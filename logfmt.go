@@ -10,7 +10,9 @@ package logfmt
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"math/bits"
 )
 
 // ErrBadFormat is returned when the input is not valid logfmt, for example a
@@ -34,6 +36,31 @@ func isSpace(b byte) bool {
 	return spaceTable[b]
 }
 
+// SWAR (SIMD-within-a-register) helpers scan eight bytes of a key or value at
+// a time. They set the high bit (0x80) of byte positions that match; we locate
+// the first match with bits.TrailingZeros64. Spurious high bits can appear in
+// bytes MORE significant than a true match (a borrow propagates upward), but
+// never on or below it, so the lowest set bit is always a real match as long
+// as we only ever OR these masks together (never subtract them).
+const (
+	swarLo = 0x0101010101010101 // 0x01 in every byte
+	swarHi = 0x8080808080808080 // 0x80 in every byte
+)
+
+// hasByte flags every byte of w equal to c.
+func hasByte(w uint64, c byte) uint64 {
+	x := w ^ (swarLo * uint64(c))
+	return (x - swarLo) &^ x & swarHi
+}
+
+// hasCtrlOrSpace flags every byte of w that is <= 0x20. This covers all logfmt
+// whitespace ('\t'..'\r' and ' '); the only other bytes it flags are control
+// bytes 0x00..0x08 and 0x0E..0x1F, which the caller rules out by re-checking
+// the located byte. UTF-8 continuation/lead bytes (>= 0x80) are never flagged.
+func hasCtrlOrSpace(w uint64) uint64 {
+	return (w - swarLo*0x21) &^ w & swarHi
+}
+
 // Iterate parses buf as a logfmt record and calls fn once for each key/value
 // pair, in order. Both key and val are sub-slices that alias buf; they are
 // only valid until buf is modified, so copy them if they must outlive the
@@ -54,9 +81,22 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 		}
 
 		kStart := i
+		for i+8 <= n {
+			w := binary.LittleEndian.Uint64(buf[i : i+8])
+			m := hasCtrlOrSpace(w) | hasByte(w, '=')
+			if m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				if c := buf[i]; isSpace(c) || c == '=' {
+					goto keyEnd
+				}
+				break // rare non-whitespace control byte; finish scalar
+			}
+			i += 8
+		}
 		for i < n && !isSpace(buf[i]) && buf[i] != '=' {
 			i++
 		}
+	keyEnd:
 
 		if i >= n {
 			if kStart < n {
@@ -120,9 +160,22 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 			}
 		} else {
 			vStart = i
+			for i+8 <= n {
+				w := binary.LittleEndian.Uint64(buf[i : i+8])
+				m := hasCtrlOrSpace(w)
+				if m != 0 {
+					i += bits.TrailingZeros64(m) >> 3
+					if isSpace(buf[i]) {
+						goto valEnd
+					}
+					break // rare non-whitespace control byte; finish scalar
+				}
+				i += 8
+			}
 			for i < n && !isSpace(buf[i]) {
 				i++
 			}
+		valEnd:
 			vEnd = i
 		}
 
