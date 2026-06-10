@@ -73,6 +73,21 @@ escaped byte (such as `\"` or `\\`) is emitted as-is.
 dst := logfmt.UnescapeInto(nil, []byte(`hello\tworld`)) // "hello\tworld" -> hello<TAB>world
 ```
 
+### Parse a timestamp value
+
+`ParseTime` parses a logfmt timestamp value and reports whether it succeeded. It
+accepts an RFC3339Nano string, a `2006-01-02 15:04:05.999 -0700 MST` string, or a
+unix epoch (10 integer digits with an optional fractional part). Trailing
+delimiters left over from a slightly malformed line (e.g. a stray `}`) are trimmed
+first, and on success the returned time is normalized to UTC.
+
+```go
+t, ok := logfmt.ParseTime("1748239806.3691056")
+if ok {
+    fmt.Println(t) // 2025-05-26 06:10:06.3691056 +0000 UTC
+}
+```
+
 ## Errors
 
 | Error             | Meaning                                                        |
