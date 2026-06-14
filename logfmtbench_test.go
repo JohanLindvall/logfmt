@@ -17,6 +17,15 @@ func Benchmark_IterateOur(b *testing.B) {
 	}
 }
 
+func Benchmark_GetMany_TimestampLevel(b *testing.B) {
+	keys := []string{"timestamp", "level"}
+	buf := make([][]byte, len(keys))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		buf, _ = GetMany(sample2, keys, buf)
+	}
+}
+
 func Benchmark_UnescapeInto(b *testing.B) {
 	buffer := []byte(`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccc foo=\"bar baz\" qux`)
 	dst := make([]byte, 0, len(buffer)*2)

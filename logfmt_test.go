@@ -1,6 +1,7 @@
 package logfmt
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -71,5 +72,122 @@ func Test_Unit_LogFmt_Values_Invalid(t *testing.T) {
 				t.Error("expected error, got nil")
 			}
 		})
+	}
+}
+
+func Test_Unit_NeedsUnescape(t *testing.T) {
+	for _, tt := range []struct {
+		in   string
+		want bool
+	}{
+		{"", false},
+		{"plain", false},
+		{"with space", false}, // space alone needs no decoding
+		{`with"quote`, false}, // a bare quote needs no decoding
+		{`esc\tval`, true},    // backslash escape
+		{`trailing\`, true},   // lone trailing backslash
+		{`a\\b`, true},        // escaped backslash
+	} {
+		if got := NeedsUnescape([]byte(tt.in)); got != tt.want {
+			t.Errorf("NeedsUnescape(%q) = %v, want %v", tt.in, got, tt.want)
+		}
+	}
+}
+
+func Test_Unit_Get(t *testing.T) {
+	line := []byte(`level=info msg="user login" id=42 r="esc\tval"`)
+
+	for _, tt := range []struct {
+		key  string
+		want string
+	}{
+		{"level", "info"},
+		{"msg", "user login"}, // quoted: surrounding quotes stripped
+		{"id", "42"},
+		{"r", `esc\tval`}, // raw: escape left intact
+	} {
+		v, err := Get(line, tt.key)
+		if err != nil {
+			t.Errorf("Get(%q) error: %v", tt.key, err)
+			continue
+		}
+		if string(v) != tt.want {
+			t.Errorf("Get(%q) = %q, want %q", tt.key, v, tt.want)
+		}
+	}
+
+	if _, err := Get(line, "missing"); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("Get(missing) error = %v, want ErrKeyNotFound", err)
+	}
+
+	if _, err := Get([]byte(`a="unterminated`), "a"); err == nil {
+		t.Error("Get on malformed input: expected error, got nil")
+	}
+}
+
+func Test_Unit_GetMany(t *testing.T) {
+	// Trailing "empty=" yields a present but empty value (a value following a
+	// space would instead be parsed as that value). r holds an escape sequence
+	// that must be returned raw (not decoded).
+	line := []byte(`level=info msg="user login" id=42 r="a\tb" empty=`)
+	keys := []string{"id", "level", "missing", "msg", "empty", "r"}
+
+	got, err := GetMany(line, keys, nil)
+	if err != nil {
+		t.Fatalf("GetMany: %v", err)
+	}
+	if len(got) != len(keys) {
+		t.Fatalf("len(got) = %d, want %d", len(got), len(keys))
+	}
+	want := map[string]string{"id": "42", "level": "info", "msg": "user login", "empty": "", "r": `a\tb`}
+	for i, k := range keys {
+		if k == "missing" {
+			if got[i] != nil {
+				t.Errorf("got[%d] (%s) = %q, want nil (absent)", i, k, got[i])
+			}
+			continue
+		}
+		// A present key (including the empty value) must be non-nil.
+		if got[i] == nil {
+			t.Errorf("got[%d] (%s) is nil, want present", i, k)
+		}
+		if string(got[i]) != want[k] {
+			t.Errorf("got[%d] (%s) = %q, want %q", i, k, got[i], want[k])
+		}
+	}
+
+	// Reuse the previous result's storage for a second line.
+	got, err = GetMany([]byte(`level=warn id=7`), []string{"level", "id", "msg"}, got)
+	if err != nil {
+		t.Fatalf("GetMany reuse: %v", err)
+	}
+	if string(got[0]) != "warn" || string(got[1]) != "7" || got[2] != nil {
+		t.Errorf("reuse got = [%q %q %v], want [warn 7 nil]", got[0], got[1], got[2])
+	}
+
+	// Empty key set.
+	if res, err := GetMany(line, nil, nil); err != nil || len(res) != 0 {
+		t.Errorf("GetMany(nil keys) = %v, %v; want empty, nil", res, err)
+	}
+
+	// Malformed input.
+	if _, err := GetMany([]byte(`a="x`), []string{"a"}, nil); err == nil {
+		t.Error("GetMany on malformed input: expected error, got nil")
+	}
+}
+
+func Test_Unit_GetMany_Allocs(t *testing.T) {
+	line := []byte(`ts=2025-01-01 level=info id=42 msg=hello`)
+	keys := []string{"level", "id", "ts"}
+
+	buf := make([][]byte, len(keys))
+	buf, _ = GetMany(line, keys, buf)
+
+	// Raw values alias data and buf is reused, so a warm call allocates nothing.
+	allocs := testing.AllocsPerRun(100, func() {
+		buf, _ = GetMany(line, keys, buf)
+	})
+	if allocs != 0 {
+		t.Errorf("GetMany allocs/op = %v, want 0", allocs)
 	}
 }
