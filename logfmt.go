@@ -86,7 +86,9 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 			m := hasCtrlOrSpace(w) | hasByte(w, '=')
 			if m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
-				if c := buf[i]; isSpace(c) || c == '=' {
+				// '=' first: keys overwhelmingly end there, so the cheap
+				// compare short-circuits past the isSpace call.
+				if c := buf[i]; c == '=' || isSpace(c) {
 					goto keyEnd
 				}
 				break // rare non-whitespace control byte; finish scalar
@@ -165,7 +167,9 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 				m := hasCtrlOrSpace(w)
 				if m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
-					if isSpace(buf[i]) {
+					// ' ' first: it is the usual value delimiter, so the cheap
+					// compare short-circuits past the isSpace call.
+					if c := buf[i]; c == ' ' || isSpace(c) {
 						goto valEnd
 					}
 					break // rare non-whitespace control byte; finish scalar
