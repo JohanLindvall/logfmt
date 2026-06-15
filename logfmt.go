@@ -4,7 +4,7 @@
 // Iterate is the core primitive: it walks a line and hands each key/value pair
 // to a callback as sub-slices of the input, performing no allocations. Values
 // are reported exactly as they appear in the input (quotes stripped but escape
-// sequences left intact); UnescapeInto decodes those escapes when needed, and
+// sequences left intact); Unescape decodes those escapes when needed, and
 // GetValue combines the two to look up and unescape a single key.
 package logfmt
 
@@ -69,7 +69,7 @@ func hasCtrlOrSpace(w uint64) uint64 {
 // A bare key with no '=' (for example "debug", or a trailing token) is
 // reported with val set to the literal "true". A quoted value is returned
 // without its surrounding double quotes but is NOT unescaped — backslash
-// escapes are left intact; pass val to UnescapeInto to decode them.
+// escapes are left intact; pass val to Unescape to decode them.
 //
 // fn may return false to stop iteration early, in which case Iterate returns
 // nil. Iterate returns ErrBadFormat if buf contains a malformed quoted value,
@@ -191,17 +191,24 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 	return nil
 }
 
-// UnescapeInto decodes the backslash escapes in a raw logfmt value and appends
+// Unescape decodes the backslash escapes in a raw logfmt value and appends
 // the result to dst, returning the extended slice. It recognises \n, \r and
 // \t; any other escaped byte (such as \" or \\) is emitted as the byte itself.
 // A trailing lone backslash is kept verbatim.
 //
-// Pass dst[:0] to reuse an existing buffer and avoid allocation.
-func UnescapeInto(dst []byte, raw []byte) []byte {
+// Pass dst[:0] to reuse an existing buffer and avoid allocation. As a fast path,
+// when raw contains no escape at all nothing is written to dst and raw is
+// returned directly, so the result may alias raw instead of dst; use the returned
+// slice, not dst.
+func Unescape(dst []byte, raw []byte) []byte {
 	i, n := 0, len(raw)
 	for i < n {
 		q := bytes.IndexByte(raw[i:], '\\')
 		if q < 0 {
+			if i == 0 {
+				// No escape anywhere: return raw untouched, leaving dst empty.
+				return raw
+			}
 			// no more escapes
 			return append(dst, raw[i:]...)
 		}
@@ -259,7 +266,7 @@ func GetValue(line []byte, key []byte, dst []byte) ([]byte, error) {
 }
 
 // NeedsUnescape reports whether raw contains a backslash escape, i.e. whether
-// passing it through UnescapeInto would change it. Values returned by Iterate,
+// passing it through Unescape would change it. Values returned by Iterate,
 // Get and GetMany are raw; use this to skip the unescape step (and its copy)
 // when decoding is unnecessary.
 func NeedsUnescape(raw []byte) bool {
@@ -271,7 +278,7 @@ func NeedsUnescape(raw []byte) bool {
 // otherwise raw is returned as-is, with no copy, so the result may alias raw.
 func valueInto(dst, raw []byte) []byte {
 	if NeedsUnescape(raw) {
-		return UnescapeInto(dst[:0], raw)
+		return Unescape(dst[:0], raw)
 	}
 	return raw
 }
@@ -279,7 +286,7 @@ func valueInto(dst, raw []byte) []byte {
 // Get returns the raw value for key in data: the value as it appears in the
 // input, with any surrounding quotes removed but escape sequences left intact.
 // The result aliases data and is valid only until data is modified; decode
-// escapes with UnescapeInto if needed. It returns ErrKeyNotFound if the key is
+// escapes with Unescape if needed. It returns ErrKeyNotFound if the key is
 // absent, or use GetValue for an unescaped, buffer-reusing lookup.
 func Get(data []byte, key string) ([]byte, error) {
 	var found bool
@@ -309,12 +316,16 @@ func Get(data []byte, key string) ([]byte, error) {
 // data and is a non-nil zero-length slice, so it is distinct from a missing
 // key's nil.
 //
+// A key matched by both an empty and a non-empty value resolves to the first
+// non-empty one: an empty value is recorded only provisionally and is overridden
+// by any later non-empty value for the same key.
+//
 // The returned values alias data and are valid only until data is modified;
-// decode escapes with UnescapeInto if needed. buf is reused as the result slice
+// decode escapes with Unescape if needed. buf is reused as the result slice
 // when it is large enough, avoiding a [][]byte allocation; pass back a previous
-// result. If a key appears more than once in data, the first occurrence wins;
-// iteration stops once every key has been found. ErrBadFormat is returned if
-// data is malformed.
+// result. If a key appears more than once with a non-empty value, the first such
+// occurrence wins; iteration stops once every key has a non-empty value.
+// ErrBadFormat is returned if data is malformed.
 func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	n := len(keys)
 	if cap(buf) < n {
@@ -323,7 +334,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	buf = buf[:n]
 
 	// Reset slots to nil; a match fills its slot, so a slot left nil records a
-	// missing key. Found values alias data and are never nil, even when empty.
+	// missing key. A slot may hold a provisional empty value (non-nil, length
+	// zero) that a later non-empty value for the same key replaces.
 	for j := range buf {
 		buf[j] = nil
 	}
@@ -331,17 +343,22 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	remaining := n
 	err := Iterate(data, func(k, v []byte) bool {
 		for j := range keys {
-			// nil check first: once a key is found it short-circuits cheaply on
-			// every later field, skipping the key compare. It also makes the
-			// first match win (a duplicate key sees a filled, non-nil slot).
-			if buf[j] != nil || string(k) != keys[j] {
+			// Length check first: a key already settled with a non-empty value
+			// short-circuits cheaply on every later field, skipping the key
+			// compare. Slots that are nil or hold a provisional empty value are
+			// still open and fall through to the key compare.
+			if len(buf[j]) > 0 || string(k) != keys[j] {
 				continue
 			}
-			buf[j] = v
-			remaining--
+			if len(v) > 0 {
+				buf[j] = v
+				remaining-- // settled: a non-empty value won't be overridden
+			} else if buf[j] == nil {
+				buf[j] = v // record the empty value, but keep looking
+			}
 			break
 		}
-		return remaining > 0 // stop once every key is found
+		return remaining > 0 // stop once every key has a non-empty value
 	})
 	if err != nil {
 		return nil, err

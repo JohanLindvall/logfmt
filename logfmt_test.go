@@ -94,6 +94,51 @@ func Test_Unit_NeedsUnescape(t *testing.T) {
 	}
 }
 
+func Test_Unit_Unescape(t *testing.T) {
+	for _, tt := range []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"plain", "plain"},
+		{`esc\tval`, "esc\tval"},
+		{`a\nb\rc\td`, "a\nb\rc\td"},
+		{`a\\b`, `a\b`},            // escaped backslash
+		{`a\"b`, `a"b`},            // escaped quote emitted as the byte itself
+		{`a\zb`, "azb"},            // unknown escape emits the byte itself
+		{`trailing\`, `trailing\`}, // lone trailing backslash kept verbatim
+	} {
+		raw := []byte(tt.in)
+		got := Unescape(nil, raw)
+		if string(got) != tt.want {
+			t.Errorf("Unescape(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+
+	// Fast path: with no escape present, raw is returned directly (aliased) and
+	// dst is left untouched.
+	raw := []byte("noescapes")
+	dst := make([]byte, 0, 16)
+	got := Unescape(dst, raw)
+	if len(dst) != 0 {
+		t.Errorf("dst length = %d, want 0 (untouched)", len(dst))
+	}
+	if &got[0] != &raw[0] {
+		t.Error("Unescape did not alias raw on the no-escape fast path")
+	}
+
+	// Decoding path: the result is written into dst, not raw.
+	raw = []byte(`a\tb`)
+	dst = make([]byte, 0, 16)
+	got = Unescape(dst, raw)
+	if string(got) != "a\tb" {
+		t.Errorf("Unescape(%q) = %q, want %q", raw, got, "a\tb")
+	}
+	if &got[0] != &dst[:1][0] {
+		t.Error("Unescape did not write into dst on the decoding path")
+	}
+}
+
 func Test_Unit_Get(t *testing.T) {
 	line := []byte(`level=info msg="user login" id=42 r="esc\tval"`)
 
@@ -126,11 +171,12 @@ func Test_Unit_Get(t *testing.T) {
 }
 
 func Test_Unit_GetMany(t *testing.T) {
-	// Trailing "empty=" yields a present but empty value (a value following a
-	// space would instead be parsed as that value). r holds an escape sequence
-	// that must be returned raw (not decoded).
-	line := []byte(`level=info msg="user login" id=42 r="a\tb" empty=`)
-	keys := []string{"id", "level", "missing", "msg", "empty", "r"}
+	// empty="" yields a present but empty value, distinct from a missing key.
+	// "dup" appears first empty then with a real value, so the non-empty value
+	// must override the provisional empty one. r holds an escape sequence that
+	// must be returned raw (not decoded).
+	line := []byte(`level=info msg="user login" id=42 r="a\tb" empty="" dup="" dup=second`)
+	keys := []string{"id", "level", "missing", "msg", "empty", "r", "dup"}
 
 	got, err := GetMany(line, keys, nil)
 	if err != nil {
@@ -139,7 +185,7 @@ func Test_Unit_GetMany(t *testing.T) {
 	if len(got) != len(keys) {
 		t.Fatalf("len(got) = %d, want %d", len(got), len(keys))
 	}
-	want := map[string]string{"id": "42", "level": "info", "msg": "user login", "empty": "", "r": `a\tb`}
+	want := map[string]string{"id": "42", "level": "info", "msg": "user login", "empty": "", "r": `a\tb`, "dup": "second"}
 	for i, k := range keys {
 		if k == "missing" {
 			if got[i] != nil {

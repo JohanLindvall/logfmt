@@ -42,7 +42,7 @@ Notes:
 - A bare key with no `=` (e.g. `debug`) is reported with `val` equal to the
   literal `true`.
 - Quoted values are returned **without** the surrounding quotes but are **not**
-  unescaped — backslash escapes are left intact. Use `UnescapeInto` to decode
+  unescaped — backslash escapes are left intact. Use `Unescape` to decode
   them.
 
 ### Look up a single key, unescaped
@@ -111,21 +111,28 @@ for i, v := range vals {
 
 ### Unescape a raw value
 
-`UnescapeInto` decodes the escapes in a raw value (as returned by `Iterate`,
+`Unescape` decodes the escapes in a raw value (as returned by `Iterate`,
 `Get` or `GetMany`), appending to a destination buffer. It recognises `\n`, `\r`
-and `\t`; any other escaped byte (such as `\"` or `\\`) is emitted as-is.
+and `\t`; any other escaped byte (such as `\"` or `\\`) is emitted as-is. A
+trailing lone backslash is kept verbatim.
+
+As a fast path, when the value contains no escape at all the buffer is left
+untouched and the value is returned directly — so the result may alias either the
+destination buffer or the input. Use the returned slice, not the buffer you
+passed in.
 
 ```go
-dst := logfmt.UnescapeInto(nil, []byte(`hello\tworld`)) // "hello\tworld" -> hello<TAB>world
+dst := logfmt.Unescape(nil, []byte(`hello\tworld`)) // "hello\tworld" -> hello<TAB>world
 ```
 
-`NeedsUnescape` reports whether a raw value actually contains a backslash escape,
-so you can skip the decode (and its copy) when it is unnecessary:
+`NeedsUnescape` reports whether a raw value actually contains a backslash escape.
+`Unescape` already skips the copy on its own when there is nothing to decode, but
+`NeedsUnescape` lets you branch before deciding whether to involve a buffer:
 
 ```go
 v, _ := logfmt.Get(line, "msg")
 if logfmt.NeedsUnescape(v) {
-    v = logfmt.UnescapeInto(buf[:0], v)
+    v = logfmt.Unescape(buf[:0], v)
 }
 ```
 
