@@ -11,7 +11,7 @@ The Benchmark* functions in the root logfmt module (parser, lookups, unescape, P
 |---|--:|--:|--:|--:|
 | IterateOur | 7796.0 | — | 0 | 0 |
 | GetMany_TimestampLevel | 1082.0 | — | 0 | 0 |
-| UnescapeInto | 550.3 | — | 0 | 0 |
+| Unescape | 550.3 | — | 0 | 0 |
 | DecodeKeyval_Custom | 6782190.0 | 73.72 MB/s | 0 | 0 |
 | LevelTS_LogFmt | 826.7 | — | 0 | 0 |
 | LevelTS_Regex | 114466.0 | — | 1076 | 4 |

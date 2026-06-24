@@ -26,11 +26,11 @@ func Benchmark_GetMany_TimestampLevel(b *testing.B) {
 	}
 }
 
-func Benchmark_UnescapeInto(b *testing.B) {
+func Benchmark_Unescape(b *testing.B) {
 	buffer := []byte(`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccc foo=\"bar baz\" qux`)
 	dst := make([]byte, 0, len(buffer)*2)
 	for i := 0; i < b.N; i++ {
-		_ = UnescapeInto(dst[:0], buffer)
+		_ = Unescape(dst[:0], buffer)
 	}
 }
 

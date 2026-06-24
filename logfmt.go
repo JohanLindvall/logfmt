@@ -4,7 +4,7 @@
 // Iterate is the core primitive: it walks a line and hands each key/value pair
 // to a callback as sub-slices of the input, performing no allocations. Values
 // are reported exactly as they appear in the input (quotes stripped but escape
-// sequences left intact); UnescapeInto decodes those escapes when needed, and
+// sequences left intact); Unescape decodes those escapes when needed, and
 // GetValue combines the two to look up and unescape a single key.
 package logfmt
 
@@ -69,7 +69,7 @@ func hasCtrlOrSpace(w uint64) uint64 {
 // A bare key with no '=' (for example "debug", or a trailing token) is
 // reported with val set to the literal "true". A quoted value is returned
 // without its surrounding double quotes but is NOT unescaped — backslash
-// escapes are left intact; pass val to UnescapeInto to decode them.
+// escapes are left intact; pass val to Unescape to decode them.
 //
 // fn may return false to stop iteration early, in which case Iterate returns
 // nil. Iterate returns ErrBadFormat if buf contains a malformed quoted value,
@@ -191,7 +191,7 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 	return nil
 }
 
-// UnescapeInto decodes the backslash escapes in a raw logfmt value and appends
+// Unescape decodes the backslash escapes in a raw logfmt value and appends
 // the result to dst, returning the extended slice. It recognises \n, \r and
 // \t; any other escaped byte (such as \" or \\) is emitted as the byte itself.
 // A trailing lone backslash is kept verbatim.
@@ -200,7 +200,7 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 // when raw contains no escapes and dst is empty, raw is returned unchanged with
 // no copy (the result then aliases raw); so callers may invoke it
 // unconditionally without a NeedsUnescape pre-check.
-func UnescapeInto(dst []byte, raw []byte) []byte {
+func Unescape(dst []byte, raw []byte) []byte {
 	i, n := 0, len(raw)
 	for i < n {
 		q := bytes.IndexByte(raw[i:], '\\')
@@ -261,14 +261,14 @@ func GetValue(line []byte, key []byte, dst []byte) ([]byte, error) {
 	if !found {
 		return nil, ErrKeyNotFound
 	}
-	// UnescapeInto short-circuits to return rawVal (aliasing line) when it has
+	// Unescape short-circuits to return rawVal (aliasing line) when it has
 	// no escapes, so this is zero-copy in the common case and decodes into dst
 	// only when needed.
-	return UnescapeInto(dst[:0], rawVal), nil
+	return Unescape(dst[:0], rawVal), nil
 }
 
 // NeedsUnescape reports whether raw contains a backslash escape, i.e. whether
-// passing it through UnescapeInto would change it. Values returned by Iterate,
+// passing it through Unescape would change it. Values returned by Iterate,
 // Get and GetMany are raw; use this to skip the unescape step (and its copy)
 // when decoding is unnecessary.
 func NeedsUnescape(raw []byte) bool {
@@ -278,7 +278,7 @@ func NeedsUnescape(raw []byte) bool {
 // Get returns the raw value for key in data: the value as it appears in the
 // input, with any surrounding quotes removed but escape sequences left intact.
 // The result aliases data and is valid only until data is modified; decode
-// escapes with UnescapeInto if needed. It returns ErrKeyNotFound if the key is
+// escapes with Unescape if needed. It returns ErrKeyNotFound if the key is
 // absent, or use GetValue for an unescaped, buffer-reusing lookup.
 func Get(data []byte, key string) ([]byte, error) {
 	var found bool
@@ -313,7 +313,7 @@ func Get(data []byte, key string) ([]byte, error) {
 // by any later non-empty value for the same key.
 //
 // The returned values alias data and are valid only until data is modified;
-// decode escapes with UnescapeInto if needed. buf is reused as the result slice
+// decode escapes with Unescape if needed. buf is reused as the result slice
 // when it is large enough, avoiding a [][]byte allocation; pass back a previous
 // result. If a key appears more than once with a non-empty value, the first such
 // occurrence wins; iteration stops once every key has a non-empty value.

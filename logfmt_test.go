@@ -94,10 +94,10 @@ func Test_Unit_NeedsUnescape(t *testing.T) {
 	}
 }
 
-func Test_Unit_UnescapeInto(t *testing.T) {
+func Test_Unit_Unescape(t *testing.T) {
 	// No escapes + empty dst: returned unchanged and aliasing raw (zero-copy).
 	raw := []byte("plain value")
-	got := UnescapeInto(nil, raw)
+	got := Unescape(nil, raw)
 	if string(got) != "plain value" {
 		t.Errorf("no-escape: got %q", got)
 	}
@@ -114,13 +114,13 @@ func Test_Unit_UnescapeInto(t *testing.T) {
 		{`a\xb`, "axb"},            // unknown escape -> the literal byte
 		{`trailing\`, `trailing\`}, // lone trailing backslash kept
 	} {
-		if got := UnescapeInto(nil, []byte(tt.in)); string(got) != tt.want {
-			t.Errorf("UnescapeInto(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := Unescape(nil, []byte(tt.in)); string(got) != tt.want {
+			t.Errorf("Unescape(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 
 	// Non-empty dst: append semantics preserved (no short-circuit).
-	if got := UnescapeInto([]byte("prefix:"), []byte("plain")); string(got) != "prefix:plain" {
+	if got := Unescape([]byte("prefix:"), []byte("plain")); string(got) != "prefix:plain" {
 		t.Errorf("append to non-empty dst = %q, want prefix:plain", got)
 	}
 }

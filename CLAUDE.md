@@ -37,7 +37,7 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 - `GetValue(line, key, dst) ([]byte, error)` — unescaped; decodes into `dst`
   only when needed, otherwise returns a sub-slice of `line` (so the result may
   alias `dst` *or* `line`).
-- `UnescapeInto(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` (others
+- `Unescape(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` (others
   pass through); `NeedsUnescape` is a single `IndexByte('\\')` so callers skip
   the decode when unnecessary.
 
@@ -49,7 +49,7 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 | `GetMany` (timestamp+level, early-stop) | ~55 | 0 |
 | `DecodeKeyval` (10k short-field rows) | ~1.28 GB/s | 0 |
 | `LevelTS` logfmt vs regex | ~45 vs ~8900 | 0 vs 4 |
-| `UnescapeInto` | ~16 | 0 |
+| `Unescape` | ~16 | 0 |
 
 Everything on the hot path is **zero-allocation**. `Iterate` went 681 → ~275 ns
 over the optimization history (~60% faster).

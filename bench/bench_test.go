@@ -93,7 +93,7 @@ func Benchmark_ParseAll_Typical_Kr(b *testing.B)       { parseAllKr(b, sampleTyp
 
 // --- Parse + decode (unescape) every value ---------------------------------
 // go-logfmt, kr/logfmt and Loki unescape values eagerly; this package returns
-// raw values, so it decodes with UnescapeInto here for an apples-to-apples
+// raw values, so it decodes with Unescape here for an apples-to-apples
 // comparison on escaped input.
 
 func Benchmark_ParseEscaped_Mine(b *testing.B) {
@@ -104,7 +104,7 @@ func Benchmark_ParseEscaped_Mine(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = mine.Iterate(sampleEscaped, func(k, v []byte) bool {
 			if mine.NeedsUnescape(v) {
-				dst = mine.UnescapeInto(dst[:0], v)
+				dst = mine.Unescape(dst[:0], v)
 				n += len(dst)
 			} else {
 				n += len(v)
