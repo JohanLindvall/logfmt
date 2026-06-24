@@ -56,14 +56,38 @@ func Test_Unit_ParseTime(t *testing.T) {
 	}
 }
 
+func Benchmark_ParseTime_RFC3339(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		if _, ok := ParseTime("2025-05-26T06:10:06.3691056Z"); !ok {
+			b.Fatal("failed")
+		}
+	}
+}
+
+func Benchmark_ParseTime_Custom(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		if _, ok := ParseTime("2025-05-26 08:10:06.369 +0200 CEST"); !ok {
+			b.Fatal("failed")
+		}
+	}
+}
+
+func Benchmark_ParseTime_Unix(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		if _, ok := ParseTime("1748239806.3691056"); !ok {
+			b.Fatal("failed")
+		}
+	}
+}
+
 func Test_Unit_ParseTime_Invalid(t *testing.T) {
 	for i, tt := range []string{
 		"",
 		"not a time",
-		"174823980",            // 9 digits, too short for unix epoch
-		"17482398066",          // 11 digits, too long for unix epoch
+		"174823980",             // 9 digits, too short for unix epoch
+		"17482398066",           // 11 digits, too long for unix epoch
 		"1748239806.1234567890", // fractional part of 10 digits, too long
-		"1748239806.abc",       // non-digit fractional part
+		"1748239806.abc",        // non-digit fractional part
 		"2025-13-26T06:10:06Z",  // invalid month
 	} {
 		t.Run(fmt.Sprintf("test-%d-%s", i, tt), func(t *testing.T) {

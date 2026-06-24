@@ -196,8 +196,14 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 // \t; any other escaped byte (such as \" or \\) is emitted as the byte itself.
 // A trailing lone backslash is kept verbatim.
 //
-// Pass dst[:0] to reuse an existing buffer and avoid allocation.
+// Pass dst[:0] to reuse an existing buffer and avoid allocation. As a fast path,
+// when raw contains no escapes and dst is empty, raw is returned unchanged with
+// no copy (the result then aliases raw); so callers may invoke it
+// unconditionally without a NeedsUnescape pre-check.
 func UnescapeInto(dst []byte, raw []byte) []byte {
+	if len(dst) == 0 && bytes.IndexByte(raw, '\\') < 0 {
+		return raw
+	}
 	i, n := 0, len(raw)
 	for i < n {
 		q := bytes.IndexByte(raw[i:], '\\')
@@ -255,7 +261,10 @@ func GetValue(line []byte, key []byte, dst []byte) ([]byte, error) {
 	if !found {
 		return nil, ErrKeyNotFound
 	}
-	return valueInto(dst, rawVal), nil
+	// UnescapeInto short-circuits to return rawVal (aliasing line) when it has
+	// no escapes, so this is zero-copy in the common case and decodes into dst
+	// only when needed.
+	return UnescapeInto(dst[:0], rawVal), nil
 }
 
 // NeedsUnescape reports whether raw contains a backslash escape, i.e. whether
@@ -264,16 +273,6 @@ func GetValue(line []byte, key []byte, dst []byte) ([]byte, error) {
 // when decoding is unnecessary.
 func NeedsUnescape(raw []byte) bool {
 	return bytes.IndexByte(raw, '\\') >= 0
-}
-
-// valueInto returns the unescaped form of a raw logfmt value. When raw contains
-// escapes it is decoded into dst (its backing array reused via dst[:0]);
-// otherwise raw is returned as-is, with no copy, so the result may alias raw.
-func valueInto(dst, raw []byte) []byte {
-	if NeedsUnescape(raw) {
-		return UnescapeInto(dst[:0], raw)
-	}
-	return raw
 }
 
 // Get returns the raw value for key in data: the value as it appears in the

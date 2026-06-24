@@ -1,0 +1,6 @@
+# Build artifacts
+*.test
+*.out
+# Raw benchmark output (the committed, rendered tables are bench/*_results_*.md)
+bench/results.txt
+bench/pkg_results.txt

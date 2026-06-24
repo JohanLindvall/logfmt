@@ -154,9 +154,37 @@ if ok {
 ## Benchmarks
 
 ```sh
-go test -bench=. -benchmem
+go test -bench=. -benchmem      # this package's microbenchmarks
+make bench-md                   # render the comparison tables in bench/
 ```
 
 `Iterate`, `Get` and `GetMany` allocate nothing on the hot path (and `GetValue`
 when its buffer is reused); the included benchmarks run against representative
 single- and multi-row logfmt input.
+
+### vs other Go logfmt parsers
+
+Parsing a ~1.4 KB line (amd64, Ryzen 7 8840HS; lower is better, speedup vs
+`go-logfmt`). The `bench/` module (a separate module, so the root stays
+dependency-free) compares against go-logfmt, kr/logfmt and Grafana Loki's
+in-tree decoder. Full tables, including arm64, are in
+[bench/results_amd64.md](bench/results_amd64.md) and
+[bench/results_arm64.md](bench/results_arm64.md).
+
+Parse every key/value pair:
+
+| Parser | ns/op | Throughput | allocs/op | Speedup |
+|---|--:|--:|--:|--:|
+| **this package** | **371** | **3776 MB/s** | **0** | **7.9×** |
+| kr/logfmt | 1295 | 1081 MB/s | 1 | 2.3× |
+| Grafana Loki | 1738 | 805 MB/s | 1 | 1.7× |
+| go-logfmt | 2941 | 476 MB/s | 4 | 1.0× |
+
+Extract two keys (`timestamp`+`level`) — this package early-stops and aliases:
+
+| Parser | ns/op | allocs/op | Speedup |
+|---|--:|--:|--:|
+| **this package** (`GetMany`) | **71** | **0** | **39.8×** |
+| kr/logfmt | 1367 | 4 | 2.1× |
+| Grafana Loki | 1667 | 1 | 1.7× |
+| go-logfmt | 2841 | 3 | 1.0× |
