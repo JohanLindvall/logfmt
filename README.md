@@ -109,18 +109,25 @@ for i, v := range vals {
 }
 ```
 
-### Unescape a raw value
+### UnescapeInto a raw value
 
 `UnescapeInto` decodes the escapes in a raw value (as returned by `Iterate`,
 `Get` or `GetMany`), appending to a destination buffer. It recognises `\n`, `\r`
-and `\t`; any other escaped byte (such as `\"` or `\\`) is emitted as-is.
+and `\t`; any other escaped byte (such as `\"` or `\\`) is emitted as-is. A
+trailing lone backslash is kept verbatim.
+
+As a fast path, when the value contains no escape at all the buffer is left
+untouched and the value is returned directly — so the result may alias either the
+destination buffer or the input. Use the returned slice, not the buffer you
+passed in.
 
 ```go
 dst := logfmt.UnescapeInto(nil, []byte(`hello\tworld`)) // "hello\tworld" -> hello<TAB>world
 ```
 
-`NeedsUnescape` reports whether a raw value actually contains a backslash escape,
-so you can skip the decode (and its copy) when it is unnecessary:
+`NeedsUnescape` reports whether a raw value actually contains a backslash escape.
+`UnescapeInto` already skips the copy on its own when there is nothing to decode, but
+`NeedsUnescape` lets you branch before deciding whether to involve a buffer:
 
 ```go
 v, _ := logfmt.Get(line, "msg")

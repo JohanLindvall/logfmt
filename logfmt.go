@@ -201,13 +201,13 @@ func Iterate(buf []byte, fn func(key, val []byte) bool) error {
 // no copy (the result then aliases raw); so callers may invoke it
 // unconditionally without a NeedsUnescape pre-check.
 func UnescapeInto(dst []byte, raw []byte) []byte {
-	if len(dst) == 0 && bytes.IndexByte(raw, '\\') < 0 {
-		return raw
-	}
 	i, n := 0, len(raw)
 	for i < n {
 		q := bytes.IndexByte(raw[i:], '\\')
 		if q < 0 {
+			if i == 0 && len(dst) == 0 {
+				return raw
+			}
 			// no more escapes
 			return append(dst, raw[i:]...)
 		}
@@ -308,12 +308,16 @@ func Get(data []byte, key string) ([]byte, error) {
 // data and is a non-nil zero-length slice, so it is distinct from a missing
 // key's nil.
 //
+// A key matched by both an empty and a non-empty value resolves to the first
+// non-empty one: an empty value is recorded only provisionally and is overridden
+// by any later non-empty value for the same key.
+//
 // The returned values alias data and are valid only until data is modified;
 // decode escapes with UnescapeInto if needed. buf is reused as the result slice
 // when it is large enough, avoiding a [][]byte allocation; pass back a previous
-// result. If a key appears more than once in data, the first occurrence wins;
-// iteration stops once every key has been found. ErrBadFormat is returned if
-// data is malformed.
+// result. If a key appears more than once with a non-empty value, the first such
+// occurrence wins; iteration stops once every key has a non-empty value.
+// ErrBadFormat is returned if data is malformed.
 func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	n := len(keys)
 	if cap(buf) < n {
@@ -322,7 +326,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	buf = buf[:n]
 
 	// Reset slots to nil; a match fills its slot, so a slot left nil records a
-	// missing key. Found values alias data and are never nil, even when empty.
+	// missing key. A slot may hold a provisional empty value (non-nil, length
+	// zero) that a later non-empty value for the same key replaces.
 	for j := range buf {
 		buf[j] = nil
 	}
@@ -330,17 +335,22 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	remaining := n
 	err := Iterate(data, func(k, v []byte) bool {
 		for j := range keys {
-			// nil check first: once a key is found it short-circuits cheaply on
-			// every later field, skipping the key compare. It also makes the
-			// first match win (a duplicate key sees a filled, non-nil slot).
-			if buf[j] != nil || string(k) != keys[j] {
+			// Length check first: a key already settled with a non-empty value
+			// short-circuits cheaply on every later field, skipping the key
+			// compare. Slots that are nil or hold a provisional empty value are
+			// still open and fall through to the key compare.
+			if len(buf[j]) > 0 || string(k) != keys[j] {
 				continue
 			}
-			buf[j] = v
-			remaining--
+			if len(v) > 0 {
+				buf[j] = v
+				remaining-- // settled: a non-empty value won't be overridden
+			} else if buf[j] == nil {
+				buf[j] = v // record the empty value, but keep looking
+			}
 			break
 		}
-		return remaining > 0 // stop once every key is found
+		return remaining > 0 // stop once every key has a non-empty value
 	})
 	if err != nil {
 		return nil, err

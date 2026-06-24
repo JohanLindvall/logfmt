@@ -157,11 +157,12 @@ func Test_Unit_Get(t *testing.T) {
 }
 
 func Test_Unit_GetMany(t *testing.T) {
-	// Trailing "empty=" yields a present but empty value (a value following a
-	// space would instead be parsed as that value). r holds an escape sequence
-	// that must be returned raw (not decoded).
-	line := []byte(`level=info msg="user login" id=42 r="a\tb" empty=`)
-	keys := []string{"id", "level", "missing", "msg", "empty", "r"}
+	// empty="" yields a present but empty value, distinct from a missing key.
+	// "dup" appears first empty then with a real value, so the non-empty value
+	// must override the provisional empty one. r holds an escape sequence that
+	// must be returned raw (not decoded).
+	line := []byte(`level=info msg="user login" id=42 r="a\tb" empty="" dup="" dup=second`)
+	keys := []string{"id", "level", "missing", "msg", "empty", "r", "dup"}
 
 	got, err := GetMany(line, keys, nil)
 	if err != nil {
@@ -170,7 +171,7 @@ func Test_Unit_GetMany(t *testing.T) {
 	if len(got) != len(keys) {
 		t.Fatalf("len(got) = %d, want %d", len(got), len(keys))
 	}
-	want := map[string]string{"id": "42", "level": "info", "msg": "user login", "empty": "", "r": `a\tb`}
+	want := map[string]string{"id": "42", "level": "info", "msg": "user login", "empty": "", "r": `a\tb`, "dup": "second"}
 	for i, k := range keys {
 		if k == "missing" {
 			if got[i] != nil {

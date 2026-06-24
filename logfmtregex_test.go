@@ -9,7 +9,6 @@ import (
 // a line, handling either field ordering. Compared against the logfmt parser
 // in the benchmarks below.
 var rfc3339NanoExpr = `"?(?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z)"?`
-var rfc3339NanoSpaceExpr = `"?(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?Z)"?`
 var logFmtTSExpr = `(` + rfc3339NanoExpr + `|"?(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(\.\d+)?(\s\+0+\sUTC)?)"?|(?P<unixts>\d{10}(\.\d{1,9})?)` + `)`
 
 var levelTSRe = regexp.MustCompile(
