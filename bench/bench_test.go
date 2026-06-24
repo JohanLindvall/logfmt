@@ -167,7 +167,11 @@ func Benchmark_ParseEscaped_Kr(b *testing.B) {
 }
 
 // --- Targeted extraction of two keys (timestamp + level) -------------------
-// Mine can early-stop and alias; the others must scan the whole line.
+// All variants stop scanning once both keys are found, where the API allows it:
+// GetMany and the pull-based decoders (go-logfmt, Loki) break out of the loop;
+// kr/logfmt is push-based (Unmarshal drives a handler and cannot be told to
+// stop — its scanner records the first handler error but keeps scanning), so it
+// can only skip the per-pair work, not the scan itself.
 
 func Benchmark_Extract_Mine(b *testing.B) {
 	keys := []string{"timestamp", "level"}
@@ -182,6 +186,7 @@ func Benchmark_Extract_GoLogfmt(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var ts, lvl []byte
 		d := golog.NewDecoder(bytes.NewReader(sampleBig))
+	scan:
 		for d.ScanRecord() {
 			for d.ScanKeyval() {
 				switch string(d.Key()) {
@@ -189,6 +194,9 @@ func Benchmark_Extract_GoLogfmt(b *testing.B) {
 					ts = d.Value()
 				case "level":
 					lvl = d.Value()
+				}
+				if ts != nil && lvl != nil {
+					break scan // both found: stop scanning
 				}
 			}
 		}
@@ -209,6 +217,9 @@ func Benchmark_Extract_Loki(b *testing.B) {
 			case "level":
 				lvl = dec.Value()
 			}
+			if ts != nil && lvl != nil {
+				break // both found: stop scanning
+			}
 		}
 		_, _ = ts, lvl
 	}
@@ -218,6 +229,9 @@ func Benchmark_Extract_Kr(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var ts, lvl []byte
 		h := krlog.HandlerFunc(func(key, val []byte) error {
+			if ts != nil && lvl != nil {
+				return nil // both found: skip work (the scan can't be stopped)
+			}
 			switch string(key) {
 			case "timestamp":
 				ts = val

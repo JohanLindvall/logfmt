@@ -187,11 +187,12 @@ Parse every key/value pair:
 | Grafana Loki | 1738 | 805 MB/s | 1 | 1.7× |
 | go-logfmt | 2941 | 476 MB/s | 4 | 1.0× |
 
-Extract two keys (`timestamp`+`level`) — this package early-stops and aliases:
+Extract two keys (`timestamp`+`level`), each parser stopping once both are found
+(where its API allows — `kr/logfmt` is push-based and can't stop its scan):
 
 | Parser | ns/op | allocs/op | Speedup |
 |---|--:|--:|--:|
-| **this package** (`GetMany`) | **71** | **0** | **39.8×** |
-| kr/logfmt | 1367 | 4 | 2.1× |
-| Grafana Loki | 1667 | 1 | 1.7× |
-| go-logfmt | 2841 | 3 | 1.0× |
+| **this package** (`GetMany`) | **54** | **0** | **15.8×** |
+| Grafana Loki | 237 | 1 | 3.6× |
+| go-logfmt | 852 | 3 | 1.0× |
+| kr/logfmt | 1025 | 4 | 0.8× |
