@@ -150,7 +150,9 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 				vEnd = i
 				i++
 				if i < n {
-					if !isSpace(data[i]) {
+					// ' ' first: the usual delimiter short-circuits past the
+					// isSpace table load.
+					if c := data[i]; c != ' ' && !isSpace(c) {
 						return ErrBadFormat
 					}
 					i++
@@ -386,9 +388,7 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	// Reset slots to nil; a match fills its slot, so a slot left nil records a
 	// missing key. A slot may hold a provisional empty value (non-nil, length
 	// zero) that a later non-empty value for the same key replaces.
-	for j := range buf {
-		buf[j] = nil
-	}
+	clear(buf)
 
 	remaining := n
 	err := Iterate(data, func(k, v []byte) bool {

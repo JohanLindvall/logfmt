@@ -87,6 +87,11 @@ over the optimization history (~60% faster).
 - **`GetMany` uses `buf` itself as the found-marker** (slots start `nil`, a match
   fills them) — no parallel bitmask. Raw aliasing makes it zero-alloc and
   found-values are never nil, so `nil` == absent unambiguously.
+- **Closing-quote verify tests `' '` first** (`c != ' ' && !isSpace(c)`) — same
+  short-circuit trick as the SWAR verifies; ~1% on quoted-heavy lines.
+- **`GOAMD64=v3` builds are ~4% faster** (measured: Iterate 267 vs 279 ns) —
+  BMI's TZCNT helps the SWAR `TrailingZeros64`. A user build flag, not
+  something the module can set; noted in the README.
 
 ## Rejected / parked (do NOT re-attempt without new evidence)
 
@@ -124,6 +129,25 @@ noisy). Each was **neutral or worse**:
   and the `NeedsUnescape` wrapper inlines entirely. Corollary: the
   guard-then-decode pattern (`if NeedsUnescape(v) { Unescape(...) }`) beats
   calling `Unescape` unconditionally (127 vs 186 ns) for the same reason.
+- **`len(data)` instead of a copied `n` throughout `Iterate`** (hoping the
+  prove pass would drop the bounds checks): the checks all *remain* and it is
+  ~3.7% slower. Note `-gcflags=all=-B` shows bounds checks cost ~8% — but that
+  ceiling is not reachable from Go source; the prove pass keeps every hot check
+  under both spellings.
+- **PGO (`default.pgo` from the benchmark profile)**: mixed within noise
+  (Iterate −2%, GetMany +3%). Also structurally pointless for a library: a
+  committed profile affects only this module's own test builds, never
+  importers' builds (PGO comes from the main module). Don't commit one.
+- **Consuming the known-whitespace delimiter after an unquoted value**
+  (`if i < n { i++ }` at valEnd, mirroring the quoted branch): −5% — the extra
+  branch in the hot loop costs more than the saved top-of-loop `isSpace` load.
+- **Inline first-word `hasByte(w,'"')` before `IndexByte` in the quoted scan**
+  (to spare short quoted values the call overhead): −3% on `Iterate` (long
+  quoted values pay the wasted word check) and neutral on `DecodeKeyval` —
+  the short-quote saving never materialised.
+- **Benchmarking note**: this machine drifts between power states *mid-session*
+  (same code measured 283 → 297 ns minutes apart). Never compare against a
+  stale baseline — interleave A/B runs (A,B,A,B…) and compare means.
 - **Porting Rust's `memchr2` (AVX2 SIMD 2-byte search) to Go**: implemented and
   differential-tested correct; it beats stdlib `bytes.IndexAny` ~2.6× (the slow
   multi-byte fallback). But it **loses to inlined SWAR for logfmt-shaped fields**

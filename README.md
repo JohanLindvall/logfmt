@@ -179,6 +179,9 @@ make bench-md                   # render the comparison tables in bench/
 when its buffer is reused); the included benchmarks run against representative
 single- and multi-row logfmt input.
 
+On amd64, building with `GOAMD64=v3` (Haswell+, 2013 onwards) makes the parser
+~4% faster (BMI instructions for the word-at-a-time scanning).
+
 ### vs other Go logfmt parsers
 
 Parsing a ~1.4 KB line (amd64, Ryzen 7 8840HS; lower is better, speedup vs
