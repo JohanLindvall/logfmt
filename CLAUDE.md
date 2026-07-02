@@ -18,28 +18,40 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 
 ## Layout
 
+- `doc.go` — package documentation: API map, aliasing/read-only rules, and the
+  documented leniency divergences from go-logfmt.
 - `logfmt.go` — the core parser and key-lookup API (the "general parsing").
 - `time.go` — `ParseTime` (see warning above).
 - `logfmt_swar_test.go` — `FuzzIterateAgainstRef`: differential fuzz of the
   SWAR `Iterate` against a byte-by-byte reference. **Run this after any change
   to the parser.**
+- `getmany_fuzz_test.go` — `FuzzGetManyAgainstRef`: differential fuzz of
+  `GetMany`/`Get`'s first-non-empty duplicate resolution against a naive
+  collect-all reference. **Run after any change to the lookup state machine.**
 - `*_test.go` — unit tests, benchmarks, and a regex-vs-logfmt comparison.
 
-## Public API (read-only, raw-by-default)
+## Public API (read-only, raw-by-default; keys are `string` everywhere)
 
-- `Iterate(buf, func(k, v) bool) error` — core primitive; calls back per pair,
-  `k`/`v` alias `buf`. Quoted values have quotes stripped but escapes left
-  intact (raw). Bare key → value `"true"`. `false` from the callback stops.
+- `Iterate(data, func(k, v) bool) error` — core primitive; calls back per pair,
+  `k`/`v` alias `data` (bare key → shared `"true"` constant; all results are
+  read-only). Quoted values have quotes stripped but escapes left intact (raw).
+  `false` from the callback stops.
 - `Get(data, key string) ([]byte, error)` — raw value, aliases `data`, zero-copy.
 - `GetMany(data, keys, buf) ([][]byte, error)` — multi-key single pass, raw
   aliasing values, **`nil` for absent** (present-but-empty is a non-nil
   zero-length slice — distinct from absent), reusable outer `buf`, early-stop.
-- `GetValue(line, key, dst) ([]byte, error)` — unescaped; decodes into `dst`
-  only when needed, otherwise returns a sub-slice of `line` (so the result may
-  alias `dst` *or* `line`).
-- `Unescape(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` (others
-  pass through); `NeedsUnescape` is a single `IndexByte('\\')` so callers skip
-  the decode when unnecessary.
+- `GetValue(data, key string, dst) ([]byte, error)` — unescaped; delegates to
+  `Get` then `Unescape`, decoding into `dst` only when needed (result may alias
+  `dst` *or* `data`).
+- **Duplicate keys resolve identically in all three lookups: first non-empty
+  occurrence wins; an empty value only if no non-empty one exists.** Guarded by
+  `FuzzGetManyAgainstRef`.
+- `Unescape(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` and JSON-style
+  `\uXXXX` incl. surrogate pairs (go-logfmt writes control chars as `\u00XX`,
+  so this is required for round-trip interop); other escapes pass through, and
+  malformed `\u` stays verbatim. `NeedsUnescape` is a single `IndexByte('\\')`
+  so callers skip the decode when unnecessary — keep it a single expression so
+  it stays inlinable (a SWAR helper here measurably regressed).
 
 ## Current benchmarks (Ryzen 7 8840HS, amd64; ~ns, machine-state dependent)
 
@@ -101,10 +113,17 @@ noisy). Each was **neutral or worse**:
 - **Inlining the parser into `GetMany`** (drop the callback indirection): only
   ~4.5% and it duplicated the parser — the prototype immediately diverged on
   bare keys under differential fuzz. Not worth the duplication/risk.
-- **`GetMany` inner-loop comparison order**: the current `buf[j] != nil ||
-  string(k) != keys[j]` (found-check first) is already fastest (54.8 ns).
+- **`GetMany` inner-loop comparison order**: the current settled-check first
+  (`len(buf[j]) > 0 || string(k) != keys[j]`) is already fastest (54.8 ns).
   String-compare-first (55.4) and a found-prefix `start`-skip (56.3) both
   regress. `GetMany` is parse-bound — the match loop is ~15 ns of ~55 ns.
+- **SWAR helper for the backslash search** (`indexBackslash` used by
+  `NeedsUnescape`/`Unescape`): regressed both (Unescape 16→20.6 ns,
+  ParseEscaped 126→136 ns). A SWAR scan needs a loop → the helper can't inline
+  → every call pays a frame, where `bytes.IndexByte` leaves only the asm call
+  and the `NeedsUnescape` wrapper inlines entirely. Corollary: the
+  guard-then-decode pattern (`if NeedsUnescape(v) { Unescape(...) }`) beats
+  calling `Unescape` unconditionally (127 vs 186 ns) for the same reason.
 - **Porting Rust's `memchr2` (AVX2 SIMD 2-byte search) to Go**: implemented and
   differential-tested correct; it beats stdlib `bytes.IndexAny` ~2.6× (the slow
   multi-byte fallback). But it **loses to inlined SWAR for logfmt-shaped fields**

@@ -44,6 +44,14 @@ Notes:
 - Quoted values are returned **without** the surrounding quotes but are **not**
   unescaped — backslash escapes are left intact. Use `Unescape` to decode
   them.
+- Returned slices alias the input (or, for bare keys, a shared constant) —
+  treat them as read-only and copy anything that must outlive the input.
+- The parser is deliberately lenient and diverges from go-logfmt in a few
+  documented ways (e.g. `key= value` parses as `("key", "value")`; a stray `"`
+  in an unquoted value is a literal). See the package documentation.
+- All lookups (`Get`, `GetValue`, `GetMany`) resolve duplicate keys the same
+  way: the **first non-empty occurrence wins**; an empty value is used only
+  when the key never appears with a non-empty one.
 
 ### Look up a single key, unescaped
 
@@ -55,7 +63,7 @@ them.
 
 ```go
 var buf []byte
-val, err := logfmt.GetValue(line, []byte("msg"), buf[:0])
+val, err := logfmt.GetValue(line, "msg", buf[:0])
 switch {
 case errors.Is(err, logfmt.ErrKeyNotFound):
     // key absent
@@ -112,9 +120,11 @@ for i, v := range vals {
 ### Unescape a raw value
 
 `Unescape` decodes the escapes in a raw value (as returned by `Iterate`,
-`Get` or `GetMany`), appending to a destination buffer. It recognises `\n`, `\r`
-and `\t`; any other escaped byte (such as `\"` or `\\`) is emitted as-is. A
-trailing lone backslash is kept verbatim.
+`Get` or `GetMany`), appending to a destination buffer. It recognises `\n`, `\r`,
+`\t` and JSON-style `\uXXXX` unicode escapes including surrogate pairs — so
+values encoded by go-logfmt (which writes control characters as `\u00XX`)
+round-trip correctly. Any other escaped byte (such as `\"` or `\\`) is emitted
+as-is; malformed `\u` sequences and a trailing lone backslash are kept verbatim.
 
 As a fast path, when the value contains no escape at all the buffer is left
 untouched and the value is returned directly — so the result may alias either the

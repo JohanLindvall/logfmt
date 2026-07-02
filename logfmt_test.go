@@ -223,3 +223,86 @@ func Test_Unit_GetMany_Allocs(t *testing.T) {
 		t.Errorf("GetMany allocs/op = %v, want 0", allocs)
 	}
 }
+
+func Test_Unit_Unescape_Unicode(t *testing.T) {
+	bs := "\\" // single backslash
+	for _, tt := range []struct{ in, want string }{
+		{bs + "u0007ab", "\aab"},                    // control char, as go-logfmt encodes
+		{bs + "u00e9", "é"},                         // lowercase hex
+		{bs + "u00E9", "é"},                         // uppercase hex
+		{bs + "ud834" + bs + "udd1e", "\U0001D11E"}, // surrogate pair
+		{bs + "ud834", "�"},                         // lone high surrogate
+		{bs + "ud834A", "�A"},                       // high surrogate, no pair
+		{bs + "udd1e", "�"},                         // lone low surrogate
+		{bs + "uZZZZ", bs + "uZZZZ"},                // malformed hex: verbatim
+		{bs + "u00", bs + "u00"},                    // truncated: verbatim
+		{"x" + bs + "u", "x" + bs + "u"},            // bare \u at end: verbatim
+		{"a" + bs + "tb" + bs + "u0041", "a\tbA"},   // mixed with \t
+	} {
+		if got := Unescape(nil, []byte(tt.in)); string(got) != tt.want {
+			t.Errorf("Unescape(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func Test_Unit_Get_Duplicates(t *testing.T) {
+	line := []byte(`dup="" mid=x dup=second dup=third`)
+
+	// First non-empty occurrence wins over an earlier empty one.
+	if v, err := Get(line, "dup"); err != nil || string(v) != "second" {
+		t.Errorf("Get(dup) = %q, %v; want second", v, err)
+	}
+	// Only-empty occurrences return the empty value, not ErrKeyNotFound.
+	// (Note e="" — a bare `e= x=1` would parse as e="x=1", since whitespace
+	// after '=' is skipped.)
+	if v, err := Get([]byte(`e="" x=1`), "e"); err != nil || v == nil || len(v) != 0 {
+		t.Errorf("Get(e) = %q, %v; want present empty", v, err)
+	}
+	if v, err := Get([]byte(`x=1 e=`), "e"); err != nil || v == nil || len(v) != 0 {
+		t.Errorf("Get(trailing e=) = %q, %v; want present empty", v, err)
+	}
+	// GetValue agrees with Get.
+	if v, err := GetValue(line, "dup", nil); err != nil || string(v) != "second" {
+		t.Errorf("GetValue(dup) = %q, %v; want second", v, err)
+	}
+	// GetMany agrees too.
+	m, err := GetMany(line, []string{"dup"}, nil)
+	if err != nil || string(m[0]) != "second" {
+		t.Errorf("GetMany(dup) = %q, %v; want second", m[0], err)
+	}
+}
+
+func Test_Unit_GetValue(t *testing.T) {
+	line := []byte(`level=info msg="user login" r="esc\tval" empty=`)
+
+	var buf []byte
+	for _, tt := range []struct{ key, want string }{
+		{"level", "info"},
+		{"msg", "user login"},
+		{"r", "esc\tval"}, // unescaped, unlike Get
+		{"empty", ""},
+	} {
+		v, err := GetValue(line, tt.key, buf[:0])
+		if err != nil {
+			t.Errorf("GetValue(%q): %v", tt.key, err)
+			continue
+		}
+		if string(v) != tt.want {
+			t.Errorf("GetValue(%q) = %q, want %q", tt.key, v, tt.want)
+		}
+	}
+
+	if _, err := GetValue(line, "missing", nil); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("GetValue(missing) err = %v, want ErrKeyNotFound", err)
+	}
+	if _, err := GetValue([]byte(`a="x`), "a", nil); !errors.Is(err, ErrBadFormat) {
+		t.Errorf("GetValue on malformed: err = %v, want ErrBadFormat", err)
+	}
+
+	// No-escape values are returned zero-copy (aliasing line, dst untouched).
+	dst := make([]byte, 0, 8)
+	v, _ := GetValue(line, "level", dst)
+	if len(dst) != 0 && &v[0] == &dst[:1][0] {
+		t.Error("no-escape value should alias line, not dst")
+	}
+}
