@@ -10,19 +10,29 @@
 // are raw — reported exactly as they appear in the input, with surrounding
 // quotes stripped but escape sequences left intact. On top of it:
 //
-//   - Get returns the raw value for one key (zero-copy).
+//   - All is the same walk as a range-over-func iterator:
+//     for key, val := range logfmt.All(line). Ranging needs Go 1.23 in the
+//     calling module; the package itself still builds at Go 1.21.
+//   - Get returns the raw value for one key (zero-copy) and whether it was
+//     present.
 //   - GetMany returns the raw values for several keys in a single pass,
 //     stopping early once all are found; a missing key yields nil, while a
 //     present-but-empty value is a non-nil empty slice.
-//   - GetValue returns the unescaped value for one key, decoding into a
-//     caller-provided buffer only when needed.
-//   - Unescape decodes escape sequences (\n, \r, \t, and JSON-style \uXXXX);
-//     NeedsUnescape reports whether decoding would change anything.
+//   - AppendValue appends one key's unescaped value to a caller-provided
+//     buffer.
+//   - AppendUnescape decodes escape sequences (\n, \r, \t, and JSON-style
+//     \uXXXX); NeedsUnescape reports whether decoding would change anything.
+//   - SplitRecord peels one record off a multi-line buffer (see Records and
+//     framing below).
+//   - Validate parses a record to completion and reports the first syntax
+//     error, which the early-stopping lookups cannot.
+//   - IsBareKey distinguishes a bare key's implicit "true" from a real one.
 //   - ParseTime parses the timestamp formats that commonly appear in logfmt.
 //
-// All three lookups resolve duplicate keys the same way: the first non-empty
-// occurrence wins, and an empty value is used only when the key never appears
-// with a non-empty one.
+// The three lookups — Get, GetMany and AppendValue — resolve duplicate keys
+// the same way: the first non-empty occurrence wins, and an empty value is used
+// only when the key never appears with a non-empty one. Every function here
+// takes and returns []byte; nothing asks the caller to convert to string first.
 //
 // # Records and framing
 //
@@ -31,10 +41,19 @@
 // therefore yields the pairs of every line as one flat sequence, with no
 // indication of where one line ended and the next began — and a lookup will
 // happily match a key from a later line. Callers that need per-record
-// semantics must split the input themselves (bytes.IndexByte(data, '\n'),
-// bufio.Scanner, and so on) and call Iterate once per line. Feeding whole
-// buffers in is supported and fast, but only when the flat view is what you
-// want.
+// semantics must split the input themselves. SplitRecord does it without
+// allocating, and handles CRLF:
+//
+//	for len(data) > 0 {
+//		var rec []byte
+//		rec, data = logfmt.SplitRecord(data)
+//		level, _ := logfmt.Get(rec, "level")
+//		// ...
+//	}
+//
+// bufio.Scanner works too when the input arrives as a stream. Feeding whole
+// buffers to Iterate is supported and fast, but only when the flat view is
+// what you want.
 //
 // # Aliasing and concurrency
 //
@@ -46,14 +65,15 @@
 // bare key's "true" is a constant shared by every caller in the process, so
 // writing through any of them corrupts something you do not own.
 //
-// Appending is handled differently by the two entry points, deliberately. The
-// lookups (Get, GetValue, GetMany) return values capped to their length, so
-// appending to one copies rather than overwriting the bytes that follow it in
-// the input; they cap once per lookup, which costs nothing measurable. Iterate
-// does not cap what it hands the callback, because that lands once per field
-// and measures ~4.5% on field-dense input. Inside an Iterate callback, copy
-// first (append(dst[:0], v...), string(v)) or re-slice to v[:len(v):len(v)]
-// before appending.
+// Appending is handled differently by the entry points, deliberately. Get and
+// GetMany return values capped to their length, so appending to one copies
+// rather than overwriting the bytes that follow it in the input; they cap once
+// per lookup, which costs nothing measurable. AppendValue and AppendUnescape
+// always copy into the caller's buffer, so their results never alias the input
+// at all. Iterate and All do not cap what they hand the callback, because that
+// lands once per field and measures ~4.5% on field-dense input; inside a
+// callback, copy first (append(dst[:0], v...), string(v)) or re-slice to
+// v[:len(v):len(v)] before appending.
 //
 // The package holds no state, so it is safe for concurrent use as long as
 // callers honour that rule.
@@ -61,20 +81,22 @@
 // # Errors
 //
 // The only malformed inputs are an unterminated quoted value and a closing
-// quote followed by a non-space byte; both yield ErrBadFormat. Because parsing
-// is streaming, Iterate has already delivered every pair preceding the fault
-// before it returns that error — treat the callback's output as a valid prefix,
-// not as something to discard.
+// quote followed by a non-space byte. Iterate and Validate report both as a
+// *SyntaxError carrying the byte offset; errors.Is(err, ErrBadFormat) matches
+// any of them. Because parsing is streaming, Iterate has already delivered
+// every pair preceding the fault before it returns — treat the callback's
+// output as a valid prefix, not as something to discard.
 //
-// For the same reason the lookups report malformation only on a best-effort
-// basis: Get, GetValue and GetMany stop as soon as their keys are settled, so a
-// malformed tail later in the line is never reached and no error is reported.
-// A nil error from a lookup means "your keys were resolved", not "the whole
-// line is well-formed". Use Iterate to full completion if you need validation.
+// The lookups report no syntax errors at all. Get, AppendValue and GetMany stop
+// as soon as their keys are settled, so a malformed tail beyond that point is
+// never examined; reporting an error they cannot reliably detect would promise
+// a validation they do not perform. They return what the reachable prefix
+// yields. Call Validate when a record's validity matters.
 //
-// Get and GetValue return ErrKeyNotFound for an absent key. GetMany instead
-// reports absence as a nil slot, which is how it distinguishes an absent key
-// from one present with an empty value.
+// Absence is uniform: Get and AppendValue return false, GetMany leaves the
+// slot nil. A key present with an empty value stays distinct from an absent
+// one — Get returns true with a non-nil empty slice, GetMany a non-nil empty
+// slot.
 //
 // # Leniency
 //
@@ -95,15 +117,17 @@
 //     starts a new pair.
 //
 // A bare key with no '=' is reported with the value "true", matching logfmt
-// convention for boolean flags.
+// convention for boolean flags. That value is a shared sentinel, so IsBareKey
+// can tell "debug" from "debug=true" — by content the two are identical.
 //
 // # Scope
 //
 // This is a reader only, by design. There is no encoder, no io.Reader-based
 // streaming decoder, no typed accessors (integers, booleans, durations) and no
 // map-building convenience: values come back as []byte for the caller to
-// convert. That keeps the package dependency-free, allocation-free and its
-// semantics small enough to fuzz against a reference implementation. Write
-// logfmt with go-logfmt or your logging library's encoder; convert values with
-// strconv.
+// convert. ParseTime is the one concession, because timestamp formats in real
+// logs vary enough to be worth centralising. That keeps the package
+// dependency-free, allocation-free and its semantics small enough to fuzz
+// against a reference implementation. Write logfmt with go-logfmt or your
+// logging library's encoder; convert values with strconv.
 package logfmt

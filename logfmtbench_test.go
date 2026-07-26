@@ -22,7 +22,7 @@ func Benchmark_GetMany_TimestampLevel(b *testing.B) {
 	buf := make([][]byte, len(keys))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf, _ = GetMany(sample2, keys, buf)
+		buf = GetMany(sample2, keys, buf)
 	}
 }
 
@@ -30,7 +30,7 @@ func Benchmark_Unescape(b *testing.B) {
 	buffer := []byte(`aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb cccccccccccccccccccccccccccccccccccc foo=\"bar baz\" qux`)
 	dst := make([]byte, 0, len(buffer)*2)
 	for i := 0; i < b.N; i++ {
-		_ = Unescape(dst[:0], buffer)
+		_ = AppendUnescape(dst[:0], buffer)
 	}
 }
 

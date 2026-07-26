@@ -5,17 +5,36 @@ import (
 	"encoding/binary"
 	"errors"
 	"math/bits"
+	"strconv"
 	"unicode/utf16"
 	"unicode/utf8"
 )
 
-// ErrBadFormat is returned when the input is not valid logfmt, for example a
-// quoted value that is never closed or that is followed by a non-space byte.
+// ErrBadFormat is the sentinel every syntax error matches: the input is not
+// valid logfmt, for example a quoted value that is never closed or that is
+// followed by a non-space byte. Errors returned by Iterate and Validate are
+// *SyntaxError values carrying the offset; test them with
+// errors.Is(err, ErrBadFormat).
 var ErrBadFormat = errors.New("bad logfmt format")
 
-// ErrKeyNotFound is returned by Get and GetValue when the requested key is
-// absent.
-var ErrKeyNotFound = errors.New("key not found")
+// SyntaxError describes a malformed logfmt record and where the parser gave up.
+// Iterate and Validate return it; errors.Is(err, ErrBadFormat) reports true for
+// any of them, so sentinel comparisons keep working.
+type SyntaxError struct {
+	// Offset is the byte index in the input at which the fault was detected:
+	// the opening quote of an unterminated value, or the offending byte after
+	// a closing quote.
+	Offset int
+	// Reason is a short description of the fault, without position.
+	Reason string
+}
+
+func (e *SyntaxError) Error() string {
+	return "logfmt: " + e.Reason + " at offset " + strconv.Itoa(e.Offset)
+}
+
+// Is makes every SyntaxError match ErrBadFormat under errors.Is.
+func (e *SyntaxError) Is(target error) bool { return target == ErrBadFormat }
 
 var trueSlice = []byte("true")
 var spaceTable = [256]bool{
@@ -148,7 +167,9 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 			for {
 				q := bytes.IndexByte(data[i:], '"')
 				if q == -1 {
-					return ErrBadFormat
+					// vStart is just past the opening quote, which is the
+					// position worth reporting.
+					return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
 				}
 				i += q
 
@@ -170,7 +191,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 					// ' ' first: the usual delimiter short-circuits past the
 					// isSpace table load.
 					if c := data[i]; c != ' ' && !isSpace(c) {
-						return ErrBadFormat
+						return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
 					}
 					i++
 				}
@@ -207,26 +228,24 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 	return nil
 }
 
-// Unescape decodes the backslash escapes in a raw logfmt value and appends
-// the result to dst, returning the extended slice. It recognises \n, \r, \t
+// AppendUnescape decodes the backslash escapes in a raw logfmt value, appends
+// the result to dst and returns the extended slice. It recognises \n, \r, \t
 // and JSON-style \uXXXX unicode escapes (including surrogate pairs, as emitted
 // by go-logfmt for control characters); any other escaped byte (such as \" or
 // \\) is emitted as the byte itself. A lone surrogate half decodes to U+FFFD,
 // matching encoding/json. A malformed \u (bad or truncated hex) and a trailing
 // lone backslash are kept verbatim rather than rejected.
 //
-// Pass dst[:0] to reuse an existing buffer and avoid allocation. As a fast path,
-// when raw contains no escapes and dst is empty, raw is returned unchanged with
-// no copy (the result then aliases raw); so callers may invoke it
-// unconditionally without a NeedsUnescape pre-check.
-func Unescape(dst []byte, raw []byte) []byte {
+// It always appends — the result never aliases raw — so it composes like the
+// other Append functions in the standard library. Pass dst[:0] to reuse a
+// buffer without allocating. To skip the copy entirely for values that need no
+// decoding, guard with NeedsUnescape; that pattern is also faster than decoding
+// unconditionally, since most values contain no escapes at all.
+func AppendUnescape(dst []byte, raw []byte) []byte {
 	i, n := 0, len(raw)
 	for i < n {
 		q := bytes.IndexByte(raw[i:], '\\')
 		if q < 0 {
-			if i == 0 && len(dst) == 0 {
-				return raw
-			}
 			// no more escapes
 			return append(dst, raw[i:]...)
 		}
@@ -309,81 +328,98 @@ func hex4(b []byte) rune {
 	return r
 }
 
-// GetValue returns the unescaped value associated with key in data. When the
-// value needs decoding it is written into dst (pass dst[:0] to reuse its
-// backing array); when it needs none, a sub-slice of data is returned directly
-// without copying. The result therefore aliases either dst or data and is valid
-// only until whichever it aliases is modified — so copy it if it must outlive
-// that. (Use the returned slice, not dst, since dst may be untouched.)
+// AppendValue looks up key in data, appends its unescaped value to dst and
+// returns the extended slice along with whether the key was present. When the
+// key is absent it returns dst unchanged and false.
 //
-// When the result aliases data it is capped to its length, as in Get, so
-// appending to it cannot overwrite the rest of the line; when it aliases dst it
-// carries dst's own capacity, which is the caller's buffer to grow.
+// It always appends, so the result never aliases data and is safe to keep.
+// Callers who would rather not copy values that need no decoding should use Get
+// with NeedsUnescape instead:
+//
+//	if v, ok := logfmt.Get(line, "msg"); ok {
+//		if logfmt.NeedsUnescape(v) {
+//			v = logfmt.AppendUnescape(buf[:0], v)
+//		}
+//		// v now aliases line (no copy) or buf (decoded)
+//	}
 //
 // Duplicate keys resolve exactly as in Get and GetMany: the first non-empty
-// occurrence wins, an empty value is returned only when no non-empty one
-// exists. GetValue returns ErrKeyNotFound if key is absent, or ErrBadFormat if
-// data is malformed.
-func GetValue(data []byte, key string, dst []byte) ([]byte, error) {
-	raw, err := Get(data, key)
-	if err != nil {
-		return nil, err
+// occurrence wins, and an empty value is used only when no non-empty one
+// exists. A malformed record yields whatever could be parsed before the fault;
+// use Validate when you need to know.
+func AppendValue(dst, data []byte, key string) ([]byte, bool) {
+	raw, ok := Get(data, key)
+	if !ok {
+		return dst, false
 	}
-	// Unescape short-circuits to return raw (aliasing data) when it has no
-	// escapes, so this is zero-copy in the common case and decodes into dst
-	// only when needed.
-	return Unescape(dst[:0], raw), nil
+	if !NeedsUnescape(raw) {
+		return append(dst, raw...), true
+	}
+	return AppendUnescape(dst, raw), true
 }
 
 // NeedsUnescape reports whether raw contains a backslash escape, i.e. whether
-// passing it through Unescape would change it. Values returned by Iterate,
-// Get and GetMany are raw; use this to skip the unescape step (and its copy)
-// when decoding is unnecessary.
+// passing it through AppendUnescape would change it. Values returned by
+// Iterate, All, Get and GetMany are raw; use this to skip the decode (and its
+// copy) when it is unnecessary.
 func NeedsUnescape(raw []byte) bool {
 	return bytes.IndexByte(raw, '\\') >= 0
 }
 
-// Get returns the raw value for key in data: the value as it appears in the
-// input, with any surrounding quotes removed but escape sequences left intact.
+// IsBareKey reports whether val is the sentinel that Iterate and All substitute
+// for a bare key — one written with no '=' at all, such as the "debug" in
+// "level=info debug" — as opposed to a real value that happens to read "true".
+// The two are otherwise indistinguishable, since both arrive as the bytes
+// "true".
+//
+// It compares identity, not contents, so it is only meaningful for a val handed
+// to a callback by this package; anything else reports false.
+func IsBareKey(val []byte) bool {
+	return len(val) == len(trueSlice) && &val[0] == &trueSlice[0]
+}
+
+// Get returns the raw value for key in data — the value as it appears in the
+// input, with any surrounding quotes removed but escape sequences left intact —
+// and whether the key was present. An absent key yields (nil, false); a key
+// present with an empty value yields a non-nil empty slice and true, so the two
+// stay distinguishable. Decode escapes with AppendUnescape, or use AppendValue
+// for a one-call unescaped lookup.
+//
 // The result aliases data (treat it as read-only) and is valid only until data
-// is modified; decode escapes with Unescape if needed. It returns
-// ErrKeyNotFound if the key is absent, or use GetValue for an unescaped,
-// buffer-reusing lookup.
+// is modified. It has capacity equal to its length, so appending to it copies
+// rather than overwriting the bytes that follow the value in data. (Iterate,
+// which calls back once per field rather than once per lookup, does not cap
+// what it hands the callback — capping there costs measurably.)
 //
-// The returned slice has capacity equal to its length, so appending to it
-// copies rather than overwriting the bytes that follow the value in data.
-// (Iterate, which calls back once per field rather than once per lookup, does
-// not cap what it hands the callback — capping there costs measurably.)
-//
-// Duplicate keys resolve as in GetValue and GetMany: the first non-empty
+// Duplicate keys resolve as in AppendValue and GetMany: the first non-empty
 // occurrence wins (iteration stops there); an empty value is returned only
 // when the key never appears with a non-empty one.
-func Get(data []byte, key string) ([]byte, error) {
-	var rawVal []byte // nil = not found; may hold a provisional empty value
+//
+// Get reports no syntax errors. It stops as soon as the key is settled, so a
+// malformed tail beyond that point is never examined; what it can reach, it
+// returns. Call Validate when you need the record checked.
+func Get(data []byte, key string) ([]byte, bool) {
+	var rawVal []byte
+	var found bool
 
-	err := Iterate(data, func(k, v []byte) bool {
+	_ = Iterate(data, func(k, v []byte) bool {
 		if string(k) != key {
 			return true
 		}
+		// cap == len, so a caller's append cannot reach into data.
 		if len(v) > 0 {
-			rawVal = v[:len(v):len(v)] // cap == len, so a caller's append cannot reach into data
-			return false               // settled: first non-empty occurrence wins
+			rawVal, found = v[:len(v):len(v)], true
+			return false // settled: first non-empty occurrence wins
 		}
-		if rawVal == nil {
+		if !found {
 			// Provisional empty; keep looking for a non-empty one. Slicing a
-			// non-nil slice keeps it non-nil even at zero length, so this stays
-			// distinguishable from "absent".
-			rawVal = v[:len(v):len(v)]
+			// non-nil slice keeps it non-nil even at zero length, so a
+			// present-but-empty value stays distinct from an absent key.
+			rawVal, found = v[:len(v):len(v)], true
 		}
 		return true
 	})
-	if err != nil {
-		return nil, err
-	}
-	if rawVal == nil {
-		return nil, ErrKeyNotFound
-	}
-	return rawVal, nil
+	return rawVal, found
 }
 
 // GetMany looks up several keys in a single pass over data. It returns a slice
@@ -400,16 +436,21 @@ func Get(data []byte, key string) ([]byte, error) {
 // The returned values alias data (treat them as read-only) and are valid only
 // until data is modified; each has capacity equal to its length, so appending
 // to one copies rather than overwriting the bytes that follow it in data.
-// Decode escapes with Unescape if needed. buf is reused
-// as the result slice when it is large enough, avoiding a [][]byte allocation;
-// pass back a previous result. If a key appears more than once with a non-empty
-// value, the first such occurrence wins; iteration stops once every key has a
-// non-empty value. ErrBadFormat is returned if data is malformed.
+// Decode escapes with AppendUnescape if needed. buf is reused as the result
+// slice when it is large enough, avoiding a [][]byte allocation; pass back a
+// previous result. If a key appears more than once with a non-empty value, the
+// first such occurrence wins; iteration stops once every key has a non-empty
+// value.
 //
-// Each parsed field is matched against keys linearly, so lookups are intended
-// for small key sets (a handful of keys); for large sets, use Iterate with a
-// map keyed by string(k).
-func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
+// Like Get, GetMany reports no syntax errors — it early-stops, so a malformed
+// tail past the settled keys is never reached. Call Validate when you need the
+// record checked.
+//
+// Each parsed field is matched against keys linearly, which is the fastest
+// arrangement for the handful of keys these lookups are meant for. Measured on
+// a 24-field line, GetMany stays ahead up to roughly ten keys; past that,
+// Iterate with a map keyed by string(k) wins (20 keys: ~505 ns versus ~385 ns).
+func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	n := len(keys)
 	if cap(buf) < n {
 		buf = make([][]byte, n)
@@ -422,7 +463,7 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 	clear(buf)
 
 	remaining := n
-	err := Iterate(data, func(k, v []byte) bool {
+	_ = Iterate(data, func(k, v []byte) bool {
 		for j := range keys {
 			// Length check first: a key already settled with a non-empty value
 			// short-circuits cheaply on every later field, skipping the key
@@ -444,8 +485,64 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 		}
 		return remaining > 0 // stop once every key has a non-empty value
 	})
-	if err != nil {
-		return nil, err
+	return buf
+}
+
+// Validate parses data to completion and reports the first syntax error, or nil
+// if the whole record is well-formed. The lookups deliberately do not do this:
+// they early-stop, so they cannot see a fault past the keys they settled. Use
+// Validate when a record's validity matters, and errors.Is(err, ErrBadFormat)
+// or a *SyntaxError type assertion to inspect the result.
+func Validate(data []byte) error {
+	return Iterate(data, func(key, val []byte) bool { return true })
+}
+
+// All returns an iterator over data's key/value pairs, for use with range:
+//
+//	for key, val := range logfmt.All(line) {
+//		fmt.Printf("%s=%s\n", key, val)
+//	}
+//
+// The pairs, their aliasing and the bare-key sentinel are exactly as described
+// on Iterate. Ranging over a function requires Go 1.23 in the calling module;
+// this package itself still builds on Go 1.21, where All is callable directly.
+//
+// A range loop has nowhere to deliver an error, so All simply stops at a
+// malformed field, having yielded the valid prefix. Call Validate if you need
+// to know; use Iterate to get the error and the pairs in one pass.
+func All(data []byte) func(yield func(key, val []byte) bool) {
+	return func(yield func(key, val []byte) bool) {
+		_ = Iterate(data, yield)
 	}
-	return buf, nil
+}
+
+// SplitRecord splits off the first logfmt record from data, returning it and
+// the remainder. A record ends at the first '\n' (a trailing '\r' is trimmed,
+// so CRLF input works); if there is no newline, the whole of data is the record
+// and rest is nil.
+//
+// This package treats '\n' as ordinary whitespace, so a multi-line buffer
+// handed straight to Iterate parses as one flat run of pairs with no record
+// boundaries — and a lookup can match a key from a later line. Split first:
+//
+//	for len(data) > 0 {
+//		var rec []byte
+//		rec, data = logfmt.SplitRecord(data)
+//		level, _ := logfmt.Get(rec, "level")
+//		// ...
+//	}
+//
+// The returned record aliases data and is capped to its length. It may be
+// empty (for a blank line); Iterate and the lookups handle that as a record
+// with no pairs.
+func SplitRecord(data []byte) (record, rest []byte) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		record, rest = data[:i], data[i+1:]
+	} else {
+		record = data
+	}
+	if n := len(record); n > 0 && record[n-1] == '\r' {
+		record = record[:n-1]
+	}
+	return record[:len(record):len(record)], rest
 }

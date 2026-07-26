@@ -104,7 +104,7 @@ func Benchmark_ParseEscaped_Mine(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = mine.Iterate(sampleEscaped, func(k, v []byte) bool {
 			if mine.NeedsUnescape(v) {
-				dst = mine.Unescape(dst[:0], v)
+				dst = mine.AppendUnescape(dst[:0], v)
 				n += len(dst)
 			} else {
 				n += len(v)
@@ -178,7 +178,7 @@ func Benchmark_Extract_Mine(b *testing.B) {
 	buf := make([][]byte, len(keys))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf, _ = mine.GetMany(sampleBig, keys, buf)
+		buf = mine.GetMany(sampleBig, keys, buf)
 	}
 }
 

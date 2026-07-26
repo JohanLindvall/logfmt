@@ -42,7 +42,7 @@ func Test_Unit_ParseTime(t *testing.T) {
 		},
 	} {
 		t.Run(fmt.Sprintf("test-%d-%s", i, tt.ts), func(t *testing.T) {
-			got, ok := ParseTime(tt.ts)
+			got, ok := ParseTime([]byte(tt.ts))
 			if !ok {
 				t.Fatalf("ParseTime(%q) reported failure, want success", tt.ts)
 			}
@@ -56,9 +56,15 @@ func Test_Unit_ParseTime(t *testing.T) {
 	}
 }
 
+var (
+	benchTSRFC3339 = []byte("2025-05-26T06:10:06.3691056Z")
+	benchTSCustom  = []byte("2025-05-26 08:10:06.369 +0200 CEST")
+	benchTSUnix    = []byte("1748239806.3691056")
+)
+
 func Benchmark_ParseTime_RFC3339(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		if _, ok := ParseTime("2025-05-26T06:10:06.3691056Z"); !ok {
+		if _, ok := ParseTime(benchTSRFC3339); !ok {
 			b.Fatal("failed")
 		}
 	}
@@ -66,7 +72,7 @@ func Benchmark_ParseTime_RFC3339(b *testing.B) {
 
 func Benchmark_ParseTime_Custom(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		if _, ok := ParseTime("2025-05-26 08:10:06.369 +0200 CEST"); !ok {
+		if _, ok := ParseTime(benchTSCustom); !ok {
 			b.Fatal("failed")
 		}
 	}
@@ -74,7 +80,7 @@ func Benchmark_ParseTime_Custom(b *testing.B) {
 
 func Benchmark_ParseTime_Unix(b *testing.B) {
 	for i := 0; i < b.N; i++ {
-		if _, ok := ParseTime("1748239806.3691056"); !ok {
+		if _, ok := ParseTime(benchTSUnix); !ok {
 			b.Fatal("failed")
 		}
 	}
@@ -91,7 +97,7 @@ func Test_Unit_ParseTime_Invalid(t *testing.T) {
 		"2025-13-26T06:10:06Z",  // invalid month
 	} {
 		t.Run(fmt.Sprintf("test-%d-%s", i, tt), func(t *testing.T) {
-			if got, ok := ParseTime(tt); ok {
+			if got, ok := ParseTime([]byte(tt)); ok {
 				t.Errorf("ParseTime(%q) = %v, want failure", tt, got)
 			}
 		})

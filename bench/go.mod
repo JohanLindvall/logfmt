@@ -3,7 +3,10 @@
 // from this directory.
 module github.com/JohanLindvall/logfmt/bench
 
-go 1.21
+// go 1.23 (above the library's own 1.21 floor) so this module can act as a
+// range-over-func consumer in TestAllRangeOverFunc. This is a dev-only
+// comparison harness, not something importers depend on.
+go 1.23
 
 require (
 	github.com/JohanLindvall/logfmt v0.0.0

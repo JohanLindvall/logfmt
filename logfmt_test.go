@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -100,15 +101,18 @@ func Test_Unit_NeedsUnescape(t *testing.T) {
 	}
 }
 
-func Test_Unit_Unescape(t *testing.T) {
-	// No escapes + empty dst: returned unchanged and aliasing raw (zero-copy).
+func Test_Unit_AppendUnescape(t *testing.T) {
+	// AppendUnescape always appends: even with nothing to decode and an empty
+	// dst, the result is a copy, never an alias of raw. (The old Unescape
+	// returned raw itself here; callers who want that now guard with
+	// NeedsUnescape, which is both explicit and faster.)
 	raw := []byte("plain value")
-	got := Unescape(nil, raw)
+	got := AppendUnescape(nil, raw)
 	if string(got) != "plain value" {
 		t.Errorf("no-escape: got %q", got)
 	}
-	if len(got) == 0 || &got[0] != &raw[0] {
-		t.Error("no-escape with empty dst must alias raw (zero-copy)")
+	if len(got) > 0 && &got[0] == &raw[0] {
+		t.Error("AppendUnescape must copy, not alias raw")
 	}
 
 	for _, tt := range []struct{ in, want string }{
@@ -120,13 +124,13 @@ func Test_Unit_Unescape(t *testing.T) {
 		{`a\xb`, "axb"},            // unknown escape -> the literal byte
 		{`trailing\`, `trailing\`}, // lone trailing backslash kept
 	} {
-		if got := Unescape(nil, []byte(tt.in)); string(got) != tt.want {
+		if got := AppendUnescape(nil, []byte(tt.in)); string(got) != tt.want {
 			t.Errorf("Unescape(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 
 	// Non-empty dst: append semantics preserved (no short-circuit).
-	if got := Unescape([]byte("prefix:"), []byte("plain")); string(got) != "prefix:plain" {
+	if got := AppendUnescape([]byte("prefix:"), []byte("plain")); string(got) != "prefix:plain" {
 		t.Errorf("append to non-empty dst = %q, want prefix:plain", got)
 	}
 }
@@ -143,9 +147,9 @@ func Test_Unit_Get(t *testing.T) {
 		{"id", "42"},
 		{"r", `esc\tval`}, // raw: escape left intact
 	} {
-		v, err := Get(line, tt.key)
-		if err != nil {
-			t.Errorf("Get(%q) error: %v", tt.key, err)
+		v, ok := Get(line, tt.key)
+		if !ok {
+			t.Errorf("Get(%q): not found", tt.key)
 			continue
 		}
 		if string(v) != tt.want {
@@ -153,12 +157,18 @@ func Test_Unit_Get(t *testing.T) {
 		}
 	}
 
-	if _, err := Get(line, "missing"); !errors.Is(err, ErrKeyNotFound) {
-		t.Errorf("Get(missing) error = %v, want ErrKeyNotFound", err)
+	if v, ok := Get(line, "missing"); ok || v != nil {
+		t.Errorf("Get(missing) = %q, %v; want nil, false", v, ok)
 	}
 
-	if _, err := Get([]byte(`a="unterminated`), "a"); err == nil {
-		t.Error("Get on malformed input: expected error, got nil")
+	// A malformed record is not an error here: Get returns what the valid
+	// prefix yielded. The key sits before the fault, so it is still found.
+	if v, ok := Get([]byte(`a=1 b="unterminated`), "a"); !ok || string(v) != "1" {
+		t.Errorf("Get(a) on malformed tail = %q, %v; want 1, true", v, ok)
+	}
+	// ...and a key that only appears past the fault is simply absent.
+	if _, ok := Get([]byte(`a="unterminated b=2`), "b"); ok {
+		t.Error("Get(b) past a fault: want not found")
 	}
 }
 
@@ -170,10 +180,7 @@ func Test_Unit_GetMany(t *testing.T) {
 	line := []byte(`level=info msg="user login" id=42 r="a\tb" empty="" dup="" dup=second`)
 	keys := []string{"id", "level", "missing", "msg", "empty", "r", "dup"}
 
-	got, err := GetMany(line, keys, nil)
-	if err != nil {
-		t.Fatalf("GetMany: %v", err)
-	}
+	got := GetMany(line, keys, nil)
 	if len(got) != len(keys) {
 		t.Fatalf("len(got) = %d, want %d", len(got), len(keys))
 	}
@@ -195,22 +202,19 @@ func Test_Unit_GetMany(t *testing.T) {
 	}
 
 	// Reuse the previous result's storage for a second line.
-	got, err = GetMany([]byte(`level=warn id=7`), []string{"level", "id", "msg"}, got)
-	if err != nil {
-		t.Fatalf("GetMany reuse: %v", err)
-	}
+	got = GetMany([]byte(`level=warn id=7`), []string{"level", "id", "msg"}, got)
 	if string(got[0]) != "warn" || string(got[1]) != "7" || got[2] != nil {
 		t.Errorf("reuse got = [%q %q %v], want [warn 7 nil]", got[0], got[1], got[2])
 	}
 
 	// Empty key set.
-	if res, err := GetMany(line, nil, nil); err != nil || len(res) != 0 {
-		t.Errorf("GetMany(nil keys) = %v, %v; want empty, nil", res, err)
+	if res := GetMany(line, nil, nil); len(res) != 0 {
+		t.Errorf("GetMany(nil keys) = %v; want empty", res)
 	}
 
-	// Malformed input.
-	if _, err := GetMany([]byte(`a="x`), []string{"a"}, nil); err == nil {
-		t.Error("GetMany on malformed input: expected error, got nil")
+	// Malformed input yields the valid prefix rather than an error.
+	if res := GetMany([]byte(`a=1 b="x`), []string{"a", "b"}, nil); string(res[0]) != "1" || res[1] != nil {
+		t.Errorf("GetMany on malformed tail = [%q %v]; want [1 nil]", res[0], res[1])
 	}
 }
 
@@ -219,21 +223,22 @@ func Test_Unit_GetMany_Allocs(t *testing.T) {
 	keys := []string{"level", "id", "ts"}
 
 	buf := make([][]byte, len(keys))
-	buf, _ = GetMany(line, keys, buf)
+	buf = GetMany(line, keys, buf)
 
 	// Raw values alias data and buf is reused, so a warm call allocates nothing.
 	allocs := testing.AllocsPerRun(100, func() {
-		buf, _ = GetMany(line, keys, buf)
+		buf = GetMany(line, keys, buf)
 	})
 	if allocs != 0 {
 		t.Errorf("GetMany allocs/op = %v, want 0", allocs)
 	}
 }
 
-// Values from the lookups are capped to their length, so a caller that appends
-// to one gets a copy instead of scribbling over the rest of the input line.
-// Iterate deliberately does NOT cap (it would cost ~4.5% on field-dense input),
-// so this guarantee is specific to Get/GetValue/GetMany.
+// Values from the aliasing lookups are capped to their length, so a caller that
+// appends to one gets a copy instead of scribbling over the rest of the input
+// line. Iterate deliberately does NOT cap (it would cost ~4.5% on field-dense
+// input), so this guarantee is specific to Get and GetMany; AppendValue cannot
+// alias the input at all, since it always copies into the caller's buffer.
 func Test_Unit_Lookups_CapValues(t *testing.T) {
 	const orig = `a=hi b=there empty= q="x"`
 
@@ -251,24 +256,25 @@ func Test_Unit_Lookups_CapValues(t *testing.T) {
 
 	line := []byte(orig)
 	for _, key := range []string{"a", "b", "empty", "q"} {
-		v, err := Get(line, key)
-		if err != nil {
-			t.Fatalf("Get(%q): %v", key, err)
+		v, ok := Get(line, key)
+		if !ok {
+			t.Fatalf("Get(%q): not found", key)
 		}
 		check(t, "Get("+key+")", v, line)
 
-		gv, err := GetValue(line, key, nil)
-		if err != nil {
-			t.Fatalf("GetValue(%q): %v", key, err)
+		// AppendValue writes into the caller's buffer, so its result must not
+		// point into line at all.
+		av, ok := AppendValue(nil, line, key)
+		if !ok {
+			t.Fatalf("AppendValue(%q): not found", key)
 		}
-		check(t, "GetValue("+key+")", gv, line)
+		if len(av) > 0 && &av[0] == &v[0] {
+			t.Errorf("AppendValue(%q) aliases the input; it must copy", key)
+		}
 	}
 
 	keys := []string{"a", "b", "empty", "q", "missing"}
-	vals, err := GetMany(line, keys, nil)
-	if err != nil {
-		t.Fatalf("GetMany: %v", err)
-	}
+	vals := GetMany(line, keys, nil)
 	for i, key := range keys {
 		if key == "missing" {
 			if vals[i] != nil {
@@ -280,13 +286,13 @@ func Test_Unit_Lookups_CapValues(t *testing.T) {
 	}
 
 	// Capping must not turn a present-but-empty value into nil — that is how
-	// GetMany distinguishes it from an absent key, and how Get avoids reporting
-	// ErrKeyNotFound for "empty=".
-	if v, err := Get(line, "empty"); err != nil || v == nil || len(v) != 0 {
-		t.Errorf("Get(empty) = %v (nil? %v), %v; want present, non-nil, empty", v, v == nil, err)
+	// GetMany distinguishes it from an absent key, and how Get reports "empty="
+	// as found rather than missing.
+	if v, ok := Get(line, "empty"); !ok || v == nil || len(v) != 0 {
+		t.Errorf("Get(empty) = %v (nil? %v), %v; want present, non-nil, empty", v, v == nil, ok)
 	}
-	if v, err := Get([]byte(`x=1 trailing=`), "trailing"); err != nil || v == nil {
-		t.Errorf("Get(trailing=) = %v (nil? %v), %v; want present, non-nil", v, v == nil, err)
+	if v, ok := Get([]byte(`x=1 trailing=`), "trailing"); !ok || v == nil {
+		t.Errorf("Get(trailing=) = %v (nil? %v), %v; want present, non-nil", v, v == nil, ok)
 	}
 	if vals[2] == nil {
 		t.Error("GetMany(empty) is nil; a present-but-empty value must stay non-nil")
@@ -308,7 +314,7 @@ func Test_Unit_Unescape_Unicode(t *testing.T) {
 		{"x" + bs + "u", "x" + bs + "u"},            // bare \u at end: verbatim
 		{"a" + bs + "tb" + bs + "u0041", "a\tbA"},   // mixed with \t
 	} {
-		if got := Unescape(nil, []byte(tt.in)); string(got) != tt.want {
+		if got := AppendUnescape(nil, []byte(tt.in)); string(got) != tt.want {
 			t.Errorf("Unescape(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
@@ -318,34 +324,33 @@ func Test_Unit_Get_Duplicates(t *testing.T) {
 	line := []byte(`dup="" mid=x dup=second dup=third`)
 
 	// First non-empty occurrence wins over an earlier empty one.
-	if v, err := Get(line, "dup"); err != nil || string(v) != "second" {
-		t.Errorf("Get(dup) = %q, %v; want second", v, err)
+	if v, ok := Get(line, "dup"); !ok || string(v) != "second" {
+		t.Errorf("Get(dup) = %q, %v; want second", v, ok)
 	}
-	// Only-empty occurrences return the empty value, not ErrKeyNotFound.
-	if v, err := Get([]byte(`e= x=1`), "e"); err != nil || v == nil || len(v) != 0 {
-		t.Errorf("Get(bare e=) = %q, %v; want present empty", v, err)
+	// Only-empty occurrences are found, with an empty value.
+	if v, ok := Get([]byte(`e= x=1`), "e"); !ok || v == nil || len(v) != 0 {
+		t.Errorf("Get(bare e=) = %q, %v; want present empty", v, ok)
 	}
-	if v, err := Get([]byte(`e= x=1`), "x"); err != nil || string(v) != "1" {
-		t.Errorf("Get(x after empty e=) = %q, %v; want 1 — an empty value must not swallow the next pair", v, err)
+	if v, ok := Get([]byte(`e= x=1`), "x"); !ok || string(v) != "1" {
+		t.Errorf("Get(x after empty e=) = %q, %v; want 1 — an empty value must not swallow the next pair", v, ok)
 	}
-	if v, err := Get([]byte(`e="" x=1`), "e"); err != nil || v == nil || len(v) != 0 {
-		t.Errorf("Get(e) = %q, %v; want present empty", v, err)
+	if v, ok := Get([]byte(`e="" x=1`), "e"); !ok || v == nil || len(v) != 0 {
+		t.Errorf("Get(e) = %q, %v; want present empty", v, ok)
 	}
-	if v, err := Get([]byte(`x=1 e=`), "e"); err != nil || v == nil || len(v) != 0 {
-		t.Errorf("Get(trailing e=) = %q, %v; want present empty", v, err)
+	if v, ok := Get([]byte(`x=1 e=`), "e"); !ok || v == nil || len(v) != 0 {
+		t.Errorf("Get(trailing e=) = %q, %v; want present empty", v, ok)
 	}
-	// GetValue agrees with Get.
-	if v, err := GetValue(line, "dup", nil); err != nil || string(v) != "second" {
-		t.Errorf("GetValue(dup) = %q, %v; want second", v, err)
+	// AppendValue agrees with Get.
+	if v, ok := AppendValue(nil, line, "dup"); !ok || string(v) != "second" {
+		t.Errorf("AppendValue(dup) = %q, %v; want second", v, ok)
 	}
 	// GetMany agrees too.
-	m, err := GetMany(line, []string{"dup"}, nil)
-	if err != nil || string(m[0]) != "second" {
-		t.Errorf("GetMany(dup) = %q, %v; want second", m[0], err)
+	if m := GetMany(line, []string{"dup"}, nil); string(m[0]) != "second" {
+		t.Errorf("GetMany(dup) = %q; want second", m[0])
 	}
 }
 
-func Test_Unit_GetValue(t *testing.T) {
+func Test_Unit_AppendValue(t *testing.T) {
 	line := []byte(`level=info msg="user login" r="esc\tval" empty=`)
 
 	var buf []byte
@@ -355,27 +360,204 @@ func Test_Unit_GetValue(t *testing.T) {
 		{"r", "esc\tval"}, // unescaped, unlike Get
 		{"empty", ""},
 	} {
-		v, err := GetValue(line, tt.key, buf[:0])
-		if err != nil {
-			t.Errorf("GetValue(%q): %v", tt.key, err)
+		v, ok := AppendValue(buf[:0], line, tt.key)
+		if !ok {
+			t.Errorf("AppendValue(%q): not found", tt.key)
 			continue
 		}
 		if string(v) != tt.want {
-			t.Errorf("GetValue(%q) = %q, want %q", tt.key, v, tt.want)
+			t.Errorf("AppendValue(%q) = %q, want %q", tt.key, v, tt.want)
 		}
 	}
 
-	if _, err := GetValue(line, "missing", nil); !errors.Is(err, ErrKeyNotFound) {
-		t.Errorf("GetValue(missing) err = %v, want ErrKeyNotFound", err)
+	// Absent key: dst comes back untouched, ok is false.
+	dst := append([]byte(nil), "keep"...)
+	v, ok := AppendValue(dst, line, "missing")
+	if ok {
+		t.Error("AppendValue(missing) ok = true, want false")
 	}
-	if _, err := GetValue([]byte(`a="x`), "a", nil); !errors.Is(err, ErrBadFormat) {
-		t.Errorf("GetValue on malformed: err = %v, want ErrBadFormat", err)
+	if string(v) != "keep" {
+		t.Errorf("AppendValue(missing) = %q, want the dst it was given (%q)", v, "keep")
 	}
 
-	// No-escape values are returned zero-copy (aliasing line, dst untouched).
-	dst := make([]byte, 0, 8)
-	v, _ := GetValue(line, "level", dst)
-	if len(dst) != 0 && &v[0] == &dst[:1][0] {
-		t.Error("no-escape value should alias line, not dst")
+	// Append semantics: the value extends dst rather than replacing it.
+	if v, ok := AppendValue(dst, line, "level"); !ok || string(v) != "keepinfo" {
+		t.Errorf("AppendValue appended = %q, %v; want keepinfo, true", v, ok)
+	}
+
+	// A malformed record is not an error; the reachable prefix still resolves.
+	if v, ok := AppendValue(nil, []byte(`a=1 b="x`), "a"); !ok || string(v) != "1" {
+		t.Errorf("AppendValue on malformed tail = %q, %v; want 1, true", v, ok)
+	}
+}
+
+func Test_Unit_Validate_SyntaxError(t *testing.T) {
+	if err := Validate([]byte(`a=1 b="ok" c=3`)); err != nil {
+		t.Errorf("Validate(well-formed) = %v, want nil", err)
+	}
+
+	for _, tt := range []struct {
+		line       string
+		wantOffset int
+		wantReason string
+	}{
+		// Offset points at the opening quote that is never closed.
+		{`a=1 b="unterminated`, 6, "unterminated quoted value"},
+		// Offset points at the offending byte itself.
+		{`a="x"y`, 5, "unexpected byte after closing quote"},
+	} {
+		err := Validate([]byte(tt.line))
+		if err == nil {
+			t.Fatalf("Validate(%q) = nil, want an error", tt.line)
+		}
+		if !errors.Is(err, ErrBadFormat) {
+			t.Errorf("Validate(%q): errors.Is(err, ErrBadFormat) = false, want true", tt.line)
+		}
+		var se *SyntaxError
+		if !errors.As(err, &se) {
+			t.Fatalf("Validate(%q) = %T, want *SyntaxError", tt.line, err)
+		}
+		if se.Offset != tt.wantOffset {
+			t.Errorf("Validate(%q) offset = %d, want %d", tt.line, se.Offset, tt.wantOffset)
+		}
+		if se.Reason != tt.wantReason {
+			t.Errorf("Validate(%q) reason = %q, want %q", tt.line, se.Reason, tt.wantReason)
+		}
+		// The message carries the position, which is the point of the type.
+		if !strings.Contains(err.Error(), fmt.Sprint(tt.wantOffset)) {
+			t.Errorf("Validate(%q) message %q omits the offset", tt.line, err)
+		}
+	}
+}
+
+func Test_Unit_SplitRecord(t *testing.T) {
+	for _, tt := range []struct {
+		in         string
+		wantRec    string
+		wantRest   string
+		wantNilest bool
+	}{
+		{"a=1\nb=2\n", "a=1", "b=2\n", false},
+		{"a=1\r\nb=2", "a=1", "b=2", false}, // CRLF: the \r is trimmed
+		{"only=1", "only=1", "", true},      // no newline: all record, nil rest
+		{"\nb=2", "", "b=2", false},         // leading blank line
+		{"", "", "", true},                  // empty input
+	} {
+		rec, rest := SplitRecord([]byte(tt.in))
+		if string(rec) != tt.wantRec {
+			t.Errorf("SplitRecord(%q) record = %q, want %q", tt.in, rec, tt.wantRec)
+		}
+		if string(rest) != tt.wantRest {
+			t.Errorf("SplitRecord(%q) rest = %q, want %q", tt.in, rest, tt.wantRest)
+		}
+		if (rest == nil) != tt.wantNilest {
+			t.Errorf("SplitRecord(%q) rest nil = %v, want %v", tt.in, rest == nil, tt.wantNilest)
+		}
+		// The record is capped, so appending to it cannot reach into the rest.
+		if cap(rec) != len(rec) {
+			t.Errorf("SplitRecord(%q) record cap = %d, want %d", tt.in, cap(rec), len(rec))
+		}
+	}
+
+	// The documented loop terminates and yields each record in order.
+	data := []byte("a=1\nb=2\r\nc=3")
+	var got []string
+	for len(data) > 0 {
+		var rec []byte
+		rec, data = SplitRecord(data)
+		got = append(got, string(rec))
+	}
+	if want := []string{"a=1", "b=2", "c=3"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("split loop = %q, want %q", got, want)
+	}
+
+	// Splitting is what keeps a lookup from crossing a record boundary.
+	multi := []byte("level=info\nlevel=error")
+	if v, _ := Get(multi, "level"); string(v) != "info" {
+		t.Errorf("Get on unsplit input = %q; want info (first line)", v)
+	}
+	rec, _ := SplitRecord(multi)
+	if v, _ := Get(rec, "level"); string(v) != "info" {
+		t.Errorf("Get on first record = %q, want info", v)
+	}
+}
+
+// All is exercised here by direct invocation, which is precisely what a range
+// loop desugars to; this module declares go 1.21, so it cannot use the range
+// form itself. TestAllRangeOverFunc in the bench module (go 1.23) proves the
+// consumer-facing promise that `for k, v := range logfmt.All(line)` compiles.
+func Test_Unit_All(t *testing.T) {
+	var got []string
+	All([]byte(`a=1 b="two" c`))(func(k, v []byte) bool {
+		got = append(got, string(k)+"="+string(v))
+		return true
+	})
+	if want := []string{"a=1", "b=two", "c=true"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("All = %q, want %q", got, want)
+	}
+
+	// Returning false stops iteration — what `break` compiles to.
+	var n int
+	All([]byte(`a=1 b=2 c=3`))(func(k, v []byte) bool {
+		n++
+		return false
+	})
+	if n != 1 {
+		t.Errorf("stopping after the first pair yielded %d, want 1", n)
+	}
+
+	// A malformed record yields the valid prefix and stops; the error is
+	// Validate's job, since a range loop has nowhere to report one.
+	var pairs int
+	All([]byte(`a=1 b=2 c="unterminated`))(func(k, v []byte) bool {
+		pairs++
+		return true
+	})
+	if pairs != 2 {
+		t.Errorf("All over malformed input yielded %d pairs, want 2 (the valid prefix)", pairs)
+	}
+}
+
+func Test_Unit_IsBareKey(t *testing.T) {
+	// A bare key and an explicit true are indistinguishable by content; only
+	// IsBareKey tells them apart.
+	var bare, explicit []byte
+	_ = Iterate([]byte(`flag other=true`), func(k, v []byte) bool {
+		switch string(k) {
+		case "flag":
+			bare = v
+		case "other":
+			explicit = v
+		}
+		return true
+	})
+	if string(bare) != "true" || string(explicit) != "true" {
+		t.Fatalf("setup: bare = %q, explicit = %q; want both true", bare, explicit)
+	}
+	if !IsBareKey(bare) {
+		t.Error("IsBareKey(bare key value) = false, want true")
+	}
+	if IsBareKey(explicit) {
+		t.Error(`IsBareKey(value of other=true) = true, want false`)
+	}
+	// Anything not handed out by this package reports false.
+	if IsBareKey([]byte("true")) {
+		t.Error("IsBareKey on a caller's own []byte = true, want false")
+	}
+	if IsBareKey(nil) {
+		t.Error("IsBareKey(nil) = true, want false")
+	}
+}
+
+func Test_Unit_ParseTime_Allocs(t *testing.T) {
+	// ParseTime takes []byte like the rest of the package; the conversion it
+	// does internally must not escape, or every call would allocate.
+	for _, ts := range [][]byte{
+		[]byte("1748239806.3691056"),
+		[]byte("2025-05-26T06:10:06.3691056Z"),
+	} {
+		if allocs := testing.AllocsPerRun(100, func() { ParseTime(ts) }); allocs != 0 {
+			t.Errorf("ParseTime(%q) allocs = %v, want 0", ts, allocs)
+		}
 	}
 }

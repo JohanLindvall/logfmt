@@ -24,7 +24,9 @@ go get github.com/JohanLindvall/logfmt
 ```
 
 Requires Go 1.21 or newer. (CI tests that floor on every push, alongside the
-current stable release, on both amd64 and arm64.)
+current stable release, on both amd64 and arm64.) Ranging over `All` needs
+Go 1.23 in *your* module — the library itself stays at 1.21, so it never forces
+a toolchain upgrade on you.
 
 ## Usage
 
@@ -46,19 +48,28 @@ if err != nil {
 }
 ```
 
+On Go 1.23 or newer, `All` is the same walk as a range loop:
+
+```go
+for key, val := range logfmt.All(line) {
+    fmt.Printf("%s = %s\n", key, val)
+}
+```
+
 Notes:
 
 - A bare key with no `=` (e.g. `debug`) is reported with `val` equal to the
-  literal `true`.
+  literal `true`. `IsBareKey(val)` tells that apart from an explicit
+  `debug=true`, which is otherwise byte-identical.
 - Quoted values are returned **without** the surrounding quotes but are **not**
-  unescaped — backslash escapes are left intact. Use `Unescape` to decode
+  unescaped — backslash escapes are left intact. Use `AppendUnescape` to decode
   them.
 - Returned slices alias the input (or, for bare keys, a shared constant) —
   treat them as read-only and copy anything that must outlive the input.
 - The parser is deliberately lenient and diverges from go-logfmt in a few
   documented ways (e.g. a stray `"` in an unquoted value is a literal byte, not
   an error). See the [package documentation](https://pkg.go.dev/github.com/JohanLindvall/logfmt).
-- All lookups (`Get`, `GetValue`, `GetMany`) resolve duplicate keys the same
+- All lookups (`Get`, `AppendValue`, `GetMany`) resolve duplicate keys the same
   way: the **first non-empty occurrence wins**; an empty value is used only
   when the key never appears with a non-empty one.
 
@@ -66,60 +77,51 @@ Notes:
 
 Newlines are ordinary whitespace to this parser — there is no record framing.
 Hand it a multi-line buffer and you get every line's pairs as one flat stream,
-with no boundary marker, and lookups can match a key from a later line. Split
-the input yourself and call `Iterate` once per record:
+with no boundary marker, and lookups can match a key from a later line.
+`SplitRecord` peels off one record at a time without allocating, and handles
+CRLF:
 
 ```go
 for len(data) > 0 {
-    line := data
-    if i := bytes.IndexByte(data, '\n'); i >= 0 {
-        line, data = data[:i], data[i+1:]
-    } else {
-        data = nil
-    }
-    _ = logfmt.Iterate(line, func(k, v []byte) bool { /* ... */ return true })
+    var rec []byte
+    rec, data = logfmt.SplitRecord(data)
+    level, _ := logfmt.Get(rec, "level")
+    fmt.Printf("%s\n", level)
 }
 ```
 
 ### Look up a single key, unescaped
 
-`GetValue` finds a key and returns its **unescaped** value. When the value needs
-decoding it is written into the caller-provided buffer (reusable across calls);
-when it needs none, a sub-slice of the input is returned without copying. The
-result thus aliases either the buffer or the input, so copy it if it must outlive
-them.
+`AppendValue` finds a key and appends its **unescaped** value to your buffer,
+returning the extended slice and whether the key was present. It always appends,
+so the result never aliases the input and is yours to keep.
 
 ```go
 var buf []byte
-val, err := logfmt.GetValue(line, "msg", buf[:0])
-switch {
-case errors.Is(err, logfmt.ErrKeyNotFound):
+val, ok := logfmt.AppendValue(buf[:0], line, "msg")
+if !ok {
     // key absent
-case err != nil:
-    log.Fatal(err)
-default:
-    fmt.Printf("msg = %s\n", val)
 }
+fmt.Printf("msg = %s\n", val)
 ```
 
 ### Look up a single key, raw
 
 `Get` returns the **raw** value (surrounding quotes removed, escape sequences
-left intact). The result aliases the input — no copy, no allocation — and is
-valid until the input is modified. Use `GetValue` instead when you want the
-value unescaped into your own buffer.
+left intact) and whether the key was found. The result aliases the input — no
+copy, no allocation — and is valid until the input is modified. Use
+`AppendValue` instead when you want the value unescaped into your own buffer.
 
 ```go
-val, err := logfmt.Get(line, "msg")
-switch {
-case errors.Is(err, logfmt.ErrKeyNotFound):
+val, ok := logfmt.Get(line, "msg")
+if !ok {
     // key absent
-case err != nil:
-    log.Fatal(err)
-default:
-    fmt.Printf("msg = %s\n", val) // raw value, aliasing line
 }
+fmt.Printf("msg = %s\n", val) // raw value, aliasing line
 ```
+
+A key present with an empty value (`msg=`) returns `ok == true` and a non-nil
+empty slice, so it stays distinct from an absent key.
 
 ### Look up several keys in one pass
 
@@ -133,10 +135,7 @@ reuse as the result slice across calls and avoid allocating it each time.
 keys := []string{"timestamp", "level"}
 var buf [][]byte // reuse across calls
 
-vals, err := logfmt.GetMany(line, keys, buf)
-if err != nil {
-    log.Fatal(err)
-}
+vals := logfmt.GetMany(line, keys, buf)
 for i, v := range vals {
     if v == nil {
         continue // keys[i] not present
@@ -145,37 +144,37 @@ for i, v := range vals {
 }
 ```
 
-Keys are matched linearly against each parsed field, so this is meant for small
-key sets (a handful). For many keys, use `Iterate` with a map keyed by
-`string(k)` — the compiler optimizes that conversion away in a map index.
+Keys are matched linearly against each parsed field, which is fastest for the
+handful of keys these lookups target. Measured on a 24-field line, `GetMany`
+stays ahead up to roughly ten keys; past that, use `Iterate` with a map keyed by
+`string(k)` (20 keys: ~505 ns vs ~385 ns) — the compiler optimizes that
+conversion away in a map index.
 
 ### Unescape a raw value
 
-`Unescape` decodes the escapes in a raw value (as returned by `Iterate`,
-`Get` or `GetMany`), appending to a destination buffer. It recognises `\n`, `\r`,
+`AppendUnescape` decodes the escapes in a raw value (as returned by `Iterate`,
+`All`, `Get` or `GetMany`), appending to a destination buffer. It recognises `\n`, `\r`,
 `\t` and JSON-style `\uXXXX` unicode escapes including surrogate pairs — so
 values encoded by go-logfmt (which writes control characters as `\u00XX`)
 round-trip correctly. Any other escaped byte (such as `\"` or `\\`) is emitted
 as-is; malformed `\u` sequences and a trailing lone backslash are kept verbatim.
 
-As a fast path, when the value contains no escape at all the buffer is left
-untouched and the value is returned directly — so the result may alias either the
-destination buffer or the input. Use the returned slice, not the buffer you
-passed in.
+It always appends, so the result never aliases the input.
 
 ```go
-dst := logfmt.Unescape(nil, []byte(`hello\tworld`)) // "hello\tworld" -> hello<TAB>world
+dst := logfmt.AppendUnescape(nil, []byte(`hello\tworld`)) // -> hello<TAB>world
 ```
 
-`NeedsUnescape` reports whether a raw value actually contains a backslash escape.
-`Unescape` already skips the copy on its own when there is nothing to decode, but
-`NeedsUnescape` lets you branch before deciding whether to involve a buffer:
+Most values contain no escapes at all, so guard with `NeedsUnescape` when you
+want to skip the copy entirely. This is both the zero-copy path and the faster
+one:
 
 ```go
 v, _ := logfmt.Get(line, "msg")
 if logfmt.NeedsUnescape(v) {
-    v = logfmt.Unescape(buf[:0], v)
+    v = logfmt.AppendUnescape(buf[:0], v) // decoded into buf
 }
+// otherwise v still aliases line, with no copy made
 ```
 
 ### Parse a timestamp value
@@ -187,7 +186,7 @@ delimiters left over from a slightly malformed line (e.g. a stray `}`) are trimm
 first, and on success the returned time is normalized to UTC.
 
 ```go
-t, ok := logfmt.ParseTime("1748239806.3691056")
+t, ok := logfmt.ParseTime([]byte("1748239806.3691056"))
 if ok {
     fmt.Println(t) // 2025-05-26 06:10:06.3691056 +0000 UTC
 }
@@ -206,9 +205,10 @@ read-only: writing through a value overwrites your log line, and a bare key's
 
 Appending is the subtler case, and the two APIs differ deliberately:
 
-- **`Get`, `GetValue` and `GetMany` cap their results** (`cap == len`), so
-  `append(v, …)` copies instead of overwriting whatever follows the value in the
-  input. They set a slot once per lookup, so the capping is free.
+- **`Get` and `GetMany` cap their results** (`cap == len`), so `append(v, …)`
+  copies instead of overwriting whatever follows the value in the input. They
+  set a slot once per lookup, so the capping is free. `AppendValue` and
+  `AppendUnescape` go further and never alias the input at all.
 - **`Iterate` does not cap** what it passes the callback. Doing so costs ~4.5%
   on field-dense input (measured) because it lands once per *field*. Inside a
   callback, copy before appending — `append(dst[:0], v...)`, `string(v)` — or
@@ -216,19 +216,33 @@ Appending is the subtler case, and the two APIs differ deliberately:
 
 ## Errors
 
-| Error            | Meaning                                                        |
-| ---------------- | -------------------------------------------------------------- |
-| `ErrBadFormat`   | Unterminated quoted value, or a closing quote followed by a non-space byte. |
-| `ErrKeyNotFound` | `Get` or `GetValue` could not find the requested key (`GetMany` reports absence as a `nil` slot). |
+Only `Iterate` and `Validate` report syntax errors, and both return a
+`*SyntaxError` carrying the byte offset of the fault:
 
-Two streaming consequences:
+```go
+if err := logfmt.Validate(line); err != nil {
+    var se *logfmt.SyntaxError
+    if errors.As(err, &se) {
+        fmt.Printf("bad record at byte %d: %s\n", se.Offset, se.Reason)
+    }
+}
+```
 
-- When `Iterate` returns `ErrBadFormat`, every pair *before* the fault has
-  already been delivered to your callback. That prefix is valid.
-- The lookups stop as soon as their keys are settled, so a malformed tail beyond
-  that point is never seen. A `nil` error from `Get`/`GetMany`/`GetValue` means
-  "your keys resolved", not "the line is well-formed". Run `Iterate` to
-  completion if you need validation.
+`errors.Is(err, logfmt.ErrBadFormat)` matches any of them, so sentinel checks
+work too. There are exactly two faults: an unterminated quoted value, and a
+closing quote followed by a non-space byte.
+
+Two consequences of streaming:
+
+- When `Iterate` returns an error, every pair *before* the fault has already
+  been delivered to your callback. That prefix is valid.
+- **The lookups report no errors at all.** They stop as soon as their keys are
+  settled, so a malformed tail beyond that point is never examined — an error
+  return would promise a validation they do not perform. They give you what the
+  reachable prefix holds; call `Validate` when a record's validity matters.
+
+Absence is uniform: `Get` and `AppendValue` return `false`, `GetMany` leaves the
+slot `nil`.
 
 ## Scope
 
@@ -246,8 +260,8 @@ go test -bench=. -benchmem      # this package's microbenchmarks
 make bench-md                   # regenerate the committed tables in bench/
 ```
 
-`Iterate`, `Get` and `GetMany` allocate nothing on the hot path (and `GetValue`
-when its buffer is reused). Cost splits into a fixed per-field overhead of
+`Iterate`, `All`, `Get`, `GetMany` and `SplitRecord` allocate nothing at all
+(and `AppendValue`/`AppendUnescape` nothing beyond growing your buffer). Cost splits into a fixed per-field overhead of
 ~6 ns plus scanning: ~11.7 GB/s through unquoted values (word-at-a-time SWAR)
 and ~27 GB/s through quoted ones (`bytes.IndexByte`, SIMD in the stdlib). Short
 fields are therefore overhead-bound, long values scan-bound. Lookups are linear

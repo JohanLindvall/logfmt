@@ -35,12 +35,17 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
-      - name: Vet
-        run: go vet ./... && cd bench && go vet ./...
+      - name: Vet (root module)
+        run: go vet ./...
       - name: Test (root module)
         run: go test -race -cover ./...
-      - name: Test (bench module)
-        run: cd bench && go test ./...
+      # The bench module declares go 1.23: it doubles as the range-over-func
+      # consumer that proves All works with `for k, v := range`. Skip it on the
+      # floor job, whose whole purpose is to prove the library itself still
+      # builds and passes at its declared go 1.21 minimum.
+      - name: Vet + test (bench module)
+        if: matrix.go != '1.21'
+        run: cd bench && go vet ./... && go test ./...
 
   lint:
     runs-on: ubuntu-latest

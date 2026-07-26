@@ -31,6 +31,9 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   `GetMany`/`Get`'s first-non-empty duplicate resolution against a naive
   collect-all reference. **Run after any change to the lookup state machine.**
 - `*_test.go` — unit tests, benchmarks, and a regex-vs-logfmt comparison.
+- `bench/` — separate module, **declares go 1.23** (above the library floor) so
+  it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
+  with `for … range`. CI skips this module on the 1.21 floor job.
 - `LICENSE` — MIT.
 
 ## Compatibility floor: `go 1.21`
@@ -39,45 +42,86 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 minimum toolchain every importer must have, not the version it was developed
 on. CI runs the suite at 1.21 as well as at `stable`, so anything newer breaks
 the build there. `clear()`, `min`/`max` and the `slices`/`maps` packages are all
-1.21 and therefore fair game; **`iter.Seq2`/range-over-func (1.23) is not**.
-Adding a range-over-func iterator would mean bumping the floor — a deliberate
-trade, not a drive-by. `bench/go.mod` tracks the same floor.
+1.21 and therefore fair game; the `iter` package (1.23) is **not**.
+Range-over-func did **not** require the bump: `All` returns the bare
+`func(yield func(k, v []byte) bool)` type rather than `iter.Seq2`, so the 1.23
+requirement lands on the consumer's module, not this one. `bench/go.mod` is
+1.23 precisely so it can be that consumer in a test.
 
-## Public API (read-only, raw-by-default; keys are `string` everywhere)
+## Public API (read-only, raw-by-default; `[]byte` in and out, keys are `string`)
+
+Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — see
+"API design rules" below before changing any of it.
 
 - `Iterate(data, func(k, v) bool) error` — core primitive; calls back per pair,
-  `k`/`v` alias `data` (bare key → shared `"true"` constant; all results are
-  read-only). Quoted values have quotes stripped but escapes left intact (raw).
-  `false` from the callback stops.
-- `Get(data, key string) ([]byte, error)` — raw value, aliases `data`, zero-copy.
-- `GetMany(data, keys, buf) ([][]byte, error)` — multi-key single pass, raw
-  aliasing values, **`nil` for absent** (present-but-empty is a non-nil
+  `k`/`v` alias `data` (bare key → shared `trueSlice`; all results read-only).
+  Quoted values have quotes stripped but escapes left intact (raw). `false` from
+  the callback stops. **The only function that reports errors alongside data.**
+- `All(data) func(yield func(k, v []byte) bool)` — range-over-func wrapper over
+  `Iterate`. Deliberately the bare func type, **not** `iter.Seq2`: that keeps the
+  `iter` import (and the go 1.23 floor) out of this module, while consumers on
+  1.23+ can still `for k, v := range`. Proven by `TestAllRangeOverFunc` in the
+  bench module, which declares 1.23 for exactly that purpose.
+- `Get(data, key) ([]byte, bool)` — raw value, aliases `data`, zero-copy, capped.
+- `GetMany(data, keys, buf) [][]byte` — multi-key single pass, raw aliasing
+  capped values, **`nil` for absent** (present-but-empty is a non-nil
   zero-length slice — distinct from absent), reusable outer `buf`, early-stop.
-- `GetValue(data, key string, dst) ([]byte, error)` — unescaped; delegates to
-  `Get` then `Unescape`, decoding into `dst` only when needed (result may alias
-  `dst` *or* `data`).
+- `AppendValue(dst, data, key) ([]byte, bool)` — unescaped, **always appends**;
+  never aliases `data`. Absent key returns `dst` untouched and false.
+- `Validate(data) error` — full parse for callers who need the error the
+  lookups structurally cannot give them.
+- `SplitRecord(data) (record, rest)` — record framing (see limits below);
+  trims a trailing `\r`, caps `record`.
+- `IsBareKey(val)` — identity test against `trueSlice`, the only way to tell
+  `debug` from `debug=true`.
 - **Duplicate keys resolve identically in all three lookups: first non-empty
   occurrence wins; an empty value only if no non-empty one exists.** Guarded by
   `FuzzGetManyAgainstRef`.
-- `Unescape(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` and JSON-style
-  `\uXXXX` incl. surrogate pairs (go-logfmt writes control chars as `\u00XX`,
-  so this is required for round-trip interop); other escapes pass through, and
-  malformed `\u` stays verbatim. `NeedsUnescape` is a single `IndexByte('\\')`
-  so callers skip the decode when unnecessary — keep it a single expression so
-  it stays inlinable (a SWAR helper here measurably regressed).
+- `AppendUnescape(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` and
+  JSON-style `\uXXXX` incl. surrogate pairs (go-logfmt writes control chars as
+  `\u00XX`, so this is required for round-trip interop); other escapes pass
+  through, and malformed `\u` stays verbatim. `NeedsUnescape` is a single
+  `IndexByte('\\')` so callers skip the decode when unnecessary — keep it a
+  single expression so it stays inlinable (a SWAR helper here measurably
+  regressed).
+- `ParseTime(ts []byte)` — `[]byte` like everything else. A caller holding a
+  `[]byte` pays the same 5 allocs on the named-zone layout either way (measured
+  both sides); the old `string` benchmark only looked cheaper because it fed a
+  compile-time constant.
+
+## API design rules (why it looks like this)
+
+- **Errors only where they can be honest.** The lookups early-stop, so they
+  cannot see a fault past the keys they settled. They therefore return no error
+  at all rather than a `nil` that means "resolved" instead of "valid".
+  `Validate` exists for callers who want the real answer.
+- **Absence is comma-ok, uniformly** (`GetMany`: a `nil` slot). Not an error:
+  a missing key is routine control flow, and `errors.Is` on a hot path is
+  noise. There is no `ErrKeyNotFound` any more.
+- **`Append*` means it appends.** Both append functions always copy into `dst`
+  and never alias the input; the conditional "returns raw if dst is empty"
+  behaviour the old `Unescape` had was a trap. Zero-copy is still available and
+  is still the faster pattern — `Get` + `NeedsUnescape` — just explicit now.
+- **Destination first** (`AppendUnescape(dst, raw)`, `AppendValue(dst, data,
+  key)`), matching `append` and the stdlib `Append*` family.
 
 ## Known functional limits (documented, not bugs — audited 2026-07-26)
 
 Deliberate behaviours that surprise people; all are now in `doc.go`/README.
 
-- **No record framing.** `'\n'`/`'\r'` are plain whitespace, so a multi-line
-  buffer parses as one flat pair stream and a lookup can match a key from a
-  later line. Callers split. (`Benchmark_DecodeKeyval_Custom` relies on this.)
-- **Lookup errors are best-effort.** `Get`/`GetMany`/`GetValue` early-stop, so a
-  malformed tail past the settled keys is never reached: `nil` error means "keys
-  resolved", not "line valid". `FuzzGetManyAgainstRef` encodes exactly this.
-- **`Iterate` delivers the valid prefix before returning `ErrBadFormat`.**
-- **Capping is asymmetric, on purpose.** `Get`/`GetValue`/`GetMany` return
+- **No record framing in the parser.** `'\n'`/`'\r'` are plain whitespace, so a
+  multi-line buffer parses as one flat pair stream and a lookup can match a key
+  from a later line. `SplitRecord` is the supported way to split; the parser
+  itself stays framing-free. (`Benchmark_DecodeKeyval_Custom` relies on this.)
+- **Lookups do not report syntax errors** — they early-stop, so a malformed tail
+  past the settled keys is never reached. They return what the reachable prefix
+  holds; `Validate` is the honest full-parse. This also made
+  `FuzzGetManyAgainstRef` *stronger*: both sides now consume the same valid
+  prefix, so they must agree exactly, with no error-case carve-outs.
+- **`Iterate` delivers the valid prefix before returning its error** (a
+  `*SyntaxError` carrying the fault offset; `errors.Is(err, ErrBadFormat)` still
+  matches, via the type's `Is` method).
+- **Capping is asymmetric, on purpose.** `Get`/`GetMany` return
   values with `cap == len` (`v[:len(v):len(v)]` at the assignment sites), so a
   caller's `append` copies instead of overwriting the rest of the line — free
   there, measured: GetMany 55.8 → 55.5 ns over 3 interleaved A/B rounds.
@@ -86,9 +130,6 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   guards the thing capping could have broken: slicing keeps a present-but-empty
   value non-nil, which is how absence stays distinguishable.
 - **The bare-key `trueSlice` is a shared global** — mutating it is process-wide.
-- **`GetValue` returns `nil` for a present-but-empty value**, where `Get`
-  returns a non-nil empty slice — `Unescape`'s fast path returns `raw` as-is.
-  Absence is still distinguishable via `ErrKeyNotFound`.
 - **Keys are never quoted**: `"a b"=c` → bare key `"a`, then `b"`=c. Quoting is
   position-dependent (value position only) — the same property that defeats the
   SIMD substring search below.
