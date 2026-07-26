@@ -200,18 +200,19 @@ and stricter.
 
 ## Read-only really means read-only
 
-Returned slices are windows onto a bigger array, so their capacity typically
-runs past their length. Two consequences worth internalising:
+Returned slices are windows onto the input, so treat every one of them as
+read-only: writing through a value overwrites your log line, and a bare key's
+`true` is a package-level constant shared by every caller in the process.
 
-- **Appending to a returned value writes into the log line.** `append(v, 'x')`
-  where `v` came from `Get` overwrites the bytes that follow it in the input.
-  Copy first — `append(dst[:0], v...)`, `string(v)` — or re-slice with
-  `v[:len(v):len(v)]`.
-- **A bare key's `true` is a package-level constant.** Mutating it corrupts
-  every caller in the process.
+Appending is the subtler case, and the two APIs differ deliberately:
 
-The package caps nothing on your behalf: doing so in the parser costs ~4.5% on
-field-dense input (measured), and the read-only contract makes it unnecessary.
+- **`Get`, `GetValue` and `GetMany` cap their results** (`cap == len`), so
+  `append(v, …)` copies instead of overwriting whatever follows the value in the
+  input. They set a slot once per lookup, so the capping is free.
+- **`Iterate` does not cap** what it passes the callback. Doing so costs ~4.5%
+  on field-dense input (measured) because it lands once per *field*. Inside a
+  callback, copy before appending — `append(dst[:0], v...)`, `string(v)` — or
+  re-slice with `v[:len(v):len(v)]` yourself.
 
 ## Errors
 

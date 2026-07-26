@@ -77,9 +77,15 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   malformed tail past the settled keys is never reached: `nil` error means "keys
   resolved", not "line valid". `FuzzGetManyAgainstRef` encodes exactly this.
 - **`Iterate` delivers the valid prefix before returning `ErrBadFormat`.**
-- **Returned slices have capacity into the input** — an `append` by the caller
-  overwrites the log line, and the bare-key `trueSlice` is a shared global.
-  Capping was measured and rejected (see below).
+- **Capping is asymmetric, on purpose.** `Get`/`GetValue`/`GetMany` return
+  values with `cap == len` (`v[:len(v):len(v)]` at the assignment sites), so a
+  caller's `append` copies instead of overwriting the rest of the line — free
+  there, measured: GetMany 55.8 → 55.5 ns over 3 interleaved A/B rounds.
+  `Iterate` does **not** cap (−4.5%, see below), so callback values still carry
+  capacity into the input. Pinned by `Test_Unit_Lookups_CapValues`, which also
+  guards the thing capping could have broken: slicing keeps a present-but-empty
+  value non-nil, which is how absence stays distinguishable.
+- **The bare-key `trueSlice` is a shared global** — mutating it is process-wide.
 - **`GetValue` returns `nil` for a present-but-empty value**, where `Get`
   returns a non-nil empty slice — `Unescape`'s fast path returns `raw` as-is.
   Absence is still distinguishable via `ErrKeyNotFound`.
@@ -206,11 +212,10 @@ noisy). Each was **neutral or worse**:
   to stop a caller's `append` from scribbling over the rest of the input):
   correct and tests pass, but **−4.5% on `DecodeKeyval`** (391.5 → 410.1 µs,
   1277 → 1222 MB/s; consistent across 3 interleaved A/B rounds) and ~−0.7% on
-  `Iterate`. Field-dense input pays it per pair. Rejected: the read-only
-  contract is documented instead (README "Read-only really means read-only",
-  doc.go "Aliasing"). **If it is ever wanted, cap in the lookups, not the
-  parser** — `Get`/`GetMany` set a slot once per key, not once per field, so
-  the cost there is unmeasurable.
+  `Iterate`. Field-dense input pays it per pair. Rejected **for `Iterate` only**
+  — the read-only contract is documented instead. The lookups *do* cap (below);
+  the asymmetry is the whole point and is documented in both README and doc.go,
+  so don't "fix" it in either direction without re-measuring.
 - **Benchmarking note**: this machine drifts between power states *mid-session*
   (same code measured 283 → 297 ns minutes apart). Never compare against a
   stale baseline — interleave A/B runs (A,B,A,B…) and compare means.

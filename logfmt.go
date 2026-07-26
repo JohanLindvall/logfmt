@@ -312,6 +312,10 @@ func hex4(b []byte) rune {
 // only until whichever it aliases is modified — so copy it if it must outlive
 // that. (Use the returned slice, not dst, since dst may be untouched.)
 //
+// When the result aliases data it is capped to its length, as in Get, so
+// appending to it cannot overwrite the rest of the line; when it aliases dst it
+// carries dst's own capacity, which is the caller's buffer to grow.
+//
 // Duplicate keys resolve exactly as in Get and GetMany: the first non-empty
 // occurrence wins, an empty value is returned only when no non-empty one
 // exists. GetValue returns ErrKeyNotFound if key is absent, or ErrBadFormat if
@@ -342,6 +346,11 @@ func NeedsUnescape(raw []byte) bool {
 // ErrKeyNotFound if the key is absent, or use GetValue for an unescaped,
 // buffer-reusing lookup.
 //
+// The returned slice has capacity equal to its length, so appending to it
+// copies rather than overwriting the bytes that follow the value in data.
+// (Iterate, which calls back once per field rather than once per lookup, does
+// not cap what it hands the callback — capping there costs measurably.)
+//
 // Duplicate keys resolve as in GetValue and GetMany: the first non-empty
 // occurrence wins (iteration stops there); an empty value is returned only
 // when the key never appears with a non-empty one.
@@ -353,11 +362,14 @@ func Get(data []byte, key string) ([]byte, error) {
 			return true
 		}
 		if len(v) > 0 {
-			rawVal = v
-			return false // settled: first non-empty occurrence wins
+			rawVal = v[:len(v):len(v)] // cap == len, so a caller's append cannot reach into data
+			return false               // settled: first non-empty occurrence wins
 		}
 		if rawVal == nil {
-			rawVal = v // provisional empty; keep looking for a non-empty one
+			// Provisional empty; keep looking for a non-empty one. Slicing a
+			// non-nil slice keeps it non-nil even at zero length, so this stays
+			// distinguishable from "absent".
+			rawVal = v[:len(v):len(v)]
 		}
 		return true
 	})
@@ -382,7 +394,9 @@ func Get(data []byte, key string) ([]byte, error) {
 // by any later non-empty value for the same key.
 //
 // The returned values alias data (treat them as read-only) and are valid only
-// until data is modified; decode escapes with Unescape if needed. buf is reused
+// until data is modified; each has capacity equal to its length, so appending
+// to one copies rather than overwriting the bytes that follow it in data.
+// Decode escapes with Unescape if needed. buf is reused
 // as the result slice when it is large enough, avoiding a [][]byte allocation;
 // pass back a previous result. If a key appears more than once with a non-empty
 // value, the first such occurrence wins; iteration stops once every key has a
@@ -414,10 +428,13 @@ func GetMany(data []byte, keys []string, buf [][]byte) ([][]byte, error) {
 				continue
 			}
 			if len(v) > 0 {
-				buf[j] = v
-				remaining-- // settled: a non-empty value won't be overridden
+				buf[j] = v[:len(v):len(v)] // cap == len, so a caller's append cannot reach into data
+				remaining--                // settled: a non-empty value won't be overridden
 			} else if buf[j] == nil {
-				buf[j] = v // record the empty value, but keep looking
+				// Record the empty value, but keep looking. Slicing a non-nil
+				// slice keeps it non-nil even at zero length, so a present-empty
+				// value stays distinguishable from an absent key's nil.
+				buf[j] = v[:len(v):len(v)]
 			}
 			break
 		}

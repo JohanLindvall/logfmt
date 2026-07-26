@@ -230,6 +230,69 @@ func Test_Unit_GetMany_Allocs(t *testing.T) {
 	}
 }
 
+// Values from the lookups are capped to their length, so a caller that appends
+// to one gets a copy instead of scribbling over the rest of the input line.
+// Iterate deliberately does NOT cap (it would cost ~4.5% on field-dense input),
+// so this guarantee is specific to Get/GetValue/GetMany.
+func Test_Unit_Lookups_CapValues(t *testing.T) {
+	const orig = `a=hi b=there empty= q="x"`
+
+	// v must alias line; appending to it must copy rather than touch line.
+	check := func(t *testing.T, what string, v, line []byte) {
+		t.Helper()
+		if cap(v) != len(v) {
+			t.Errorf("%s: cap = %d, want %d (len)", what, cap(v), len(v))
+		}
+		_ = append(v, "XXXX"...) //nolint:gocritic // appendAssign: the copy is the point
+		if string(line) != orig {
+			t.Errorf("%s: append overwrote the input: %q", what, line)
+		}
+	}
+
+	line := []byte(orig)
+	for _, key := range []string{"a", "b", "empty", "q"} {
+		v, err := Get(line, key)
+		if err != nil {
+			t.Fatalf("Get(%q): %v", key, err)
+		}
+		check(t, "Get("+key+")", v, line)
+
+		gv, err := GetValue(line, key, nil)
+		if err != nil {
+			t.Fatalf("GetValue(%q): %v", key, err)
+		}
+		check(t, "GetValue("+key+")", gv, line)
+	}
+
+	keys := []string{"a", "b", "empty", "q", "missing"}
+	vals, err := GetMany(line, keys, nil)
+	if err != nil {
+		t.Fatalf("GetMany: %v", err)
+	}
+	for i, key := range keys {
+		if key == "missing" {
+			if vals[i] != nil {
+				t.Errorf("GetMany(%q) = %q, want nil", key, vals[i])
+			}
+			continue
+		}
+		check(t, "GetMany("+key+")", vals[i], line)
+	}
+
+	// Capping must not turn a present-but-empty value into nil — that is how
+	// GetMany distinguishes it from an absent key, and how Get avoids reporting
+	// ErrKeyNotFound for "empty=".
+	if v, err := Get(line, "empty"); err != nil || v == nil || len(v) != 0 {
+		t.Errorf("Get(empty) = %v (nil? %v), %v; want present, non-nil, empty", v, v == nil, err)
+	}
+	if v, err := Get([]byte(`x=1 trailing=`), "trailing"); err != nil || v == nil {
+		t.Errorf("Get(trailing=) = %v (nil? %v), %v; want present, non-nil", v, v == nil, err)
+	}
+	if vals[2] == nil {
+		t.Error("GetMany(empty) is nil; a present-but-empty value must stay non-nil")
+	}
+}
+
 func Test_Unit_Unescape_Unicode(t *testing.T) {
 	bs := "\\" // single backslash
 	for _, tt := range []struct{ in, want string }{

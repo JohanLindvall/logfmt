@@ -42,12 +42,18 @@
 // keys) a shared package-level constant — treat them as read-only, and copy
 // any that must outlive the input.
 //
-// Read-only means what it says: these slices are windows onto a larger array,
-// so their capacity generally runs to the end of that array. Appending to one
-// writes into the bytes that follow it — for a value from Get that is the rest
-// of the log line, and for a bare key's "true" it is a constant shared by every
-// caller in the process. Copy first (append(dst[:0], v...), string(v)) or
-// re-slice to v[:len(v):len(v)] before appending.
+// Read-only means what it says: these slices are windows onto the input, and a
+// bare key's "true" is a constant shared by every caller in the process, so
+// writing through any of them corrupts something you do not own.
+//
+// Appending is handled differently by the two entry points, deliberately. The
+// lookups (Get, GetValue, GetMany) return values capped to their length, so
+// appending to one copies rather than overwriting the bytes that follow it in
+// the input; they cap once per lookup, which costs nothing measurable. Iterate
+// does not cap what it hands the callback, because that lands once per field
+// and measures ~4.5% on field-dense input. Inside an Iterate callback, copy
+// first (append(dst[:0], v...), string(v)) or re-slice to v[:len(v):len(v)]
+// before appending.
 //
 // The package holds no state, so it is safe for concurrent use as long as
 // callers honour that rule.
