@@ -1,6 +1,6 @@
 # logfmt microbenchmarks
 
-- generated 2026-07-02T19:43:57Z
+- generated 2026-07-26T06:08:55Z
 - go version go1.26.3 linux/amd64
 - cpu: AMD EPYC 7763 64-Core Processor (4 cores)
 
@@ -8,12 +8,12 @@ The Benchmark* functions in the root logfmt module (parser, lookups, unescape, P
 
 | Benchmark | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| IterateOur | 469.5 | — | 0 | 0 |
-| GetMany_TimestampLevel | 96.3 | — | 0 | 0 |
-| Unescape | 29.0 | — | 0 | 0 |
-| DecodeKeyval_Custom | 696530.0 | 717.84 MB/s | 0 | 0 |
-| LevelTS_LogFmt | 76.5 | — | 0 | 0 |
-| LevelTS_Regex | 15932.0 | — | 1077 | 4 |
-| ParseTime_RFC3339 | 76.1 | — | 0 | 0 |
-| ParseTime_Custom | 404.6 | — | 164 | 4 |
-| ParseTime_Unix | 81.3 | — | 0 | 0 |
+| IterateOur | 466.5 | — | 0 | 0 |
+| GetMany_TimestampLevel | 98.4 | — | 0 | 0 |
+| Unescape | 28.3 | — | 0 | 0 |
+| DecodeKeyval_Custom | 693150.0 | 721.34 MB/s | 0 | 0 |
+| LevelTS_LogFmt | 72.5 | — | 0 | 0 |
+| LevelTS_Regex | 15764.0 | — | 1076 | 4 |
+| ParseTime_RFC3339 | 78.7 | — | 0 | 0 |
+| ParseTime_Custom | 406.5 | — | 164 | 4 |
+| ParseTime_Unix | 85.2 | — | 0 | 0 |
