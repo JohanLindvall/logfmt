@@ -3,7 +3,7 @@
 // from this directory.
 module github.com/JohanLindvall/logfmt/bench
 
-go 1.26.3
+go 1.21
 
 require (
 	github.com/JohanLindvall/logfmt v0.0.0

@@ -27,7 +27,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
-          go-version-file: go.mod
+          go-version: stable # benchmark on current Go, not the go.mod floor
       - name: Run benchmarks
         env:
           GOTOOLCHAIN: auto

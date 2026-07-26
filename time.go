@@ -13,6 +13,22 @@ var logFmtLayouts = []string{time.RFC3339Nano, "2006-01-02 15:04:05.999 -0700 MS
 // a unix epoch (10 integer digits with an optional fractional part). Trailing
 // delimiters left over from a slightly malformed line (e.g. a stray '}') are
 // trimmed first. On success the returned time is normalized to UTC.
+//
+// The accepted set is deliberately narrow — these are the shapes real logfmt
+// emitters produce — so several plausible-looking timestamps are rejected
+// rather than guessed at:
+//
+//   - Epochs must have exactly 10 integer digits, which bounds them to
+//     2001-09-09 .. 2286-11-20 and excludes negative (pre-1970) values.
+//   - Millisecond and microsecond epochs (13 and 16 digits, as written by
+//     JavaScript's Date.now or Java's System.currentTimeMillis) are rejected;
+//     the digit count alone cannot distinguish them from a far-future second
+//     epoch. Divide them yourself, or parse with strconv and time.UnixMilli.
+//   - Date-only ("2006-01-02"), time-only and other layouts are rejected.
+//
+// Callers with a known emitter should prefer time.Parse with that emitter's
+// exact layout; ParseTime is for mixed-source logs where the layout is not
+// known up front. It performs no allocations for the RFC3339 and epoch forms.
 func ParseTime(ts string) (time.Time, bool) {
 	ts = strings.TrimRight(ts, "}],)\"")
 	if t, ok := parseUnixTS(ts); ok {

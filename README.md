@@ -1,7 +1,12 @@
 # logfmt
 
-A fast, allocation-free reader for the [logfmt](https://brandur.org/logfmt) line
-format in Go:
+[![CI](https://github.com/JohanLindvall/logfmt/actions/workflows/ci.yml/badge.svg)](https://github.com/JohanLindvall/logfmt/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/logfmt.svg)](https://pkg.go.dev/github.com/JohanLindvall/logfmt)
+[![Go Report Card](https://goreportcard.com/badge/github.com/JohanLindvall/logfmt)](https://goreportcard.com/report/github.com/JohanLindvall/logfmt)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A fast, allocation-free **reader** for the [logfmt](https://brandur.org/logfmt)
+line format in Go:
 
 ```
 level=info msg="user login" user=john id=42 success=true
@@ -9,13 +14,17 @@ level=info msg="user login" user=john id=42 success=true
 
 The package operates on `[]byte` and reports keys and values as sub-slices of
 the input, so iterating a line performs **zero allocations**. It has no
-dependencies outside the standard library.
+dependencies outside the standard library, and parses a ~1.4 KB line at
+~3 GB/s — roughly 6× go-logfmt, with key extraction 12× faster still.
 
 ## Install
 
 ```sh
 go get github.com/JohanLindvall/logfmt
 ```
+
+Requires Go 1.21 or newer. (CI tests that floor on every push, alongside the
+current stable release, on both amd64 and arm64.)
 
 ## Usage
 
@@ -47,11 +56,30 @@ Notes:
 - Returned slices alias the input (or, for bare keys, a shared constant) —
   treat them as read-only and copy anything that must outlive the input.
 - The parser is deliberately lenient and diverges from go-logfmt in a few
-  documented ways (e.g. `key= value` parses as `("key", "value")`; a stray `"`
-  in an unquoted value is a literal). See the package documentation.
+  documented ways (e.g. a stray `"` in an unquoted value is a literal byte, not
+  an error). See the [package documentation](https://pkg.go.dev/github.com/JohanLindvall/logfmt).
 - All lookups (`Get`, `GetValue`, `GetMany`) resolve duplicate keys the same
   way: the **first non-empty occurrence wins**; an empty value is used only
   when the key never appears with a non-empty one.
+
+### One record per call
+
+Newlines are ordinary whitespace to this parser — there is no record framing.
+Hand it a multi-line buffer and you get every line's pairs as one flat stream,
+with no boundary marker, and lookups can match a key from a later line. Split
+the input yourself and call `Iterate` once per record:
+
+```go
+for len(data) > 0 {
+    line := data
+    if i := bytes.IndexByte(data, '\n'); i >= 0 {
+        line, data = data[:i], data[i+1:]
+    } else {
+        data = nil
+    }
+    _ = logfmt.Iterate(line, func(k, v []byte) bool { /* ... */ return true })
+}
+```
 
 ### Look up a single key, unescaped
 
@@ -117,6 +145,10 @@ for i, v := range vals {
 }
 ```
 
+Keys are matched linearly against each parsed field, so this is meant for small
+key sets (a handful). For many keys, use `Iterate` with a map keyed by
+`string(k)` — the compiler optimizes that conversion away in a map index.
+
 ### Unescape a raw value
 
 `Unescape` decodes the escapes in a raw value (as returned by `Iterate`,
@@ -150,7 +182,7 @@ if logfmt.NeedsUnescape(v) {
 
 `ParseTime` parses a logfmt timestamp value and reports whether it succeeded. It
 accepts an RFC3339Nano string, a `2006-01-02 15:04:05.999 -0700 MST` string, or a
-unix epoch (10 integer digits with an optional fractional part). Trailing
+unix epoch (exactly 10 integer digits with an optional fractional part). Trailing
 delimiters left over from a slightly malformed line (e.g. a stray `}`) are trimmed
 first, and on success the returned time is normalized to UTC.
 
@@ -161,33 +193,76 @@ if ok {
 }
 ```
 
+Millisecond/microsecond epochs (13 or 16 digits) and date-only strings are
+rejected rather than guessed at — see the package docs for the full accepted set.
+If you know your emitter's layout, `time.Parse` with that layout is both faster
+and stricter.
+
+## Read-only really means read-only
+
+Returned slices are windows onto a bigger array, so their capacity typically
+runs past their length. Two consequences worth internalising:
+
+- **Appending to a returned value writes into the log line.** `append(v, 'x')`
+  where `v` came from `Get` overwrites the bytes that follow it in the input.
+  Copy first — `append(dst[:0], v...)`, `string(v)` — or re-slice with
+  `v[:len(v):len(v)]`.
+- **A bare key's `true` is a package-level constant.** Mutating it corrupts
+  every caller in the process.
+
+The package caps nothing on your behalf: doing so in the parser costs ~4.5% on
+field-dense input (measured), and the read-only contract makes it unnecessary.
+
 ## Errors
 
-| Error             | Meaning                                                        |
-| ----------------- | -------------------------------------------------------------- |
-| `ErrBadFormat`    | Malformed input, e.g. an unterminated quoted value.            |
-| `ErrKeyNotFound`  | `GetValue` or `Get` could not find the requested key.          |
+| Error            | Meaning                                                        |
+| ---------------- | -------------------------------------------------------------- |
+| `ErrBadFormat`   | Unterminated quoted value, or a closing quote followed by a non-space byte. |
+| `ErrKeyNotFound` | `Get` or `GetValue` could not find the requested key (`GetMany` reports absence as a `nil` slot). |
+
+Two streaming consequences:
+
+- When `Iterate` returns `ErrBadFormat`, every pair *before* the fault has
+  already been delivered to your callback. That prefix is valid.
+- The lookups stop as soon as their keys are settled, so a malformed tail beyond
+  that point is never seen. A `nil` error from `Get`/`GetMany`/`GetValue` means
+  "your keys resolved", not "the line is well-formed". Run `Iterate` to
+  completion if you need validation.
+
+## Scope
+
+A reader, deliberately and only. Not included: an encoder, an `io.Reader`
+streaming decoder, typed accessors (int/bool/duration), and map building.
+Values come back as `[]byte` for you to convert with `strconv`. That is what
+keeps the package dependency-free, allocation-free, and small enough to fuzz
+the whole parser against a byte-by-byte reference implementation on every
+change. To *write* logfmt, use go-logfmt or your logging library's encoder.
 
 ## Benchmarks
 
 ```sh
 go test -bench=. -benchmem      # this package's microbenchmarks
-make bench-md                   # render the comparison tables in bench/
+make bench-md                   # regenerate the committed tables in bench/
 ```
 
 `Iterate`, `Get` and `GetMany` allocate nothing on the hot path (and `GetValue`
-when its buffer is reused); the included benchmarks run against representative
-single- and multi-row logfmt input.
+when its buffer is reused). Cost splits into a fixed per-field overhead of
+~6 ns plus scanning: ~11.7 GB/s through unquoted values (word-at-a-time SWAR)
+and ~27 GB/s through quoted ones (`bytes.IndexByte`, SIMD in the stdlib). Short
+fields are therefore overhead-bound, long values scan-bound. Lookups are linear
+in how deep the key sits: ~8.6 ns per field skipped.
 
 On amd64, building with `GOAMD64=v3` (Haswell+, 2013 onwards) makes the parser
-~4% faster (BMI instructions for the word-at-a-time scanning).
+~3% faster (BMI's `TZCNT` for the word-at-a-time scanning). It is a consumer
+build flag, not something the module can set.
 
 ### vs other Go logfmt parsers
 
-Parsing a ~1.4 KB line (amd64, Ryzen 7 8840HS; lower is better, speedup vs
-`go-logfmt`). The `bench/` module (a separate module, so the root stays
-dependency-free) compares against go-logfmt, kr/logfmt and Grafana Loki's
-in-tree decoder. Full tables, including arm64, are in
+Parsing the same ~1.4 KB line, measured on GitHub Actions `ubuntu-latest`
+(AMD EPYC 7763, Go 1.26); lower is better, speedup relative to `go-logfmt`. The
+`bench/` module is a separate module, so the root package stays
+dependency-free; it compares against go-logfmt, kr/logfmt and Grafana Loki's
+in-tree decoder. Full tables, including arm64 and shorter/escaped inputs, are in
 [bench/results_amd64.md](bench/results_amd64.md) and
 [bench/results_arm64.md](bench/results_arm64.md).
 
@@ -195,17 +270,24 @@ Parse every key/value pair:
 
 | Parser | ns/op | Throughput | allocs/op | Speedup |
 |---|--:|--:|--:|--:|
-| **this package** | **371** | **3776 MB/s** | **0** | **7.9×** |
-| kr/logfmt | 1295 | 1081 MB/s | 1 | 2.3× |
-| Grafana Loki | 1738 | 805 MB/s | 1 | 1.7× |
-| go-logfmt | 2941 | 476 MB/s | 4 | 1.0× |
+| **this package** | **456** | **3070 MB/s** | **0** | **6.0×** |
+| kr/logfmt | 1470 | 953 MB/s | 1 | 1.9× |
+| Grafana Loki | 1968 | 711 MB/s | 1 | 1.4× |
+| go-logfmt | 2758 | 508 MB/s | 4 | 1.0× |
 
 Extract two keys (`timestamp`+`level`), each parser stopping once both are found
 (where its API allows — `kr/logfmt` is push-based and can't stop its scan):
 
 | Parser | ns/op | allocs/op | Speedup |
 |---|--:|--:|--:|
-| **this package** (`GetMany`) | **54** | **0** | **15.8×** |
-| Grafana Loki | 237 | 1 | 3.6× |
-| go-logfmt | 852 | 3 | 1.0× |
-| kr/logfmt | 1025 | 4 | 0.8× |
+| **this package** (`GetMany`) | **95** | **0** | **12.0×** |
+| Grafana Loki | 348 | 1 | 3.3× |
+| go-logfmt | 1139 | 3 | 1.0× |
+| kr/logfmt | 1563 | 4 | 0.7× |
+
+Faster hardware roughly halves these: the same two benchmarks measure 275 ns and
+54 ns on a Ryzen 7 8840HS.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

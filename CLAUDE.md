@@ -18,8 +18,10 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 
 ## Layout
 
-- `doc.go` — package documentation: API map, aliasing/read-only rules, and the
-  documented leniency divergences from go-logfmt.
+- `doc.go` — package documentation: API map, record-framing rules (newlines are
+  plain whitespace; the caller splits records), aliasing/read-only rules,
+  streaming error semantics, leniency divergences from go-logfmt, and the
+  explicit non-goals under "Scope".
 - `logfmt.go` — the core parser and key-lookup API (the "general parsing").
 - `time.go` — `ParseTime` (see warning above).
 - `logfmt_swar_test.go` — `FuzzIterateAgainstRef`: differential fuzz of the
@@ -29,6 +31,17 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   `GetMany`/`Get`'s first-non-empty duplicate resolution against a naive
   collect-all reference. **Run after any change to the lookup state machine.**
 - `*_test.go` — unit tests, benchmarks, and a regex-vs-logfmt comparison.
+- `LICENSE` — MIT.
+
+## Compatibility floor: `go 1.21`
+
+`go.mod` declares `go 1.21` **on purpose** — a library's go directive is the
+minimum toolchain every importer must have, not the version it was developed
+on. CI runs the suite at 1.21 as well as at `stable`, so anything newer breaks
+the build there. `clear()`, `min`/`max` and the `slices`/`maps` packages are all
+1.21 and therefore fair game; **`iter.Seq2`/range-over-func (1.23) is not**.
+Adding a range-over-func iterator would mean bumping the floor — a deliberate
+trade, not a drive-by. `bench/go.mod` tracks the same floor.
 
 ## Public API (read-only, raw-by-default; keys are `string` everywhere)
 
@@ -53,6 +66,31 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   so callers skip the decode when unnecessary — keep it a single expression so
   it stays inlinable (a SWAR helper here measurably regressed).
 
+## Known functional limits (documented, not bugs — audited 2026-07-26)
+
+Deliberate behaviours that surprise people; all are now in `doc.go`/README.
+
+- **No record framing.** `'\n'`/`'\r'` are plain whitespace, so a multi-line
+  buffer parses as one flat pair stream and a lookup can match a key from a
+  later line. Callers split. (`Benchmark_DecodeKeyval_Custom` relies on this.)
+- **Lookup errors are best-effort.** `Get`/`GetMany`/`GetValue` early-stop, so a
+  malformed tail past the settled keys is never reached: `nil` error means "keys
+  resolved", not "line valid". `FuzzGetManyAgainstRef` encodes exactly this.
+- **`Iterate` delivers the valid prefix before returning `ErrBadFormat`.**
+- **Returned slices have capacity into the input** — an `append` by the caller
+  overwrites the log line, and the bare-key `trueSlice` is a shared global.
+  Capping was measured and rejected (see below).
+- **`GetValue` returns `nil` for a present-but-empty value**, where `Get`
+  returns a non-nil empty slice — `Unescape`'s fast path returns `raw` as-is.
+  Absence is still distinguishable via `ErrKeyNotFound`.
+- **Keys are never quoted**: `"a b"=c` → bare key `"a`, then `b"`=c. Quoting is
+  position-dependent (value position only) — the same property that defeats the
+  SIMD substring search below.
+- **`ParseTime` epochs are exactly 10 digits** → 2001-09-09 .. 2286-11-20, no
+  negatives, and ms/µs epochs (13/16 digits) are rejected by design.
+- Statement coverage is 98.4%; both differential fuzzers pass 45 s clean
+  (17.1 M and 15.4 M execs, no new failures).
+
 ## Current benchmarks (Ryzen 7 8840HS, amd64; ~ns, machine-state dependent)
 
 | Benchmark | ns/op | allocs |
@@ -64,7 +102,25 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 | `Unescape` | ~16 | 0 |
 
 Everything on the hot path is **zero-allocation**. `Iterate` went 681 → ~275 ns
-over the optimization history (~60% faster).
+over the optimization history (~60% faster). Re-measured 2026-07-26: unchanged.
+
+CI-generated tables (EPYC 7763, ~1.7× slower than this laptop) live in
+`bench/pkg_results_<arch>.md` and `bench/results_<arch>.md`; the README quotes
+those, since they are the reproducible ones.
+
+### Cost model (measured 2026-07-26, synthetic field-size sweep)
+
+| Shape | Cost |
+|---|---|
+| Fixed per-field overhead (4–16 B values) | ~5.8–7.2 ns/field |
+| Unquoted value scan (SWAR), 256 B values | ~11.7 GB/s |
+| Quoted value scan (`bytes.IndexByte`), 512 B | ~27 GB/s |
+| `Get` per skipped field | ~8.6 ns (10.7 ns for field 0, 551 ns for field 63) |
+
+Reading: short fields are **overhead-bound** (~6 ns of loop/callback per pair,
+scan is noise), long values are **scan-bound**. The 8 B/iter SWAR only starts
+paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
+`sample2` averages ~8.3 ns/field, consistent with the sweep.
 
 ## How the general parser is optimized (logfmt.go)
 
@@ -89,7 +145,8 @@ over the optimization history (~60% faster).
   found-values are never nil, so `nil` == absent unambiguously.
 - **Closing-quote verify tests `' '` first** (`c != ' ' && !isSpace(c)`) — same
   short-circuit trick as the SWAR verifies; ~1% on quoted-heavy lines.
-- **`GOAMD64=v3` builds are ~4% faster** (measured: Iterate 267 vs 279 ns) —
+- **`GOAMD64=v3` builds are ~3–4% faster** (re-measured 2026-07-26, interleaved
+  A/B: Iterate 275.2 → 266.9 ns = 3.0%; GetMany 54.9 → 53.4 ns = 2.7%) —
   BMI's TZCNT helps the SWAR `TrailingZeros64`. A user build flag, not
   something the module can set; noted in the README.
 
@@ -145,6 +202,15 @@ noisy). Each was **neutral or worse**:
   (to spare short quoted values the call overhead): −3% on `Iterate` (long
   quoted values pay the wasted word check) and neutral on `DecodeKeyval` —
   the short-quote saving never materialised.
+- **Three-index capping of the slices handed to `fn`** (`data[kStart:kEnd:kEnd]`,
+  to stop a caller's `append` from scribbling over the rest of the input):
+  correct and tests pass, but **−4.5% on `DecodeKeyval`** (391.5 → 410.1 µs,
+  1277 → 1222 MB/s; consistent across 3 interleaved A/B rounds) and ~−0.7% on
+  `Iterate`. Field-dense input pays it per pair. Rejected: the read-only
+  contract is documented instead (README "Read-only really means read-only",
+  doc.go "Aliasing"). **If it is ever wanted, cap in the lookups, not the
+  parser** — `Get`/`GetMany` set a slot once per key, not once per field, so
+  the cost there is unmeasurable.
 - **Benchmarking note**: this machine drifts between power states *mid-session*
   (same code measured 283 → 297 ns minutes apart). Never compare against a
   stale baseline — interleave A/B runs (A,B,A,B…) and compare means.
