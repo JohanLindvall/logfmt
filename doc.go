@@ -38,9 +38,6 @@
 // unterminated quoted value and a closing quote followed by a non-space byte.
 // This differs from go-logfmt in a few ways:
 //
-//   - Whitespace after '=' is skipped: "key= value" parses as ("key",
-//     "value"), where go-logfmt reports an empty value and a separate bare
-//     key.
 //   - A '"' inside an unquoted value is a literal byte, not a syntax error.
 //   - Unknown escapes decode leniently (the escaped byte itself) instead of
 //     being rejected.

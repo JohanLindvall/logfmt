@@ -36,15 +36,19 @@ func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
 		}
 		i++
 
-		for i < n && isSpace(buf[i]) {
-			i++
-		}
-
 		vStart, vEnd := i, i
 
 		if i >= n {
 			fn(buf[kStart:kEnd], buf[vStart:vEnd])
 			return nil
+		}
+
+		// `key=` before whitespace is an empty value (see Iterate).
+		if isSpace(buf[i]) {
+			if !fn(buf[kStart:kEnd], buf[vStart:vEnd]) {
+				return nil
+			}
+			continue
 		}
 
 		if buf[i] == '"' {

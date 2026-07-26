@@ -25,8 +25,14 @@ func Test_Unit_LogFmt_Values(t *testing.T) {
 			[]string{"foo", ""},
 		},
 		{
+			// `key=` is an empty value; the whitespace after '=' is NOT
+			// skipped, so the following token is its own pair (or a bare key).
 			`foo=   bar   `,
-			[]string{"foo", "bar"},
+			[]string{"foo", "", "bar", "true"},
+		},
+		{
+			`err= level=info msg=x`,
+			[]string{"err", "", "level", "info", "msg", "x"},
 		},
 		{
 			`level=info msg="user login" user=john id=42 success=true `,
@@ -253,8 +259,12 @@ func Test_Unit_Get_Duplicates(t *testing.T) {
 		t.Errorf("Get(dup) = %q, %v; want second", v, err)
 	}
 	// Only-empty occurrences return the empty value, not ErrKeyNotFound.
-	// (Note e="" — a bare `e= x=1` would parse as e="x=1", since whitespace
-	// after '=' is skipped.)
+	if v, err := Get([]byte(`e= x=1`), "e"); err != nil || v == nil || len(v) != 0 {
+		t.Errorf("Get(bare e=) = %q, %v; want present empty", v, err)
+	}
+	if v, err := Get([]byte(`e= x=1`), "x"); err != nil || string(v) != "1" {
+		t.Errorf("Get(x after empty e=) = %q, %v; want 1 — an empty value must not swallow the next pair", v, err)
+	}
 	if v, err := Get([]byte(`e="" x=1`), "e"); err != nil || v == nil || len(v) != 0 {
 		t.Errorf("Get(e) = %q, %v; want present empty", v, err)
 	}

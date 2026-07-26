@@ -114,15 +114,28 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		}
 		i++
 
-		for i < n && isSpace(data[i]) {
-			i++
-		}
-
 		vStart, vEnd := i, i
 
 		if i >= n {
 			fn(data[kStart:kEnd], data[vStart:vEnd])
 			return nil
+		}
+
+		// `key=` followed by whitespace is an EMPTY value — it is NOT a
+		// lookahead past the separator for the next token. Skipping the
+		// whitespace here made "err= level=info" parse as a single pair
+		// err="level=info", swallowing the following key outright: the value
+		// is garbage and the key is simply gone. That shape is what every real
+		// emitter produces for an empty string (go-kit's and logrus's logfmt
+		// encoders both write a bare "key="), whereas the "key= value" spelling
+		// this leniency was meant to accept is something no encoder writes and
+		// only a human hand-types. Trading a common correct parse for a rare
+		// convenience was the wrong way round.
+		if isSpace(data[i]) {
+			if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
+				return nil
+			}
+			continue
 		}
 
 		if data[i] == '"' {
