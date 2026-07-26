@@ -1,6 +1,6 @@
 # logfmt parser comparison
 
-- generated 2026-07-26T11:53:39Z
+- generated 2026-07-26T12:28:17Z
 - go version go1.26.5 linux/arm64
 - cpu: unknown (4 cores)
 
@@ -10,34 +10,34 @@ This package vs other Go logfmt parsers on the same input. Lower ns/op is better
 
 | Parser | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| this (logfmt) | 425 | 3295.76 MB/s | 0 | 0 | 5.7× |
-| kr/logfmt | 1243 | 1126.70 MB/s | 80 | 1 | 1.9× |
-| Grafana Loki | 1483 | 944.22 MB/s | 80 | 1 | 1.6× |
-| go-logfmt | 2419 | 578.67 MB/s | 4352 | 4 | 1.0× |
+| this (logfmt) | 422 | 3315.01 MB/s | 0 | 0 | 5.8× |
+| kr/logfmt | 1245 | 1124.06 MB/s | 80 | 1 | 2.0× |
+| Grafana Loki | 1485 | 942.51 MB/s | 80 | 1 | 1.7× |
+| go-logfmt | 2454 | 570.43 MB/s | 4352 | 4 | 1.0× |
 
 ## ParseAll_Typical
 
 | Parser | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| this (logfmt) | 88 | 1533.06 MB/s | 0 | 0 | 11.5× |
-| kr/logfmt | 113 | 1196.58 MB/s | 0 | 0 | 9.0× |
-| Grafana Loki | 143 | 941.50 MB/s | 0 | 0 | 7.1× |
-| go-logfmt | 1016 | 132.86 MB/s | 4272 | 3 | 1.0× |
+| this (logfmt) | 88 | 1536.83 MB/s | 0 | 0 | 12.4× |
+| kr/logfmt | 113 | 1192.22 MB/s | 0 | 0 | 9.6× |
+| Grafana Loki | 143 | 941.44 MB/s | 0 | 0 | 7.6× |
+| go-logfmt | 1085 | 124.43 MB/s | 4272 | 3 | 1.0× |
 
 ## ParseEscaped
 
 | Parser | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| this (logfmt) | 218 | 684.03 MB/s | 0 | 0 | 5.8× |
-| kr/logfmt | 329 | 452.96 MB/s | 112 | 3 | 3.8× |
-| Grafana Loki | 374 | 398.38 MB/s | 112 | 3 | 3.4× |
-| go-logfmt | 1258 | 118.46 MB/s | 4384 | 6 | 1.0× |
+| this (logfmt) | 216 | 688.47 MB/s | 0 | 0 | 6.1× |
+| kr/logfmt | 327 | 456.14 MB/s | 112 | 3 | 4.0× |
+| Grafana Loki | 372 | 401.02 MB/s | 112 | 3 | 3.5× |
+| go-logfmt | 1313 | 113.45 MB/s | 4384 | 6 | 1.0× |
 
 ## Extract
 
 | Parser | ns/op | Throughput | B/op | allocs/op | Speedup |
 |---|--:|--:|--:|--:|--:|
-| this (logfmt) | 85 | — | 0 | 0 | 14.1× |
-| Grafana Loki | 328 | — | 80 | 1 | 3.7× |
-| go-logfmt | 1201 | — | 4224 | 3 | 1.0× |
-| kr/logfmt | 1404 | — | 152 | 4 | 0.9× |
+| this (logfmt) | 85 | — | 0 | 0 | 14.8× |
+| Grafana Loki | 325 | — | 80 | 1 | 3.9× |
+| go-logfmt | 1258 | — | 4224 | 3 | 1.0× |
+| kr/logfmt | 1390 | — | 152 | 4 | 0.9× |
