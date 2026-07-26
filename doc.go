@@ -70,10 +70,13 @@
 // rather than overwriting the bytes that follow it in the input; they cap once
 // per lookup, which costs nothing measurable. AppendValue and AppendUnescape
 // always copy into the caller's buffer, so their results never alias the input
-// at all. Iterate and All do not cap what they hand the callback, because that
-// lands once per field and measures ~4.5% on field-dense input; inside a
-// callback, copy first (append(dst[:0], v...), string(v)) or re-slice to
-// v[:len(v):len(v)] before appending.
+// at all. Iterate and All do not cap what they hand the callback to the value's
+// own length, because that lands once per field and measures ~4.5% on
+// field-dense input; they do bound it at the end of the record, so an append
+// cannot run past the data you handed in, but it can still overwrite later
+// fields of the same record. Inside a callback, copy first
+// (append(dst[:0], v...), string(v)) or re-slice to v[:len(v):len(v)] before
+// appending.
 //
 // The package holds no state, so it is safe for concurrent use as long as
 // callers honour that rule.

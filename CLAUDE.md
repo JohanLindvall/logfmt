@@ -26,7 +26,11 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 - `time.go` — `ParseTime` (see warning above).
 - `logfmt_swar_test.go` — `FuzzIterateAgainstRef`: differential fuzz of the
   SWAR `Iterate` against a byte-by-byte reference. **Run this after any change
-  to the parser.**
+  to the parser.** Also `Test_Unit_SWARMasks` (exhaustive: every byte value in
+  every lane, for both masks, plus "the lower of two stops wins") and
+  `Test_Unit_IsSpace`. `isSpace` needs its own test precisely *because* the
+  reference above shares it — a bug there cancels out and the fuzzer sees
+  nothing.
 - `getmany_fuzz_test.go` — `FuzzGetManyAgainstRef`: differential fuzz of
   `GetMany`/`Get`'s first-non-empty duplicate resolution against a naive
   collect-all reference. **Run after any change to the lookup state machine.**
@@ -57,6 +61,10 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   `k`/`v` alias `data` (bare key → shared `trueSlice`; all results read-only).
   Quoted values have quotes stripped but escapes left intact (raw). `false` from
   the callback stops. **The only function that reports errors alongside data.**
+  `key=` before whitespace is an **empty value**, and the whitespace still
+  separates the next token: `"key= value"` yields `("key", "")` then the bare
+  key `("value", "true")`. (The doc comment claimed the opposite until
+  2026-07-27 — it was never updated when 5323cb2 changed the behaviour.)
 - `All(data) func(yield func(k, v []byte) bool)` — range-over-func wrapper over
   `Iterate`. Deliberately the bare func type, **not** `iter.Seq2`: that keeps the
   `iter` import (and the go 1.23 floor) out of this module, while consumers on
@@ -125,38 +133,68 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   values with `cap == len` (`v[:len(v):len(v)]` at the assignment sites), so a
   caller's `append` copies instead of overwriting the rest of the line — free
   there, measured: GetMany 55.8 → 55.5 ns over 3 interleaved A/B rounds.
-  `Iterate` does **not** cap (−4.5%, see below), so callback values still carry
-  capacity into the input. Pinned by `Test_Unit_Lookups_CapValues`, which also
-  guards the thing capping could have broken: slicing keeps a present-but-empty
-  value non-nil, which is how absence stays distinguishable.
+  `Iterate` does **not** cap to the value's own length (−4.5%, see below), so
+  callback values still carry capacity into the input — but only as far as the
+  end of the record: `Iterate` now opens with
+  `data = data[:len(data):len(data)]`, which it does for bounds-check
+  elimination and which incidentally stops a callback's `append` reaching past
+  the record. A strict tightening, never a loosening. Pinned by
+  `Test_Unit_Lookups_CapValues`, which also guards the thing capping could have
+  broken: slicing keeps a present-but-empty value non-nil, which is how absence
+  stays distinguishable.
 - **The bare-key `trueSlice` is a shared global** — mutating it is process-wide.
 - **Keys are never quoted**: `"a b"=c` → bare key `"a`, then `b"`=c. Quoting is
   position-dependent (value position only) — the same property that defeats the
   SIMD substring search below.
 - **`ParseTime` epochs are exactly 10 digits** → 2001-09-09 .. 2286-11-20, no
   negatives, and ms/µs epochs (13/16 digits) are rejected by design.
-- Statement coverage is 98.4%; both differential fuzzers pass 45 s clean
-  (17.1 M and 15.4 M execs, no new failures).
+- Statement coverage is 99.0%; both differential fuzzers pass 90 s clean
+  (24.9 M and 22.4 M execs, no new failures).
 
-## Current benchmarks (Ryzen 7 8840HS, amd64; ~ns, machine-state dependent)
+## Current benchmarks (Ryzen 7 8840HS, amd64)
 
-| Benchmark | ns/op | allocs |
-|---|---:|---:|
-| `Iterate` (sample2, ~900B real line) | ~266 | 0 |
-| `GetMany` (timestamp+level, early-stop) | ~55 | 0 |
-| `DecodeKeyval` (10k short-field rows) | ~1.28 GB/s | 0 |
-| `LevelTS` logfmt vs regex | ~45 vs ~8900 | 0 vs 4 |
-| `Unescape` | ~16 | 0 |
+Quoted as **before → after from one interleaved run**, not as standalone
+absolutes. This machine's power state moves the absolute numbers by ~30% between
+sessions (`Iterate` measured 270 ns, 307 ns and 358 ns for the *same* code
+within one afternoon), so a bare ns/op figure here ages into a lie and invites
+exactly the stale-baseline comparison the methodology section forbids. The
+ratios are the portable part.
 
-Everything on the hot path is **zero-allocation**. `Iterate` went 681 → ~266 ns
-over the optimization history (~61% faster); the last step was `hasKeyStop`
-(2026-07-26, −3.3%).
+2026-07-27 pass, n=10 interleaved pinned rounds, control (two identical trees)
+`~` on every row at +0.13% geomean:
+
+| Benchmark | before | after | Δ | allocs |
+|---|---:|---:|---:|---:|
+| `Iterate` (sample2, 1.4 KB real line) | 358.1 ns | 308.8 ns | **−13.8%** | 0 |
+| `ParseAll_Big_Mine` (same line, bench/) | 359.7 ns | 309.9 ns | **−13.8%** | 0 |
+| `ParseAll_Typical_Mine` (130 B line) | 72.4 ns | 65.9 ns | −9.0% | 0 |
+| `LevelTS` logfmt (vs ~8900 ns regex) | 57.1 ns | 53.5 ns | −6.3% | 0 |
+| `Extract_Mine` / `GetMany` (early-stop) | 71.2 ns | 67.1 ns | −5.7% | 0 |
+| `ParseEscaped_Mine` | 171.2 ns | 164.7 ns | −3.9% | 0 |
+| `DecodeKeyval` (10k short-field rows) | 521.9 µs | 517.6 µs | −0.8% | 0 |
+| `Unescape` (untouched by the pass) | 21.7 ns | 22.0 ns | `~` | 0 |
+
+Everything on the hot path is **zero-allocation**. `Iterate` has come down from
+681 ns over the optimization history on comparable hardware; the 2026-07-27 pass
+took −13.8% off what remained. Geomean −8.2% across the `bench/` suite, big-line
+throughput +16.0%. Every benchmark improved or stayed flat; none regressed —
+including `DecodeKeyval`, which is the *worst* case for this pass (its rows end
+`x=sf   \n`, a four-byte separator run, the one shape the skip-loop removal
+pessimises) and which still came out ahead.
 
 CI-generated tables (EPYC 7763, ~1.7× slower than this laptop) live in
 `bench/pkg_results_<arch>.md` and `bench/results_<arch>.md`; the README quotes
-those, since they are the reproducible ones.
+those, since they are the reproducible ones. **They are stale as of 2026-07-27**
+— they still show the pre-optimization numbers and will refresh on the next CI
+run; don't hand-edit them with laptop figures.
 
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
+
+**Not re-measured after the 2026-07-27 pass**, which attacked the fixed
+per-field term specifically — `sample2`'s average fell from ~7.7 to ~6.7
+ns/field, so read the overhead row as roughly 1 ns high. The scan rows are
+unaffected (neither scan loop's inner shape changed for values). Re-run the
+sweep before quoting the overhead figure again.
 
 | Shape | Cost |
 |---|---|
@@ -179,17 +217,55 @@ paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
   **OR-ed** then `TrailingZeros64`'d — never subtracted from each other (a borrow
   can set spurious high bits *above* a true match, which is fine for OR+find-
   first but breaks subtraction; this was a real fuzz-caught bug).
-- **`hasKeyStop` fuses the two key-scan masks** (`'='` and `<= 0x20`) by
-  factoring the `& swarHi` that both terms end in out of the OR: one ALU op
-  fewer per word, **−3.3 to −3.9% on `Iterate`** (p≤0.04 across two pinned
-  runs), neutral everywhere else. Both terms must still be combined with OR
-  only — the borrow caveat above is unchanged. Don't re-split it into
-  `hasCtrlOrSpace(w) | hasByte(w, '=')`; `hasByte` was removed with it.
+- **`hasKeyStop` is two `<= 0x20` tests, not a `<= 0x20` test plus an equality
+  test.** XOR-ing by `0x1d` turns `b <= 0x20` into a test for exactly
+  `{0x00..0x1f} ∪ {'='}`: `0x1d < 0x20` so the XOR permutes the low 32 values
+  among themselves, `0x3d ^ 0x1d == 0x20` pulls `'='` in, and bits 5–6 are
+  untouched so nothing else reaches `0x20`. Union with the plain term is exactly
+  the key-stop set. `0x1d` is *forced*, not a lucky pick: the fold needs
+  `k < 0x20` **and** `k ^ 0x20 == 0x3d`. Pinned exhaustively by
+  `Test_Unit_SWARMasks`.
+  The payoff is that both terms subtract the **same** word, so the scan needs
+  three broadcast constants instead of four. The shared `&^ w` factors out on
+  top of the `& swarHi` that was already factored, which is sound because
+  `0x1d` has bit 7 clear: bit 7 of each byte of `x` therefore equals bit 7 of
+  `w`, and bit 7 is the only position the result is ever read at. Both terms
+  must still be combined with OR only — the borrow caveat above is unchanged.
+- **No per-field whitespace-skip loop.** Every field used to open with
+  `for i < n && isSpace(data[i]) { i++ }`, which costs *two* iterations (one to
+  eat the single separator, one to notice the key started) — about eighteen
+  instructions before the key scan could even begin. Instead the value scan and
+  the bare-key path consume the separator they have already located, with an
+  **unconditional** `i++`: `i` may reach `n+1`, and every bound in `Iterate` is
+  `i < n` or `i+8 <= n`, both of which treat `n+1` exactly as they treat `n`.
+  A separator *run* (or leading whitespace, or a `\t`/`\n` delimiter) then
+  leaves the key scan stopping at offset zero with an empty key, and that empty
+  key is the signal to drain the run — correct, and off the hot path. This is
+  why the "consume the known delimiter at valEnd" experiment below measured
+  −5%: on its own it adds a branch *and* still pays for the skip loop.
+- **The SWAR verify dispatches straight to `keyEq`/`keyBare`.** Each label
+  already knows both what byte was found and that `i < n`, so neither re-loads
+  `data[i]` nor re-tests a bound the hit established.
+- **`data = data[:len(data):len(data)]` at the top of `Iterate`.** With
+  `cap == len` the loop's own `i+8 <= n` guard proves the eight-byte load in
+  range and a slice bounds check per SWAR iteration goes away. Worth ~1.1% on
+  `Iterate` on its own (n=20, control clean).
 - **`binary.LittleEndian.Uint64(buf[i:i+8])`** (fixed-size slice, not `buf[i:]`)
   — this single change was a large win (337 → 278 ns): it lets the compiler emit
   a tighter load. Keep the `i+8` slice form.
+- **`key=` before whitespace needs no explicit branch.** Whitespace is not `"`,
+  so control falls into the unquoted scan, which stops on the first byte and
+  leaves `vEnd == vStart` — the same empty value the explicit test produced,
+  one branch and one `isSpace` cheaper on every field.
 - **`isSpace` is a 256-byte table lookup**, not arithmetic — measured faster
-  (the table beat `b==' ' || b-'\t' <= '\r'-'\t'`, which mispredicts).
+  twice now. The second time (2026-07-27) was against a *branchless* spelling,
+  `(b == ' ') != (b-'\t' <= '\r'-'\t')`, which compiles to SETcc/SETcc/XOR with
+  no branch and no memory reference. It was introduced to free the register the
+  table's base address occupies, back when the SWAR masks were being held in
+  registers; the XOR fold made that unnecessary and the table won on its own
+  merits: **`DecodeKeyval` −1.29% with the table vs +2.12% branchless**, for
+  ~0.3% on the other benchmarks (n=20, control `~` at +0.13%). Two instructions
+  beat six when nothing is competing for the register.
 - **Verify-order**: at SWAR stop points, test the cheap expected byte first
   (`c == '=' || isSpace(c)` for keys, `c == ' ' || isSpace(c)` for values) so the
   common case short-circuits past the `isSpace` table load. `IsAbsent`/nil-style
@@ -252,6 +328,35 @@ noisy). Each was **neutral or worse**:
 - **Consuming the known-whitespace delimiter after an unquoted value**
   (`if i < n { i++ }` at valEnd, mirroring the quoted branch): −5% — the extra
   branch in the hot loop costs more than the saved top-of-loop `isSpace` load.
+  **Superseded 2026-07-27**, and the reason is instructive: the idea was right
+  and the *spelling* was wrong twice over. Make the step unconditional (`n+1`
+  fails every bound exactly as `n` does, so no branch) **and** delete the
+  whitespace-skip loop it makes redundant, rather than paying for both. See
+  "No per-field whitespace-skip loop" above. A half-applied optimization can
+  measure worse than not applying it at all — which is exactly what happened
+  here, and it kept the idea parked for a release.
+- **Sourcing the SWAR broadcast masks from package-level `var`s** so the
+  register allocator has to keep them in registers instead of rematerialising
+  `MOVQ $imm64` at every use (four per 8-byte key-scan iteration, ~a fifth of
+  the loop). It does exactly what it promises in the disassembly — the masks
+  live in R9–R12 and the loop drops to 16 instructions — but it is **neutral to
+  negative** once the XOR fold has cut the mask count to three: holding them
+  costs a spill/reload around every `fn` callback, which short-field workloads
+  cannot amortise. Measured head to head (n=8, control clean): plain consts beat
+  package vars on `ParseAll_Typical` (−7.18% vs −4.65%), `ParseEscaped`
+  (−6.38% vs `~`) and `DecodeKeyval` (+1.76% vs +2.56%), and tie elsewhere.
+  Fewer constants beat pinned constants. Don't reach for the `var` trick until
+  you have first tried to need fewer values.
+- **A shrinking sub-slice window** (`s := data[i:]; for len(s) >= 8 { …;
+  s = s[8:] }`) to get bounds-check elimination: Go emits a *conditional*
+  pointer advance for `s[8:]` (`MOV`/`NEG`/`SAR`/`AND`/`ADD`) because it must
+  not advance the pointer when the result's capacity reaches zero. Five
+  instructions to remove two. `binary.LittleEndian.Uint64(data[i:])` pays the
+  same dance, which is the mechanism behind the `data[i:i+8]` win above.
+  `data = data[:len(data):len(data)]` is the cheap way to get the same check
+  eliminated — one instruction, once per call.
+- **A hoisted `lim := n - 8` loop bound** replacing `i+8 <= n`: more
+  instructions, not fewer; the compiler already folds the `i+8` form well.
 - **Inline first-word `hasByte(w,'"')` before `IndexByte` in the quoted scan**
   (to spare short quoted values the call overhead): −3% on `Iterate` (long
   quoted values pay the wasted word check) and neutral on `DecodeKeyval` —

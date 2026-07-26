@@ -37,6 +37,7 @@ func (e *SyntaxError) Error() string {
 func (e *SyntaxError) Is(target error) bool { return target == ErrBadFormat }
 
 var trueSlice = []byte("true")
+
 var spaceTable = [256]bool{
 	' ':  true,
 	'\t': true,
@@ -70,13 +71,27 @@ func hasCtrlOrSpace(w uint64) uint64 {
 }
 
 // hasKeyStop flags every byte of w that can end a key: '=' or <= 0x20. It is
-// hasCtrlOrSpace(w) OR-ed with an equality mask for '=', with the & swarHi that
-// both terms end in factored out — one ALU op fewer per word, measured at
-// -3.9% on Iterate. Combining the terms with OR (never subtraction) is what
-// keeps the borrow caveat above harmless.
+// two "<= 0x20" tests OR-ed together, with everything they share factored out.
+//
+// The second test is what handles '=', without an equality mask: XOR-ing by
+// 0x1d turns "b <= 0x20" into a test for exactly {0x00..0x1f} + {'='}. That
+// holds because 0x1d < 0x20, so the XOR permutes the low 32 values among
+// themselves, while 0x3d ^ 0x1d == 0x20 pulls '=' in and nothing else reaches
+// 0x20 or below (bits 5 and 6 are untouched by 0x1d). Union it with the plain
+// "b <= 0x20" term and the result is exactly {0x00..0x20} + {'='}.
+//
+// Doing it that way lets both terms subtract the SAME word (swarSpW), so the
+// scan needs three live broadcast masks instead of four. The shared "&^ w" is
+// factored out too, which is sound because 0x1d has bit 7 clear: bit 7 of every
+// byte of x therefore equals bit 7 of w, and bit 7 is the only position the
+// result is ever read at.
+//
+// Combining the terms with OR (never subtraction) is what keeps the borrow
+// caveat above harmless: every spurious bit sits above a true match, so the
+// lowest set bit of the union is still a genuine stop.
 func hasKeyStop(w uint64) uint64 {
-	x := w ^ (swarLo * uint64('='))
-	return ((w-swarLo*0x21)&^w | (x-swarLo)&^x) & swarHi
+	x := w ^ (swarLo * 0x1d)
+	return ((w - swarLo*0x21) | (x - swarLo*0x21)) &^ w & swarHi
 }
 
 // Iterate parses data as a logfmt record and calls fn once for each key/value
@@ -85,31 +100,54 @@ func hasKeyStop(w uint64) uint64 {
 // a shared constant "true". Treat both as read-only, and copy them if they must
 // outlive the call.
 //
-// Whitespace after '=' is skipped, so "key= value" yields ("key", "value");
-// go-logfmt instead reports an empty value and a separate bare key. A quoted
-// value is returned without its surrounding double quotes but is NOT
-// unescaped — backslash escapes are left intact; pass val to Unescape to
-// decode them.
+// `key=` followed by whitespace is an EMPTY value, and that whitespace still
+// separates the next token: "key= value" yields ("key", "") and then the bare
+// key ("value", "true"). go-logfmt reads it the same way, bar the bare-key
+// sentinel. A quoted value is returned without its surrounding double quotes
+// but is NOT unescaped — backslash escapes are left intact; pass val to
+// AppendUnescape to decode them, or guard with NeedsUnescape to skip the copy
+// when there is nothing to decode.
 //
 // fn may return false to stop iteration early, in which case Iterate returns
 // nil. Iterate returns ErrBadFormat if data contains a malformed quoted value,
 // and otherwise nil. It performs no allocations.
 func Iterate(data []byte, fn func(key, val []byte) bool) error {
-	for i, n := 0, len(data); i < n; {
-		for i < n && isSpace(data[i]) {
-			i++
-		}
-
+	// cap == len makes the eight-byte load provably in range from the loop's
+	// own "i+8 <= n" guard, so the compiler drops a slice bounds check from
+	// every SWAR iteration. It also stops a callback's append reaching past the
+	// end of the record — a free tightening of the read-only contract, never a
+	// loosening.
+	data = data[:len(data):len(data)]
+	n := len(data)
+	// Loop invariant worth stating because two steps below rely on it: a field
+	// consumes its own trailing separator, so i can finish a step at n+1 rather
+	// than n. Every bound in here is "i < n" or "i+8 <= n", and both treat n+1
+	// exactly as they treat n — which is what lets those steps be branchless.
+	for i := 0; i < n; {
+		// There is no whitespace-skip loop here, on purpose. The previous field
+		// already stepped past its separator, so i points at the key. Leading
+		// whitespace, a run of separators, or a '\t'/'\n' delimiter instead
+		// leaves the scan below stopping at offset zero with an empty key,
+		// which keyBare handles once, off the hot path.
 		kStart := i
+		// Declared up here so the gotos, which jump forward, skip no declaration.
+		var kEnd, vStart, vEnd int
+
 		for i+8 <= n {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
 			m := hasKeyStop(w)
 			if m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
-				// '=' first: keys overwhelmingly end there, so the cheap
-				// compare short-circuits past the isSpace call.
-				if c := data[i]; c == '=' || isSpace(c) {
-					goto keyEnd
+				// '=' first: keys overwhelmingly end there. Each stop byte
+				// jumps straight to the label that already knows both what was
+				// found and that i < n, so neither label reloads data[i] nor
+				// re-tests a bound this hit has already established.
+				c := data[i]
+				if c == '=' {
+					goto keyEq
+				}
+				if isSpace(c) {
+					goto keyBare
 				}
 				break // rare non-whitespace control byte; finish scalar
 			}
@@ -118,7 +156,6 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		for i < n && !isSpace(data[i]) && data[i] != '=' {
 			i++
 		}
-	keyEnd:
 
 		if i >= n {
 			if kStart < n {
@@ -126,18 +163,33 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 			}
 			return nil
 		}
+		if data[i] == '=' {
+			goto keyEq
+		}
 
-		kEnd := i
-
-		if data[i] != '=' {
-			if !fn(data[kStart:i], trueSlice) {
-				return nil
+	keyBare:
+		// data[i] is whitespace: the key scan stops at nothing else. An EMPTY
+		// key means i was sitting on a separator run rather than on a key, so
+		// drain the run and start the field over. This is the only place a run
+		// costs anything, and no real emitter writes one.
+		if i == kStart {
+			i++
+			for i < n && isSpace(data[i]) {
+				i++
 			}
 			continue
 		}
+		if !fn(data[kStart:i], trueSlice) {
+			return nil
+		}
+		i++ // step past the separator the key stopped on
+		continue
+
+	keyEq:
+		kEnd = i
 		i++
 
-		vStart, vEnd := i, i
+		vStart, vEnd = i, i
 
 		if i >= n {
 			fn(data[kStart:kEnd], data[vStart:vEnd])
@@ -154,13 +206,11 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		// this leniency was meant to accept is something no encoder writes and
 		// only a human hand-types. Trading a common correct parse for a rare
 		// convenience was the wrong way round.
-		if isSpace(data[i]) {
-			if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
-				return nil
-			}
-			continue
-		}
-
+		//
+		// No explicit test is needed for it: whitespace is not '"', so control
+		// falls into the unquoted scan, which stops on the very first byte and
+		// leaves vEnd == vStart — the same empty value, one branch and one
+		// isSpace cheaper on every field.
 		if data[i] == '"' {
 			i++
 			vStart = i
@@ -188,8 +238,8 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 				vEnd = i
 				i++
 				if i < n {
-					// ' ' first: the usual delimiter short-circuits past the
-					// isSpace table load.
+					// ' ' first: the usual delimiter short-circuits past
+					// the isSpace test.
 					if c := data[i]; c != ' ' && !isSpace(c) {
 						return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
 					}
@@ -205,7 +255,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 				if m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
 					// ' ' first: it is the usual value delimiter, so the cheap
-					// compare short-circuits past the isSpace call.
+					// compare short-circuits past the isSpace test.
 					if c := data[i]; c == ' ' || isSpace(c) {
 						goto valEnd
 					}
@@ -218,6 +268,12 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 			}
 		valEnd:
 			vEnd = i
+			// The scan stopped on whitespace or ran out of input, so stepping
+			// past the separator needs no guard: i == n+1 fails every bound
+			// exactly as i == n does. Unlike "if i < n { i++ }" this costs no
+			// branch, and it is what removes the whitespace-skip loop that
+			// used to open every field.
+			i++
 		}
 
 		if !fn(data[kStart:kEnd], data[vStart:vEnd]) {

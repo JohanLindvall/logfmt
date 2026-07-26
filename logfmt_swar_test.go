@@ -2,6 +2,8 @@ package logfmt
 
 import (
 	"bytes"
+	"encoding/binary"
+	"math/bits"
 	"testing"
 )
 
@@ -144,4 +146,77 @@ func slicesEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// isSpace is shared by Iterate and by iterateRef, the differential fuzzer's
+// reference implementation — so a bug in it cancels out there and goes unseen.
+// Pin it against the definition instead.
+func Test_Unit_IsSpace(t *testing.T) {
+	for b := 0; b < 256; b++ {
+		want := b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r'
+		if got := isSpace(byte(b)); got != want {
+			t.Errorf("isSpace(%#02x) = %v, want %v", b, got, want)
+		}
+	}
+}
+
+// firstStop reports which byte of a SWAR mask is flagged first, or 8 if none
+// is. Only the first match is contractual: a borrow can set spurious high bits
+// in bytes ABOVE a true match, which is precisely why the masks may only ever
+// be OR-ed together and never subtracted from one another.
+func firstStop(m uint64) int {
+	if m == 0 {
+		return 8
+	}
+	return bits.TrailingZeros64(m) >> 3
+}
+
+func Test_Unit_SWARMasks(t *testing.T) {
+	// 'a' (0x61) satisfies neither predicate, so it is a safe filler.
+	for pos := 0; pos < 8; pos++ {
+		for v := 0; v < 256; v++ {
+			buf := []byte("aaaaaaaa")
+			buf[pos] = byte(v)
+			w := binary.LittleEndian.Uint64(buf)
+
+			want := 8
+			if v <= 0x20 || v == '=' {
+				want = pos
+			}
+			if got := firstStop(hasKeyStop(w)); got != want {
+				t.Fatalf("hasKeyStop: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
+
+			want = 8
+			if v <= 0x20 {
+				want = pos
+			}
+			if got := firstStop(hasCtrlOrSpace(w)); got != want {
+				t.Fatalf("hasCtrlOrSpace: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
+		}
+	}
+
+	// Two stops in one word: the lower position must win. This is the property
+	// the OR-only rule exists to protect — subtracting one mask from another
+	// would let a borrow from the low match manufacture a false stop above it.
+	for lo := 0; lo < 8; lo++ {
+		for hi := lo + 1; hi < 8; hi++ {
+			for _, pair := range [][2]byte{
+				{'=', ' '}, {' ', '='}, {'\n', '='}, {0x00, '='}, {0x01, ' '}, {'\t', '\r'},
+			} {
+				buf := []byte("aaaaaaaa")
+				buf[lo], buf[hi] = pair[0], pair[1]
+				w := binary.LittleEndian.Uint64(buf)
+				if got := firstStop(hasKeyStop(w)); got != lo {
+					t.Fatalf("hasKeyStop: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
+				}
+				if pair[0] <= 0x20 {
+					if got := firstStop(hasCtrlOrSpace(w)); got != lo {
+						t.Fatalf("hasCtrlOrSpace: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
+					}
+				}
+			}
+		}
+	}
 }
