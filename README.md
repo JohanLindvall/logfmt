@@ -271,22 +271,22 @@ Parse every key/value pair:
 
 | Parser | ns/op | Throughput | allocs/op | Speedup |
 |---|--:|--:|--:|--:|
-| **this package** | **456** | **3070 MB/s** | **0** | **6.0×** |
-| kr/logfmt | 1470 | 953 MB/s | 1 | 1.9× |
-| Grafana Loki | 1968 | 711 MB/s | 1 | 1.4× |
-| go-logfmt | 2758 | 508 MB/s | 4 | 1.0× |
+| **this package** | **444** | **3157 MB/s** | **0** | **6.3×** |
+| kr/logfmt | 1473 | 951 MB/s | 1 | 1.9× |
+| Grafana Loki | 1967 | 712 MB/s | 1 | 1.4× |
+| go-logfmt | 2779 | 504 MB/s | 4 | 1.0× |
 
 Extract two keys (`timestamp`+`level`), each parser stopping once both are found
 (where its API allows — `kr/logfmt` is push-based and can't stop its scan):
 
 | Parser | ns/op | allocs/op | Speedup |
 |---|--:|--:|--:|
-| **this package** (`GetMany`) | **95** | **0** | **12.0×** |
-| Grafana Loki | 348 | 1 | 3.3× |
-| go-logfmt | 1139 | 3 | 1.0× |
-| kr/logfmt | 1563 | 4 | 0.7× |
+| **this package** (`GetMany`) | **96** | **0** | **11.8×** |
+| Grafana Loki | 349 | 1 | 3.3× |
+| go-logfmt | 1135 | 3 | 1.0× |
+| kr/logfmt | 1560 | 4 | 0.7× |
 
-Faster hardware roughly halves these: the same two benchmarks measure 275 ns and
+Faster hardware roughly halves these: the same two benchmarks measure 266 ns and
 54 ns on a Ryzen 7 8840HS.
 
 ## License
