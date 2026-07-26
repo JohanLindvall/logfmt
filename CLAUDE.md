@@ -101,14 +101,15 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
 
 | Benchmark | ns/op | allocs |
 |---|---:|---:|
-| `Iterate` (sample2, ~900B real line) | ~275 | 0 |
+| `Iterate` (sample2, ~900B real line) | ~266 | 0 |
 | `GetMany` (timestamp+level, early-stop) | ~55 | 0 |
 | `DecodeKeyval` (10k short-field rows) | ~1.28 GB/s | 0 |
 | `LevelTS` logfmt vs regex | ~45 vs ~8900 | 0 vs 4 |
 | `Unescape` | ~16 | 0 |
 
-Everything on the hot path is **zero-allocation**. `Iterate` went 681 → ~275 ns
-over the optimization history (~60% faster). Re-measured 2026-07-26: unchanged.
+Everything on the hot path is **zero-allocation**. `Iterate` went 681 → ~266 ns
+over the optimization history (~61% faster); the last step was `hasKeyStop`
+(2026-07-26, −3.3%).
 
 CI-generated tables (EPYC 7763, ~1.7× slower than this laptop) live in
 `bench/pkg_results_<arch>.md` and `bench/results_<arch>.md`; the README quotes
@@ -137,6 +138,12 @@ paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
   **OR-ed** then `TrailingZeros64`'d — never subtracted from each other (a borrow
   can set spurious high bits *above* a true match, which is fine for OR+find-
   first but breaks subtraction; this was a real fuzz-caught bug).
+- **`hasKeyStop` fuses the two key-scan masks** (`'='` and `<= 0x20`) by
+  factoring the `& swarHi` that both terms end in out of the OR: one ALU op
+  fewer per word, **−3.3 to −3.9% on `Iterate`** (p≤0.04 across two pinned
+  runs), neutral everywhere else. Both terms must still be combined with OR
+  only — the borrow caveat above is unchanged. Don't re-split it into
+  `hasCtrlOrSpace(w) | hasByte(w, '=')`; `hasByte` was removed with it.
 - **`binary.LittleEndian.Uint64(buf[i:i+8])`** (fixed-size slice, not `buf[i:]`)
   — this single change was a large win (337 → 278 ns): it lets the compiler emit
   a tighter load. Keep the `i+8` slice form.
@@ -216,6 +223,19 @@ noisy). Each was **neutral or worse**:
   — the read-only contract is documented instead. The lookups *do* cap (below);
   the asymmetry is the whole point and is documented in both README and doc.go,
   so don't "fix" it in either direction without re-measuring.
+- **Fusing the value scan into the key scan's word** (when `key=value ` fits in
+  one 8-byte word, the key mask already locates the value's end, so the pair can
+  be emitted with no second load and no second SWAR loop). Implemented, fuzz-
+  clean, and it does exactly what it promises on short fields: **−6.1% on
+  `DecodeKeyval`** (p=0.002). Rejected anyway, because that shape is the
+  synthetic one. On real input the wasted check costs more than the hits save:
+  **`ParseAll_Typical` +2.3%, `Extract` +2.3%, `LevelTS` +4.6%** (all p≤0.04),
+  `ParseAll_Big`/`Iterate`/`GetMany` neutral — geomean **+1.6% on the realistic
+  suite**. Fields only fuse when key+value+delimiter ≤ 8 B; real logfmt keys
+  (`session_attr_*`, `timestamp`) blow that instantly, and every quoted value
+  pays the failed check. Related: consuming the known delimiter in the fused
+  path (`i = ve + 1`) was a further −1.7%, so if this is ever revisited on a
+  short-field-only workload, include it.
 - **Benchmarking note**: this machine drifts between power states *mid-session*
   (same code measured 283 → 297 ns minutes apart). Never compare against a
   stale baseline — interleave A/B runs (A,B,A,B…) and compare means.
@@ -262,6 +282,18 @@ wins in `-count=1` runs but vanish when averaged.
 - **A/B with averaging**, not single runs: `-count=8 -benchtime=2s` and compare
   medians/means; ±3–4 ns is noise on this machine, and machine power-state
   drifts between sessions (absolute numbers shift ~30%).
+- **The A/B harness itself needs three things, learned the hard way (2026-07-26)
+  when a naive one manufactured a 4–6% "regression" out of nothing:**
+  1. **Alternate the order** (A,B then B,A per round). Running A-then-B every
+     round makes whichever goes second look ~3–5% slower.
+  2. **Pin to a core** (`taskset -c 6`). This cut run-to-run variance from
+     ±8–16% to ±1–2%, which is the difference between deciding and guessing.
+  3. **Run a control first**: A/B two *identical* copies and confirm benchstat
+     reports `~` on everything. If the control shows a delta, the harness is
+     lying and no result from it counts. The tell in the cross-library suite was
+     go-logfmt/Loki/kr — code neither variant touches — "regressing" 4–10%.
+  Use `benchstat` (p-values), not eyeballed means; with n=6 pinned rounds a real
+  3% effect lands at p≤0.05 and noise stays at `~`.
 - **Profile cumulative + line-level**: `-cpuprofile`, then `go tool pprof -top
   -cum` and `-list=Iterate`. Beware skid: `isSpace` and verify-line "flat %" are
   often attribution of dependent-load latency, not removable work.
