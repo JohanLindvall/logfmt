@@ -550,14 +550,58 @@ func Test_Unit_IsBareKey(t *testing.T) {
 }
 
 func Test_Unit_ParseTime_Allocs(t *testing.T) {
-	// ParseTime takes []byte like the rest of the package; the conversion it
-	// does internally must not escape, or every call would allocate.
+	// ParseTime takes []byte like the rest of the package and must not copy
+	// them to reach time.Parse. Every case here has to stay at zero, INCLUDING
+	// the ones past 32 bytes: a plain string([]byte) conversion is kept off the
+	// heap only while it fits the compiler's stack buffer, so testing only
+	// short timestamps hides the copy on exactly the two layouts that are long.
+	//
+	// Two shapes are deliberately absent because their cost is time.Parse's
+	// own and predates the []byte signature — a zone abbreviation it cannot
+	// resolve ("...+0200 CEST", 4 allocs, the fabricated Location) and a value
+	// matching no layout ("...+07:00xxx", 5 allocs, the discarded *ParseError).
+	// Both allocate identically when time.Parse is handed a plain string with
+	// no conversion at all, so pinning them here would assert something this
+	// package cannot deliver short of hand-rolling the layouts.
 	for _, ts := range [][]byte{
-		[]byte("1748239806.3691056"),
-		[]byte("2025-05-26T06:10:06.3691056Z"),
+		[]byte("1748239806.3691056"),                  // epoch, returns before the layout loop
+		[]byte("2025-05-26T06:10:06.3691056Z"),        // 28 bytes, fits the stack buffer
+		[]byte("2026-03-14 06:11:46.397 +0000 UTC"),   // 33 bytes, "-0700 MST" layout
+		[]byte("2026-03-14T06:11:46.123456789+07:00"), // 35 bytes, RFC3339Nano
 	} {
 		if allocs := testing.AllocsPerRun(100, func() { ParseTime(ts) }); allocs != 0 {
 			t.Errorf("ParseTime(%q) allocs = %v, want 0", ts, allocs)
+		}
+	}
+}
+
+// Test_Unit_ParseTime_NoAliasing pins the safety argument behind ParseTime's
+// unsafe.String: nothing the caller can reach may alias the input bytes, so
+// mutating (or reusing) the buffer afterwards must not disturb the result.
+// The zone abbreviation is the interesting case — time.Parse fabricates a
+// FixedZone named by a slice of the value when it cannot resolve one.
+func Test_Unit_ParseTime_NoAliasing(t *testing.T) {
+	for _, in := range []string{
+		"2026-03-14 06:11:46.397 +0200 CEST", // unresolvable abbreviation
+		"2026-03-14 06:11:46.397 +0000 UTC",
+		"2026-03-14T06:11:46.123456789+07:00",
+	} {
+		buf := []byte(in)
+		got, ok := ParseTime(buf)
+		if !ok {
+			t.Fatalf("ParseTime(%q) failed", in)
+		}
+		want := got.String()
+		wantZone, wantOff := got.Zone()
+
+		for i := range buf { // scribble over the bytes ParseTime just read
+			buf[i] = 'x'
+		}
+		if got.String() != want {
+			t.Errorf("ParseTime(%q): time changed after input was overwritten: %q -> %q", in, want, got.String())
+		}
+		if z, off := got.Zone(); z != wantZone || off != wantOff {
+			t.Errorf("ParseTime(%q): zone changed after input was overwritten: %q/%d -> %q/%d", in, wantZone, wantOff, z, off)
 		}
 	}
 }

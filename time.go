@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strconv"
 	"time"
+	"unsafe"
 )
 
 var logFmtLayouts = []string{time.RFC3339Nano, "2006-01-02 15:04:05.999 -0700 MST"}
@@ -28,21 +29,47 @@ var logFmtLayouts = []string{time.RFC3339Nano, "2006-01-02 15:04:05.999 -0700 MS
 //
 // Callers with a known emitter should prefer time.Parse with that emitter's
 // exact layout; ParseTime is for mixed-source logs where the layout is not
-// known up front. It performs no allocations for the RFC3339 and epoch forms.
+// known up front.
+//
+// It copies nothing, at any input length. The only allocations it can incur
+// are time.Parse's own, on two shapes this package cannot parse without
+// hand-rolling the layouts: a zone abbreviation the runtime cannot resolve
+// (the fabricated Location) and a value matching no layout at all (the
+// discarded *time.ParseError). Every accepted form above is allocation-free.
 func ParseTime(ts []byte) (time.Time, bool) {
 	ts = bytes.TrimRight(ts, "}],)\"")
 	if t, ok := parseUnixTS(ts); ok {
 		return t, true
 	}
+	if len(ts) == 0 {
+		return time.Time{}, false
+	}
+	// time.Parse wants a string and we hold bytes. A `string(ts)` conversion
+	// here is provably non-escaping, but the compiler only keeps a
+	// non-escaping conversion off the heap while it fits its 32-byte stack
+	// buffer — and the timestamps that reach this loop routinely do not: the
+	// "-0700 MST" form is 33 bytes ("2026-03-14 06:11:46.397 +0000 UTC") and
+	// an RFC3339Nano with nanoseconds and a numeric offset is 35. That made
+	// every such call allocate, once per attempted layout, on what is a
+	// per-log-line path for this package's callers.
+	//
+	// Aliasing the caller's bytes avoids the copy at every length. It is safe
+	// because ts is read-only for the duration of the call and time.Parse does
+	// not retain value: the compiler proves it (an escaping value would put
+	// the plain conversion on the heap too, which Test_Unit_ParseTime_Allocs
+	// would catch at ANY length), and the one place a parsed Time can capture
+	// a slice of value — the fabricated FixedZone for a zone abbreviation the
+	// layout matched but the runtime cannot resolve — is discarded by the
+	// .UTC() below before the Time is returned. Nothing reachable by the
+	// caller aliases ts.
+	s := unsafe.String(unsafe.SliceData(ts), len(ts))
 	for _, layout := range logFmtLayouts {
 		// Only RFC3339Nano carries a 'T' date/time separator at index 10, so a
 		// 'T'-vs-space disagreement there means time.Parse would fail for nothing.
 		if len(ts) > 10 && len(layout) > 10 && (layout[10] == 'T') != (ts[10] == 'T') {
 			continue
 		}
-		// The conversion does not escape into time.Parse, so it costs no
-		// allocation (pinned by Test_Unit_ParseTime_Allocs).
-		if t, err := time.Parse(layout, string(ts)); err == nil {
+		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC(), true
 		}
 	}
