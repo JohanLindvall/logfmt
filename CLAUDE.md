@@ -188,6 +188,15 @@ those, since they are the reproducible ones. **They are stale as of 2026-07-27**
 — they still show the pre-optimization numbers and will refresh on the next CI
 run; don't hand-edit them with laptop figures.
 
+2026-07-27 **evening** pass (same machine, faster power state — do not compare
+absolutes across the two tables), n=8 interleaved pinned 1 s rounds, control
+clean: the uint/n-8 loop bounds and the guard-free backslash walk landed
+together. Iterate 231.2 → 228.2 ns (−1.3%), GetMany 50.6 → 48.9 ns (−3.4%),
+Extract 51.0 → 49.3 ns (−3.4%), ParseEscaped 124.3 → 120.2 ns (−3.3%), LevelTS
+−1.4%, ParseAll_Typical −0.6%, ParseAll_Big/Unescape `~`, **DecodeKeyval 391.0
+→ 395.6 µs (+1.2%)** — the accepted trade (see the optimization-notes bullet).
+Geomean −1.0% (root) / −2.0% (bench). CI tables are stale for this pass too.
+
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
 **Not re-measured after the 2026-07-27 pass**, which attacked the fixed
@@ -246,10 +255,36 @@ paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
 - **The SWAR verify dispatches straight to `keyEq`/`keyBare`.** Each label
   already knows both what byte was found and that `i < n`, so neither re-loads
   `data[i]` nor re-tests a bound the hit established.
-- **`data = data[:len(data):len(data)]` at the top of `Iterate`.** With
-  `cap == len` the loop's own `i+8 <= n` guard proves the eight-byte load in
-  range and a slice bounds check per SWAR iteration goes away. Worth ~1.1% on
-  `Iterate` on its own (n=20, control clean).
+- **`data = data[:len(data):len(data)]` at the top of `Iterate`.** Originally
+  for bounds-check elimination (worth ~1.1% then); since the 2026-07-27 evening
+  pass the loop spellings below carry that role, and the cap-pin stays for the
+  documented contract tightening (a callback's `append` cannot reach past the
+  record).
+- **`uint(i) < uint(n)` outer loop + `i <= n-8` SWAR loop heads** (2026-07-27
+  evening). The unsigned compare is `i < n` (i is never negative) plus the
+  `i >= 0` fact the prove pass otherwise never has; `i <= n-8` proves
+  `i+8 <= n` without materialising an add that could overflow. Together they
+  kill the IsSliceInBounds overflow check that had survived the cap-pin on
+  both SWAR loads (~2 instructions + 2 never-taken branches per iteration),
+  plus the bare-key-tail slice check and the separator-drain IsInBounds.
+  Neither half works alone: uint-outer alone leaves the overflow check, and
+  `n-8` alone (without `i >= 0`) removes nothing and adds an op — which is
+  exactly why the old "hoisted `lim := n - 8`" attempt measured worse (see
+  Rejected, now superseded).
+- **The backslash-run walk before a closing quote has no lower-bound guard**
+  (2026-07-27 evening): `data[vStart-1]` is the opening quote, any earlier
+  escaped quote inside the value is also `"`, and neither is a backslash, so
+  the run self-terminates and `j >= vStart` was semantically dead. `bs&1`
+  replaces `bs%2` — the compiler cannot prove `bs >= 0` across the loop phi
+  and spells `%2` as a 6-op signed-modulo dance. Measured together with the
+  loop-bounds change as one pass (n=8 pinned interleaved rounds, control
+  clean): geomean −1.0% (root suite) / −2.0% (bench suite); ParseEscaped
+  −3.3%, GetMany −3.4%, Extract −3.4%, Iterate −1.3%, LevelTS −1.4%,
+  ParseAll_Typical −0.6%, ParseAll_Big/Unescape `~` — and **DecodeKeyval
+  +1.2% (p=0.000), the one accepted regression**: the first pass to trade the
+  synthetic worst-case shape for the realistic suite. A variant keeping the
+  old value-loop head halved that cost (+0.6%) but gave back roughly half the
+  GetMany/Extract/LevelTS wins and lost on both geomeans.
 - **`binary.LittleEndian.Uint64(buf[i:i+8])`** (fixed-size slice, not `buf[i:]`)
   — this single change was a large win (337 → 278 ns): it lets the compiler emit
   a tighter load. Keep the `i+8` slice form.
@@ -297,7 +332,11 @@ noisy). Each was **neutral or worse**:
 - **`bytes.IndexByte('=')` for the key scan**: slightly slower even as an
   unchecked ceiling — 29 non-inlinable calls/line cost more than inlined SWAR.
 - **Register-extract of the verify byte** (`byte(w >> (tz &^ 7))` instead of
-  `buf[i]`): neutral — the reload is an L1 hit the CPU pipelines.
+  `buf[i]`): neutral — the reload is an L1 hit the CPU pipelines. Re-tested
+  2026-07-27 evening under the changed-circumstances rule (it also removes a
+  real per-field IsInBounds the prover cannot drop): still no — DecodeKeyval
+  +1.1% (p=0.002), all else `~`; the shift-chain dependency costs what the
+  eliminated check saves.
 - **16-byte unrolled key scan**: no change (loop overhead wasn't the bottleneck;
   it's memory-latency bound).
 - **Arithmetic `isSpace`**, **combined key-stop lookup table**, **`len(buf)` in
@@ -357,6 +396,10 @@ noisy). Each was **neutral or worse**:
   eliminated — one instruction, once per call.
 - **A hoisted `lim := n - 8` loop bound** replacing `i+8 <= n`: more
   instructions, not fewer; the compiler already folds the `i+8` form well.
+  **Superseded 2026-07-27 evening**: the idea was right and half-applied —
+  `i <= n-8` pays off only when the outer loop's `uint(i) < uint(n)` supplies
+  the `i >= 0` fact, and the pair (and only the pair) eliminates every bounds
+  check in both SWAR loops. Second instance of the valEnd lesson.
 - **Inline first-word `hasByte(w,'"')` before `IndexByte` in the quoted scan**
   (to spare short quoted values the call overhead): −3% on `Iterate` (long
   quoted values pay the wasted word check) and neutral on `DecodeKeyval` —
@@ -415,6 +458,40 @@ noisy). Each was **neutral or worse**:
   logfmt's context-sensitive quoting defeats the context-free SIMD tricks that
   work for JSON.
 
+- **2026-07-27 evening pass — measured and rejected** (multi-agent ideation +
+  three adversarial skeptics, then serial pinned A/B; every item below was
+  correctness-verified and fuzz-clean before losing on the stopwatch):
+  - *Split `fn` call sites for the quoted/unquoted value paths* (kill the
+    kStart/kEnd spill round-trip around the callback): Extract +8.4%,
+    DecodeKeyval +3.8%, Iterate +2.6%, ParseAll_Big +2.9% — code growth beats
+    the saved store-forwarded spills, decisively.
+  - *GetMany inline byte-compare* replacing `string(k) != keys[j]` (+ a
+    prover-guard to BCE the closure): GetMany +7.0%, Extract +6.9%.
+    `runtime.memequal` is SIMD; a byte loop over realistic key lengths loses
+    even after deleting the call and shrinking the closure frame 0x58→0x20.
+  - *AppendUnescape fused chunk+escape append* via a 256-byte self-map table:
+    verifiably fewer instructions, measured `~` everywhere (Unescape 17.12 →
+    17.12 ns). Escapes are too rare on real shapes for the emit path to matter.
+  - *wsMask bit-test verify* (`(wsMask>>c)&1` for the stop-byte whitespace
+    test — valid because SWAR stop bytes are provably < 64): no significant
+    wins, Extract +4.5%. The two-instruction spaceTable load keeps winning
+    (third spelling of "arithmetic isSpace" to lose to it).
+  - *First-probe backslash unroll* (`if data[i-1] == '\\'` before the run
+    walk): ParseEscaped −1.9% but LevelTS +2.2% and DecodeKeyval leaning
+    positive — the added branch in the quoted path costs more than the probe
+    saves. Superseded by the guard-drop spelling that landed (same
+    ParseEscaped win, no new branch).
+  - *AppendUnescape 8-byte word-copy for short inter-escape chunks*: killed on
+    correctness before measurement — it writes into `dst[len:cap]`, which
+    corrupts an in-place `AppendUnescape(raw[:0], raw)` decode.
+  - *Seeding the value scan from the key word's remaining mask bits*
+    (mask-carry across `=`): parked unmeasured. A scratch prototype verified
+    correct, but it restructures the whole value state machine for a gain the
+    cost model caps at ~1 word-load per short field, and the split-callsites
+    result above is a fresh warning about code-growth effects in exactly that
+    region. Revisit only with the prototype under differential fuzz and a
+    control-clean series.
+
 The parser is **memory-latency / per-field-overhead bound**, not scan-throughput
 bound. Further wins require an API change (non-callback) or accepting a
 correctness/maintainability cost. Don't chase sub-ns micro-ops; they read as
@@ -440,6 +517,10 @@ wins in `-count=1` runs but vanish when averaged.
      go-logfmt/Loki/kr — code neither variant touches — "regressing" 4–10%.
   Use `benchstat` (p-values), not eyeballed means; with n=6 pinned rounds a real
   3% effect lands at p≤0.05 and noise stays at `~`.
+- **Budget the series** (maintainer preference, 2026-07-27): keep a full A/B
+  series within ~10 minutes wall clock — 1 s benchtime with n=6–8 interleaved
+  pinned rounds resolves ≥1% effects; escalate to 2 s / n≥10 only for a single
+  ambiguous finalist, not for broad sweeps.
 - **Profile cumulative + line-level**: `-cpuprofile`, then `go tool pprof -top
   -cum` and `-list=Iterate`. Beware skid: `isSpace` and verify-line "flat %" are
   often attribution of dependent-load latency, not removable work.

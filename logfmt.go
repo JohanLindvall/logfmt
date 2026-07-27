@@ -112,18 +112,24 @@ func hasKeyStop(w uint64) uint64 {
 // nil. Iterate returns ErrBadFormat if data contains a malformed quoted value,
 // and otherwise nil. It performs no allocations.
 func Iterate(data []byte, fn func(key, val []byte) bool) error {
-	// cap == len makes the eight-byte load provably in range from the loop's
-	// own "i+8 <= n" guard, so the compiler drops a slice bounds check from
-	// every SWAR iteration. It also stops a callback's append reaching past the
-	// end of the record — a free tightening of the read-only contract, never a
-	// loosening.
+	// cap == len stops a callback's append reaching past the end of the record
+	// — a tightening of the read-only contract, never a loosening — for one
+	// instruction once per call. (Its original bounds-check role is now played
+	// by the loop spellings below; see the loop-invariant comment.)
 	data = data[:len(data):len(data)]
 	n := len(data)
 	// Loop invariant worth stating because two steps below rely on it: a field
 	// consumes its own trailing separator, so i can finish a step at n+1 rather
-	// than n. Every bound in here is "i < n" or "i+8 <= n", and both treat n+1
-	// exactly as they treat n — which is what lets those steps be branchless.
-	for i := 0; i < n; {
+	// than n. Every bound in here is "uint(i) < uint(n)" or "i <= n-8", and
+	// both treat n+1 exactly as they treat n — which is what lets those steps
+	// be branchless. The spellings are deliberate: i is never negative, so the
+	// unsigned compare means i < n, but it also hands the prove pass the
+	// i >= 0 fact it otherwise never has, and "i <= n-8" proves i+8 <= n
+	// without an add that could overflow. The pair is what eliminates every
+	// bounds check on the SWAR loads and in the separator-drain loop; neither
+	// half does it alone (the half-applied form measures WORSE — see
+	// CLAUDE.md on the previously rejected bare "lim := n-8" attempt).
+	for i := 0; uint(i) < uint(n); {
 		// There is no whitespace-skip loop here, on purpose. The previous field
 		// already stepped past its separator, so i points at the key. Leading
 		// whitespace, a run of separators, or a '\t'/'\n' delimiter instead
@@ -133,7 +139,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		// Declared up here so the gotos, which jump forward, skip no declaration.
 		var kEnd, vStart, vEnd int
 
-		for i+8 <= n {
+		for i <= n-8 {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
 			m := hasKeyStop(w)
 			if m != 0 {
@@ -225,12 +231,18 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 
 				// Determine whether this quote is escaped by counting the
 				// run of backslashes immediately preceding it: an odd count
-				// means the quote is escaped and we keep scanning.
+				// means the quote is escaped and we keep scanning. The walk
+				// needs no lower-bound guard: data[vStart-1] is the opening
+				// quote (this path is entered only via '=' then '"'), any
+				// earlier escaped quote inside the value is also '"', and
+				// neither is a backslash, so the run always stops on its own.
+				// bs&1 rather than bs%2 spares the signed-modulo dance the
+				// compiler emits when it cannot prove bs >= 0 across the loop.
 				bs := 0
-				for j := i - 1; j >= vStart && data[j] == '\\'; j-- {
+				for j := i - 1; data[j] == '\\'; j-- {
 					bs++
 				}
-				if bs%2 == 1 {
+				if bs&1 == 1 {
 					i++
 					continue
 				}
@@ -249,7 +261,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 			}
 		} else {
 			vStart = i
-			for i+8 <= n {
+			for i <= n-8 {
 				w := binary.LittleEndian.Uint64(data[i : i+8])
 				m := hasCtrlOrSpace(w)
 				if m != 0 {
