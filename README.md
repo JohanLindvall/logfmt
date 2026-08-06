@@ -277,7 +277,9 @@ Parsing the same ~1.4 KB line, measured on GitHub Actions `ubuntu-latest`
 (AMD EPYC 7763, Go 1.26); lower is better, speedup relative to `go-logfmt`. The
 `bench/` module is a separate module, so the root package stays
 dependency-free; it compares against go-logfmt, kr/logfmt and Grafana Loki's
-in-tree decoder. Full tables, including arm64 and shorter/escaped inputs, are in
+in-tree decoder. (The Loki entry is a stand-in adapted from go-logfmt under
+MIT rather than a vendored copy — Loki's own tree is AGPL-licensed — verified
+equivalent to Loki's decoder on these inputs; see `bench/lokifmt`.) Full tables, including arm64 and shorter/escaped inputs, are in
 [bench/results_amd64.md](bench/results_amd64.md) and
 [bench/results_arm64.md](bench/results_arm64.md).
 

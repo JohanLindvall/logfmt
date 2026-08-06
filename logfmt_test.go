@@ -3,7 +3,7 @@ package logfmt
 import (
 	"errors"
 	"fmt"
-	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -50,6 +50,20 @@ func Test_Unit_LogFmt_Values(t *testing.T) {
 		{
 			"a=1 b=\"bar\" ƒ=2h3s r=\"esc\\tmore stuff\" d x=sf   ",
 			[]string{"a", "1", "b", "bar", "ƒ", "2h3s", "r", "esc\\tmore stuff", "d", "true", "x", "sf"},
+		},
+		{
+			// A non-whitespace control byte is an ordinary value byte; this
+			// one sits where the value SWAR scan finds it (>= 8 bytes left),
+			// pinning the finish-scalar dispatch deterministically.
+			"k=aaaa\x06bbbbbbbbbbbb next=ok",
+			[]string{"k", "aaaa\x06bbbbbbbbbbbb", "next", "ok"},
+		},
+		{
+			// '=' with no key before it yields a pair with an empty key, and
+			// a '=' inside an unquoted value is a literal byte — both
+			// documented divergences from go-logfmt, which rejects each.
+			`=v a==b`,
+			[]string{"", "v", "a", "=b"},
 		}} {
 		t.Run(fmt.Sprintf("test-%d-%s", i, tt.line), func(t *testing.T) {
 			var result []string
@@ -60,7 +74,7 @@ func Test_Unit_LogFmt_Values(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if !reflect.DeepEqual(result, tt.expected) {
+			if !slices.Equal(result, tt.expected) {
 				t.Errorf("got %v, want %v", result, tt.expected)
 			}
 		})
@@ -467,7 +481,7 @@ func Test_Unit_SplitRecord(t *testing.T) {
 		rec, data = SplitRecord(data)
 		got = append(got, string(rec))
 	}
-	if want := []string{"a=1", "b=2", "c=3"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"a=1", "b=2", "c=3"}; !slices.Equal(got, want) {
 		t.Errorf("split loop = %q, want %q", got, want)
 	}
 
@@ -492,7 +506,7 @@ func Test_Unit_All(t *testing.T) {
 		got = append(got, string(k)+"="+string(v))
 		return true
 	})
-	if want := []string{"a=1", "b=two", "c=true"}; !reflect.DeepEqual(got, want) {
+	if want := []string{"a=1", "b=two", "c=true"}; !slices.Equal(got, want) {
 		t.Errorf("All = %q, want %q", got, want)
 	}
 

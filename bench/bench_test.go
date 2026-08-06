@@ -7,6 +7,7 @@ package bench
 
 import (
 	"bytes"
+	"os"
 	"testing"
 
 	mine "github.com/JohanLindvall/logfmt"
@@ -16,9 +17,17 @@ import (
 )
 
 // sampleBig is a real-world ~1.4 KB line with many fields and several quoted
-// values (one containing escaped quotes) — the same line the root package
-// benchmarks as sample2.
-var sampleBig = []byte(`timestamp="2025-01-01 00:00:00.000 +0000 UTC" kind=log message="[AF] on conversion CUID set to: \"00000000-0000-4000-8000-000000000000\"" level=warn sdk_version=1.0.0 app_name=Sample-Client app_version=20250101.01 session_attr_cf_colo=XXX session_attr_cf_ray=0000000000000000 session_attr_client_brand=example session_attr_client_id=11111111-1111-4111-8111-111111111111 session_attr_client_ip=203.0.113.0 session_attr_client_jurisdiction=zz session_attr_client_locale=en session_attr_client_location=zz session_attr_ff_casino_lobby_swimlanes_orientation_ab_flag=true session_attr_ff_f_registration_sheet_ab_flag=false session_attr_visit_id=22222222-2222-4222-8222-222222222222 session_attr_visitor_id=33333333-3333-4333-8333-333333333333 session_attr_visitor_location=ZZ session_attr_wrapper_name=ExampleSportsAndroid session_attr_wrapper_type=SampleSport_Android session_attr_wrapper_version=14.20250101.1 page_url="https://example.com/zz/en/sports?wrapperName=ExampleSportsAndroid&wrapperType=SampleSport_Android&wrapperVersion=14.20250101.1&wrapperAlias=example.com&deviceId=0000000000000000&wrapperStore=exampleStore" browser_name="Chrome WebView" browser_version=140 browser_os="Android unknown" browser_mobile=true browser_userAgent="Mozilla/5.0 (Linux; Android 15; SM-X000X Build/AAAA.000000.000.A0; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/140.0.0.0 Mobile Safari/537.36"`)
+// values (one containing escaped quotes) — the same bytes the root package
+// benchmarks as sample2, read from the shared testdata file so the two suites
+// cannot drift apart. (This module always sits inside the repo — its go.mod
+// replaces the root module with ../ — so the relative path is safe.)
+var sampleBig = func() []byte {
+	b, err := os.ReadFile("../testdata/sample_big.txt")
+	if err != nil {
+		panic(err)
+	}
+	return bytes.TrimSuffix(b, []byte("\n"))
+}()
 
 // sampleTypical is a shorter, everyday application log line.
 var sampleTypical = []byte(`time=2025-01-01T00:00:00Z level=info msg="request completed" method=GET path=/api/v1/users status=200 duration=12.4ms request_id=abc123`)
@@ -66,7 +75,9 @@ func parseAllKr(b *testing.B, data []byte) {
 	}
 }
 
-// parseAllLoki uses Grafana Loki's in-tree zero-alloc decoder (vendored).
+// parseAllLoki uses the lokifmt stand-in for Grafana Loki's in-tree decoder
+// (go-logfmt's scanner on a []byte line; see lokifmt's package doc for why it
+// is a reimplementation rather than a vendored copy).
 func parseAllLoki(b *testing.B, data []byte) {
 	dec := lokifmt.NewDecoder(data)
 	b.SetBytes(int64(len(data)))

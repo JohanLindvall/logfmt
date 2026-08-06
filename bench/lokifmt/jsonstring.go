@@ -1,5 +1,11 @@
-// Vendored from Grafana Loki pkg/logql/log/logfmt/jsonstring.go (Apache-2.0,
-// itself adapted from go-logfmt/logfmt, MIT). Package clause changed only.
+// The decode half of go-logfmt/logfmt v0.6.1's jsonstring.go (MIT — see the
+// LICENSE file in this directory), which is in turn:
+//
+// Taken from Go's encoding/json and modified for use here.
+//
+// Copyright 2010 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
 package lokifmt
 
 import (
@@ -9,12 +15,8 @@ import (
 	"unicode/utf8"
 )
 
-// Taken from Go's encoding/json and modified for use here.
-
-// Copyright 2010 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
+// getu4 decodes \uXXXX from the beginning of s, returning the hex value,
+// or it returns -1.
 func getu4(s []byte) rune {
 	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
 		return -1
@@ -35,6 +37,11 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 	// Check for unusual characters. If there are none,
 	// then no unquoting is needed, so return a slice of the
 	// original bytes.
+	//
+	// Unlike go-logfmt (and encoding/json), control characters are NOT
+	// unusual here: Loki's decoder deletes the two `c < ' '` rejections so
+	// raw control bytes inside quoted values pass through, and this stand-in
+	// mirrors that.
 	r := 0
 	for r < len(s) {
 		c := s[r]
@@ -120,7 +127,8 @@ func unquoteBytes(s []byte) (t []byte, ok bool) {
 				w += utf8.EncodeRune(b[w:], rr)
 			}
 
-		// Unescaped quote is invalid.
+		// Unescaped quote is invalid. (Control characters are allowed —
+		// the second half of Loki's leniency edit mirrored above.)
 		case c == '"':
 			return
 

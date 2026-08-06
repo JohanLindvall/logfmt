@@ -501,6 +501,12 @@ func Get(data []byte, key string) ([]byte, bool) {
 // non-empty one: an empty value is recorded only provisionally and is overridden
 // by any later non-empty value for the same key.
 //
+// Entries in keys are expected to be distinct. A key listed twice is a
+// degenerate case: each parsed field fills the first slot for that key not yet
+// settled with a non-empty value, so duplicate slots are filled by successive
+// occurrences in data, and when the key occurs fewer times than it is listed
+// the extra slots stay nil — reading as absent even though the key is present.
+//
 // The returned values alias data (treat them as read-only) and are valid only
 // until data is modified; each has capacity equal to its length, so appending
 // to one copies rather than overwriting the bytes that follow it in data.

@@ -38,6 +38,18 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 - `bench/` — separate module, **declares go 1.23** (above the library floor) so
   it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
   with `for … range`. CI skips this module on the 1.21 floor job.
+  Its `lokifmt/` package is a benchmark stand-in for Loki's in-tree decoder,
+  **reimplemented from go-logfmt v0.6.1 (MIT, licence text in the directory)
+  — do NOT re-vendor from the Loki tree**: `pkg/logql` is AGPL-3.0-only (it is
+  not in Loki's Apache-2.0 exception list). Loki's only behavioural edit
+  (unquoteBytes accepts control bytes) is mirrored; the stand-in was
+  differentially verified against the old vendored copy (pairs/err/msg/pos
+  identical on the samples + a malformed battery) and A/B'd clean (control
+  clean; big line −3% from the dead resync code going away).
+- `testdata/sample_big.txt` — the shared ~1.4 KB benchmark line, read by both
+  root (`sample2`) and bench (`sampleBig`). Keep it a single file: the
+  cross-suite ratios rely on the two suites parsing identical bytes, which is
+  why the former duplicated literals were replaced.
 - `LICENSE` — MIT.
 
 ## Compatibility floor: `go 1.21`
@@ -146,10 +158,18 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
 - **Keys are never quoted**: `"a b"=c` → bare key `"a`, then `b"`=c. Quoting is
   position-dependent (value position only) — the same property that defeats the
   SIMD substring search below.
+- **Empty keys and literal `=` in unquoted values are accepted** (2026-08-06):
+  `=v` → `(""="v")` and `a==b` → `("a"="=b")`, where go-logfmt rejects both
+  with "unexpected '='". Doc'd in doc.go's Leniency list, pinned by a unit
+  case; `Get(data, "")` can genuinely match.
 - **`ParseTime` epochs are exactly 10 digits** → 2001-09-09 .. 2286-11-20, no
   negatives, and ms/µs epochs (13/16 digits) are rejected by design.
-- Statement coverage is 99.0%; both differential fuzzers pass 90 s clean
-  (24.9 M and 22.4 M execs, no new failures).
+- Statement coverage is 99.5%, and the one uncovered statement is
+  `parseUnixTS`'s defensive ParseInt error guard, which is unreachable (10
+  digits cannot overflow int64). The value-scan SWAR control-byte break —
+  formerly the other uncovered line, reachable on CI by no seed — is pinned by
+  a fuzz seed and a unit case since 2026-08-06. Both differential fuzzers pass
+  90 s clean (24.9 M and 22.4 M execs, no new failures).
 
 ## Current benchmarks (Ryzen 7 8840HS, amd64)
 

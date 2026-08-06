@@ -39,8 +39,10 @@ fix:
 	go mod tidy
 	cd bench && go mod tidy
 
+GOLANGCI_LINT_INSTALL := go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+
 update-tools:
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	$(GOLANGCI_LINT_INSTALL)
 
 $(GOBIN)/golangci-lint:
-	go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+	$(GOLANGCI_LINT_INSTALL)

@@ -31,8 +31,10 @@
 //
 // The three lookups — Get, GetMany and AppendValue — resolve duplicate keys
 // the same way: the first non-empty occurrence wins, and an empty value is used
-// only when the key never appears with a non-empty one. Every function here
-// takes and returns []byte; nothing asks the caller to convert to string first.
+// only when the key never appears with a non-empty one. Data and values are
+// []byte throughout — nothing asks the caller to convert input or results to
+// string; only the lookup keys, in practice compile-time constants, are
+// strings.
 //
 // # Records and framing
 //
@@ -118,6 +120,12 @@
 //     after '='.
 //   - 'key=' followed by whitespace is an empty value, and the following token
 //     starts a new pair.
+//   - A '=' with no key before it yields a pair with an EMPTY key: =v parses
+//     as the pair ""="v", where go-logfmt reports "unexpected '='". A lookup
+//     for the key "" can therefore genuinely match.
+//   - A '=' inside an unquoted value is a literal byte: a==b parses as the
+//     pair "a"="=b", which go-logfmt also rejects. Only the first '=' of a
+//     field separates key from value.
 //
 // A bare key with no '=' is reported with the value "true", matching logfmt
 // convention for boolean flags. That value is a shared sentinel, so IsBareKey

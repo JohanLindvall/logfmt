@@ -119,6 +119,12 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		string(sample2),
 		"\x00\x01\x02\x08\x09\x0a\x0b\x0c\x0d\x0e=\x1f\x20\x7f\x80\xff",
 		"longkeywithcontrol\x05inside=value verylongunquotedvalue\x06here next=ok",
+		// A control byte inside an unquoted VALUE, with >= 8 bytes left at the
+		// scan position, so the value SWAR loop (not the scalar tail, and not
+		// the key scan like the seed above) locates it and takes its
+		// finish-scalar break. Fuzzing finds this shape quickly, but that
+		// corpus is machine-local; CI executes only these seeds.
+		"k=aaaa\x06bbbbbbbbbbbb next=ok",
 		"ƒƒƒƒƒƒƒƒ=ƒ aaaaaaaaaaaaaaaaaa=bbbbbbbbbbbbbbbbbbbb",
 	}
 	for _, s := range seeds {
