@@ -20,7 +20,10 @@ var logFmtLayouts = []string{time.RFC3339Nano, "2006-01-02 15:04:05.999 -0700 MS
 // rather than guessed at:
 //
 //   - Epochs must have exactly 10 integer digits, which bounds them to
-//     2001-09-09 .. 2286-11-20 and excludes negative (pre-1970) values.
+//     1970-01-01 .. 2286-11-20 and excludes negative (pre-1970) values. Ten
+//     digits is a digit COUNT, not a magnitude: a zero-padded "0000000000" is
+//     accepted and is the epoch itself, so the lower bound is 1970 rather than
+//     the 2001-09-09 that unpadded ten-digit values start at.
 //   - Millisecond and microsecond epochs (13 and 16 digits, as written by
 //     JavaScript's Date.now or Java's System.currentTimeMillis) are rejected;
 //     the digit count alone cannot distinguish them from a far-future second
@@ -32,10 +35,20 @@ var logFmtLayouts = []string{time.RFC3339Nano, "2006-01-02 15:04:05.999 -0700 MS
 // known up front.
 //
 // It copies nothing, at any input length. The only allocations it can incur
-// are time.Parse's own, on two shapes this package cannot parse without
-// hand-rolling the layouts: a zone abbreviation the runtime cannot resolve
-// (the fabricated Location) and a value matching no layout at all (the
-// discarded *time.ParseError). Every accepted form above is allocation-free.
+// are time.Parse's own, on two shapes this package cannot avoid without
+// hand-rolling the layouts:
+//
+//   - A zone abbreviation the runtime cannot resolve — "+0200 CEST" on a host
+//     whose local zone is not CEST — costs 4 allocations for the fabricated
+//     Location. This one is an ACCEPTED form: it returns the right instant and
+//     ok == true, so "every accepted form is allocation-free" would be wrong.
+//     Whether a given abbreviation resolves depends on the host's local zone
+//     and on the parsed date, so the same layout can cost 0 or 4.
+//   - A value matching no layout at all costs 5, for the discarded
+//     *time.ParseError.
+//
+// Everything else — epochs, RFC3339Nano, and a numeric-offset-plus-UTC value —
+// is allocation-free, which is what Test_Unit_ParseTime_Allocs pins.
 func ParseTime(ts []byte) (time.Time, bool) {
 	ts = bytes.TrimRight(ts, "}],)\"")
 	if t, ok := parseUnixTS(ts); ok {

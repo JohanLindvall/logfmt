@@ -23,8 +23,8 @@ dependencies outside the standard library, and parses a ~1.4 KB line at
 go get github.com/JohanLindvall/logfmt
 ```
 
-Requires Go 1.21 or newer. (CI tests that floor on every push, alongside the
-current stable release, on both amd64 and arm64.) Ranging over `All` needs
+Requires Go 1.21 or newer. (CI tests that floor on every push on amd64, and
+the current stable release on both amd64 and arm64.) Ranging over `All` needs
 Go 1.23 in *your* module — the library itself stays at 1.21, so it never forces
 a toolchain upgrade on you.
 
@@ -62,14 +62,17 @@ Notes:
   literal `true`. `IsBareKey(val)` tells that apart from an explicit
   `debug=true`, which is otherwise byte-identical.
 - Quoted values are returned **without** the surrounding quotes but are **not**
-  unescaped — backslash escapes are left intact. Use `AppendUnescape` to decode
-  them.
+  unescaped — backslash escapes are left intact. `val` doesn't say whether it
+  was quoted, and escapes only mean anything inside quotes, so decode with
+  `AppendValue` or `GetQuoted` rather than calling `AppendUnescape` on whatever
+  the callback hands you (see [Escapes belong to quoted values
+  only](#escapes-belong-to-quoted-values-only)).
 - Returned slices alias the input (or, for bare keys, a shared constant) —
   treat them as read-only and copy anything that must outlive the input.
 - The parser is deliberately lenient and diverges from go-logfmt in a few
   documented ways (e.g. a stray `"` in an unquoted value is a literal byte, not
   an error). See the [package documentation](https://pkg.go.dev/github.com/JohanLindvall/logfmt).
-- All lookups (`Get`, `AppendValue`, `GetMany`) resolve duplicate keys the same
+- All lookups (`Get`, `GetQuoted`, `AppendValue`, `GetMany`) resolve duplicate keys the same
   way: the **first non-empty occurrence wins**; an empty value is used only
   when the key never appears with a non-empty one.
 
@@ -166,16 +169,42 @@ dst := logfmt.AppendUnescape(nil, []byte(`hello\tworld`)) // -> hello<TAB>world
 ```
 
 Most values contain no escapes at all, so guard with `NeedsUnescape` when you
-want to skip the copy entirely. This is both the zero-copy path and the faster
-one:
+want to skip the copy entirely. Use `GetQuoted` rather than `Get` here — it
+reports whether the value was quoted, which is what makes the decode safe (see
+below):
 
 ```go
-v, _ := logfmt.Get(line, "msg")
-if logfmt.NeedsUnescape(v) {
-    v = logfmt.AppendUnescape(buf[:0], v) // decoded into buf
+if v, quoted, ok := logfmt.GetQuoted(line, "msg"); ok {
+    if quoted && logfmt.NeedsUnescape(v) {
+        v = logfmt.AppendUnescape(buf[:0], v) // decoded into buf
+    }
+    // otherwise v still aliases line, with no copy made
 }
-// otherwise v still aliases line, with no copy made
 ```
+
+### Escapes belong to quoted values only
+
+A backslash means something only inside quotes. `msg="a\nb"` holds an escape;
+`path=C:\Users\bob` holds three literal backslashes — and go-logfmt's encoder
+writes it exactly that way, because a backslash is not one of the bytes that
+force quoting. Decoding without knowing which of the two you have is silent
+corruption, since both are perfectly valid logfmt:
+
+```go
+line := []byte(`path=C:\Users\bob\new`)
+
+logfmt.Get(line, "path")            // C:\Users\bob\new   — raw, correct
+logfmt.AppendValue(nil, line, "path") // C:\Users\bob\new — knows it was unquoted
+// AppendUnescape(nil, raw) would give "C:Usersbob<NL>ew": \U→U, \b→b, \n→newline
+```
+
+`Iterate`, `All`, `Get` and `GetMany` hand out quoted and unquoted values alike
+without distinguishing them. Two entry points carry the missing bit:
+
+- **`AppendValue`** decodes for you, and only when the value was quoted.
+- **`GetQuoted`** returns the bit, for the zero-copy path above.
+
+Reach for `AppendUnescape` directly only on a value you already know was quoted.
 
 ### Parse a timestamp value
 
@@ -260,12 +289,23 @@ go test -bench=. -benchmem      # this package's microbenchmarks
 make bench-md                   # regenerate the committed tables in bench/
 ```
 
-`Iterate`, `All`, `Get`, `GetMany` and `SplitRecord` allocate nothing at all
-(and `AppendValue`/`AppendUnescape` nothing beyond growing your buffer). Cost splits into a fixed per-field overhead of
-~5 ns plus scanning: ~11.7 GB/s through unquoted values (word-at-a-time SWAR)
-and ~27 GB/s through quoted ones (`bytes.IndexByte`, SIMD in the stdlib). Short
-fields are therefore overhead-bound, long values scan-bound. Lookups are linear
-in how deep the key sits: ~8 ns per field skipped.
+`Iterate`, `All`, `Get`, `GetQuoted`, `GetMany` and `SplitRecord` allocate
+nothing on a well-formed record (and `AppendValue`/`AppendUnescape` nothing
+beyond growing your buffer). The one exception is a malformed record, which
+costs a single 24-byte `*SyntaxError` — and the lookups pay it only when they
+have to walk past the fault to settle their keys.
+
+Cost splits into a fixed per-field overhead of ~5 ns plus scanning: ~11.7 GB/s
+through unquoted values (word-at-a-time SWAR) and ~27 GB/s through quoted ones
+(`bytes.IndexByte`, SIMD in the stdlib). Short fields are therefore
+overhead-bound, long values scan-bound. Lookups are linear in how deep the key
+sits: ~8 ns per field skipped.
+
+That 27 GB/s is for quoted values with **no escaped quotes in them**. Each `\"`
+makes the scan restart `bytes.IndexByte`, so cost is linear in the number of
+escapes rather than in bytes: a 1 KB value holding embedded JSON (where every
+quote is escaped) parses roughly 90× slower than the same 1 KB with none.
+`Benchmark_IterateEscaped` sweeps that axis.
 
 On amd64, building with `GOAMD64=v3` (Haswell+, 2013 onwards) makes the parser
 ~3% faster (BMI's `TZCNT` for the word-at-a-time scanning). It is a consumer
@@ -273,39 +313,27 @@ build flag, not something the module can set.
 
 ### vs other Go logfmt parsers
 
-Parsing the same ~1.4 KB line, measured on GitHub Actions `ubuntu-latest`
-(AMD EPYC 7763, Go 1.26); lower is better, speedup relative to `go-logfmt`. The
-`bench/` module is a separate module, so the root package stays
+The `bench/` module is a separate module, so the root package stays
 dependency-free; it compares against go-logfmt, kr/logfmt and Grafana Loki's
 in-tree decoder. (The Loki entry is a stand-in adapted from go-logfmt under
 MIT rather than a vendored copy — Loki's own tree is AGPL-licensed — verified
-equivalent to Loki's decoder on these inputs; see `bench/lokifmt`.) Full tables, including arm64 and shorter/escaped inputs, are in
-[bench/results_amd64.md](bench/results_amd64.md) and
-[bench/results_arm64.md](bench/results_arm64.md).
+equivalent to Loki's decoder on these inputs; see `bench/lokifmt`.)
 
-Parse every key/value pair:
+**The numbers live in the generated tables, not here.** They are produced by
+`make bench-md` (and by the `bench` CI workflow, which commits them), each
+stamped with the CPU and Go version that produced it — no figure is copied into
+this file, because a copied one goes stale silently and this one did:
 
-| Parser | ns/op | Throughput | allocs/op | Speedup |
-|---|--:|--:|--:|--:|
-| **this package** | **444** | **3157 MB/s** | **0** | **6.3×** |
-| kr/logfmt | 1473 | 951 MB/s | 1 | 1.9× |
-| Grafana Loki | 1967 | 712 MB/s | 1 | 1.4× |
-| go-logfmt | 2779 | 504 MB/s | 4 | 1.0× |
+- [bench/results_amd64.md](bench/results_amd64.md) — cross-library comparison
+- [bench/results_arm64.md](bench/results_arm64.md) — same, on arm64
+- [bench/pkg_results_amd64.md](bench/pkg_results_amd64.md) — this package's own
+  microbenchmarks
 
-Extract two keys (`timestamp`+`level`), each parser stopping once both are found
-(where its API allows — `kr/logfmt` is push-based and can't stop its scan):
-
-| Parser | ns/op | allocs/op | Speedup |
-|---|--:|--:|--:|
-| **this package** (`GetMany`) | **96** | **0** | **11.8×** |
-| Grafana Loki | 349 | 1 | 3.3× |
-| go-logfmt | 1135 | 3 | 1.0× |
-| kr/logfmt | 1560 | 4 | 0.7× |
-
-Faster hardware roughly halves these. The tables above are regenerated by CI and
-lag the parser by a release: the current code is ~14% faster on the big line and
-~6% faster on two-key extraction than the numbers shown, measured as an
-interleaved A/B on a pinned core.
+For orientation only, on the ~1.4 KB sample line this package parses every pair
+roughly **7× faster than go-logfmt** with zero allocations, and extracts two
+keys roughly **14× faster** by stopping as soon as both are found. Consult the
+tables for the actual figures on actual hardware; treat any ratio quoted in
+prose as approximate and possibly a release behind.
 
 ## License
 

@@ -25,16 +25,39 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 - `logfmt.go` — the core parser and key-lookup API (the "general parsing").
 - `time.go` — `ParseTime` (see warning above).
 - `logfmt_swar_test.go` — `FuzzIterateAgainstRef`: differential fuzz of the
-  SWAR `Iterate` against a byte-by-byte reference. **Run this after any change
-  to the parser.** Also `Test_Unit_SWARMasks` (exhaustive: every byte value in
-  every lane, for both masks, plus "the lower of two stops wins") and
-  `Test_Unit_IsSpace`. `isSpace` needs its own test precisely *because* the
-  reference above shares it — a bug there cancels out and the fuzzer sees
-  nothing.
+  SWAR `iterate` against a byte-by-byte reference. **Run this after any change
+  to the parser.** It compares FOUR facts per pair, not two: key, value,
+  `IsBareKey(v)` and `quoted`. The last two were added 2026-08-08 because
+  comparing `string(k)`/`string(v)` alone left it blind to properties the package
+  exports — replacing either `trueSlice` call site with a fresh `[]byte("true")`
+  is byte-identical yet flips `IsBareKey`, and survived 6.89 M execs. It also no
+  longer skips the pair comparison when an error came back (the old
+  `gotErr == nil &&` guard discarded the check on ~12% of short inputs, i.e. the
+  whole quoted-value error region), and it carries malformed seeds — before those
+  were added, **no seed reached an error path at all**, so CI, which runs seeds
+  rather than a corpus, never exercised it. Also `Test_Unit_SWARMasks`
+  (exhaustive: every byte value in every lane, for both masks, plus "the lower of
+  two stops wins") and `Test_Unit_IsSpace`. `isSpace` needs its own test
+  precisely *because* the reference above shares it — a bug there cancels out and
+  the fuzzer sees nothing.
 - `getmany_fuzz_test.go` — `FuzzGetManyAgainstRef`: differential fuzz of
-  `GetMany`/`Get`'s first-non-empty duplicate resolution against a naive
-  collect-all reference. **Run after any change to the lookup state machine.**
+  `GetMany`/`Get`/`GetQuoted`'s first-non-empty duplicate resolution against a
+  naive collect-all reference, which also tracks the quoted flag so
+  `AppendValue`'s decode-only-if-quoted rule is checked rather than assumed.
+  **Run after any change to the lookup state machine.** Caveat worth knowing: it
+  uses `AppendUnescape` as its own oracle for `AppendValue`, so a bug inside
+  `AppendUnescape` cancels on both sides — the unescape half of the API has no
+  independent oracle.
 - `*_test.go` — unit tests, benchmarks, and a regex-vs-logfmt comparison.
+  `Test_Unit_HotPath_Allocs` pins the allocation-free contract across all 14
+  entry points that claim one (previously only 2 were asserted, and three
+  injected allocations left the suite green); `Test_Unit_Malformed_Allocs` pins
+  the single carve-out. `Test_Unit_Lookups_CapValues` now asserts `Get` really
+  aliases the input at a known offset — `cap == len` plus "append didn't touch
+  the line" is satisfied by a heap copy, so the old form passed with `Get`
+  copying. `Test_Unit_Unquoted_Backslashes_Are_Literal` pins the quoted/unquoted
+  decode split. `Benchmark_IterateEscaped` sweeps escape density at fixed
+  length.
 - `bench/` — separate module, **declares go 1.23** (above the library floor) so
   it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
   with `for … range`. CI skips this module on the 1.21 floor job.
@@ -69,7 +92,9 @@ requirement lands on the consumer's module, not this one. `bench/go.mod` is
 Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — see
 "API design rules" below before changing any of it.
 
-- `Iterate(data, func(k, v) bool) error` — core primitive; calls back per pair,
+- `Iterate(data, func(k, v) bool) error` — exported adapter over the unexported
+  `iterate`, whose callback takes a third `quoted bool` (see "The `iterate` /
+  `Iterate` split" below). Calls back per pair,
   `k`/`v` alias `data` (bare key → shared `trueSlice`; all results read-only).
   Quoted values have quotes stripped but escapes left intact (raw). `false` from
   the callback stops. **The only function that reports errors alongside data.**
@@ -83,18 +108,28 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   1.23+ can still `for k, v := range`. Proven by `TestAllRangeOverFunc` in the
   bench module, which declares 1.23 for exactly that purpose.
 - `Get(data, key) ([]byte, bool)` — raw value, aliases `data`, zero-copy, capped.
+  A bare key yields the shared `trueSlice`, the one result that does not alias
+  `data`.
+- `GetQuoted(data, key) ([]byte, bool, bool)` — `Get` plus **whether the value
+  was double-quoted**, which is the bit that decides whether unescaping it is
+  correct at all. Added 2026-08-08 with the `iterate` split; it is the
+  zero-copy-and-correct decode path (`GetQuoted` + `NeedsUnescape` +
+  `AppendUnescape`), where plain `Get` + `NeedsUnescape` is the recipe that
+  silently corrupted unquoted values.
 - `GetMany(data, keys, buf) [][]byte` — multi-key single pass, raw aliasing
   capped values, **`nil` for absent** (present-but-empty is a non-nil
   zero-length slice — distinct from absent), reusable outer `buf`, early-stop.
 - `AppendValue(dst, data, key) ([]byte, bool)` — unescaped, **always appends**;
-  never aliases `data`. Absent key returns `dst` untouched and false.
+  never aliases `data`. Absent key returns `dst` untouched and false. Decodes
+  **only quoted values**: an unquoted `path=C:\Users\bob` is copied through
+  byte for byte.
 - `Validate(data) error` — full parse for callers who need the error the
   lookups structurally cannot give them.
 - `SplitRecord(data) (record, rest)` — record framing (see limits below);
   trims a trailing `\r`, caps `record`.
 - `IsBareKey(val)` — identity test against `trueSlice`, the only way to tell
   `debug` from `debug=true`.
-- **Duplicate keys resolve identically in all three lookups: first non-empty
+- **Duplicate keys resolve identically in all four lookups: first non-empty
   occurrence wins; an empty value only if no non-empty one exists.** Guarded by
   `FuzzGetManyAgainstRef`.
 - `AppendUnescape(dst, raw)` / `NeedsUnescape(raw)` — decode `\n \r \t` and
@@ -105,9 +140,14 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   single expression so it stays inlinable (a SWAR helper here measurably
   regressed).
 - `ParseTime(ts []byte)` — `[]byte` like everything else. A caller holding a
-  `[]byte` pays the same 5 allocs on the named-zone layout either way (measured
+  `[]byte` pays the same allocs on the named-zone layout either way (measured
   both sides); the old `string` benchmark only looked cheaper because it fed a
-  compile-time constant.
+  compile-time constant. Since `c04fbed` the counts are **4** for a zone
+  abbreviation the runtime cannot resolve (the fabricated `Location`) and **5**
+  for a value matching no layout at all (the discarded `*ParseError`); every
+  other accepted shape is 0. The unresolvable-zone case is host- AND
+  date-dependent, since `time.Parse` reuses `Local` only when the abbreviation
+  matches Local's at that instant.
 
 ## API design rules (why it looks like this)
 
@@ -121,7 +161,13 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
 - **`Append*` means it appends.** Both append functions always copy into `dst`
   and never alias the input; the conditional "returns raw if dst is empty"
   behaviour the old `Unescape` had was a trap. Zero-copy is still available and
-  is still the faster pattern — `Get` + `NeedsUnescape` — just explicit now.
+  is still the faster pattern — but it is `GetQuoted` + `NeedsUnescape`, not
+  `Get` + `NeedsUnescape`: without the quoted bit the decode is wrong on any
+  unquoted value containing a backslash.
+- **Escapes are a property of the QUOTED form, not of the value.** Anything that
+  unescapes has to know how the value was written, so the parser reports it
+  rather than letting callers guess. This is why `iterate` carries a third
+  callback argument and why `GetQuoted` exists.
 - **Destination first** (`AppendUnescape(dst, raw)`, `AppendValue(dst, data,
   key)`), matching `append` and the stdlib `Append*` family.
 
@@ -162,8 +208,12 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   `=v` → `(""="v")` and `a==b` → `("a"="=b")`, where go-logfmt rejects both
   with "unexpected '='". Doc'd in doc.go's Leniency list, pinned by a unit
   case; `Get(data, "")` can genuinely match.
-- **`ParseTime` epochs are exactly 10 digits** → 2001-09-09 .. 2286-11-20, no
-  negatives, and ms/µs epochs (13/16 digits) are rejected by design.
+- **`ParseTime` epochs are exactly 10 digits** → 1970-01-01 .. 2286-11-20, no
+  negatives, and ms/µs epochs (13/16 digits) are rejected by design. Ten is a
+  digit COUNT, so a zero-padded `0000000000` is accepted and is the epoch
+  itself; the lower bound is 1970, not the 2001-09-09 that unpadded ten-digit
+  values start at. Don't "fix" this by rejecting a leading zero — `0999999999`
+  is a legitimate epoch.
 - Statement coverage is 99.5%, and the one uncovered statement is
   `parseUnixTS`'s defensive ParseInt error guard, which is unreachable (10
   digits cannot overflow int64). The value-scan SWAR control-byte break —
@@ -202,11 +252,22 @@ including `DecodeKeyval`, which is the *worst* case for this pass (its rows end
 `x=sf   \n`, a four-byte separator run, the one shape the skip-loop removal
 pessimises) and which still came out ahead.
 
-CI-generated tables (EPYC 7763, ~1.7× slower than this laptop) live in
-`bench/pkg_results_<arch>.md` and `bench/results_<arch>.md`; the README quotes
-those, since they are the reproducible ones. **They are stale as of 2026-07-27**
-— they still show the pre-optimization numbers and will refresh on the next CI
-run; don't hand-edit them with laptop figures.
+CI-generated tables live in `bench/pkg_results_<arch>.md` and
+`bench/results_<arch>.md`, each stamped with the CPU and Go version that
+produced it. **The README no longer copies any figure out of them** — it links
+them and quotes only order-of-magnitude ratios in prose. It used to carry a full
+table, which silently went two generations stale and disagreed with the file it
+linked (README said EPYC 7763 / 444 ns; the table said EPYC 9V74 / 386 ns), and
+claimed "regenerated by CI" although nothing in `bench.yml` ever writes README.
+Don't reintroduce that pattern; if the numbers must appear in two places, have
+the renderers splice into marker-delimited blocks so the claim is true.
+
+Table currency, as of 2026-08-08: the committed tables are **current through
+`e048e5d`** (the −13.8% pass — `dcd5687` is its direct child, stamped 95 s
+later) and **stale for `3a55c5e`, `c04fbed` and everything after**, this pass
+included. Note `bench.yml` is `workflow_dispatch` only, so nothing refreshes
+them automatically; run `make bench-md` deliberately. Don't hand-edit them with
+laptop figures.
 
 2026-07-27 **evening** pass (same machine, faster power state — do not compare
 absolutes across the two tables), n=8 interleaved pinned 1 s rounds, control
@@ -220,8 +281,10 @@ Geomean −1.0% (root) / −2.0% (bench). CI tables are stale for this pass too.
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
 **Not re-measured after the 2026-07-27 pass**, which attacked the fixed
-per-field term specifically — `sample2`'s average fell from ~7.7 to ~6.7
-ns/field, so read the overhead row as roughly 1 ns high. The scan rows are
+per-field term specifically. `sample_big.txt` holds **29** pairs (counted, not
+estimated), so that pass moved it from 358.1/29 = 12.3 to 308.8/29 = 10.6
+ns/field; earlier notes here divided by a wrong field count and read ~7.7 to
+~6.7, which is why the overhead row below is not to be trusted as-is. The scan rows are
 unaffected (neither scan loop's inner shape changed for values). Re-run the
 sweep before quoting the overhead figure again.
 
@@ -229,17 +292,73 @@ sweep before quoting the overhead figure again.
 |---|---|
 | Fixed per-field overhead (4–16 B values) | ~5.8–7.2 ns/field |
 | Unquoted value scan (SWAR), 256 B values | ~11.7 GB/s |
-| Quoted value scan (`bytes.IndexByte`), 512 B | ~27 GB/s |
+| Quoted value scan (`bytes.IndexByte`), 512 B, **no escaped quotes** | ~27 GB/s |
+| Quoted value scan, **per escaped quote** | ~10 ns each (see below) |
 | `Get` per skipped field | ~8.6 ns (10.7 ns for field 0, 551 ns for field 63) |
+
+**The 27 GB/s row is escape-free only** — do not quote it unqualified. Each `\"`
+makes the quoted loop restart the non-inlinable `bytes.IndexByte` and re-walk
+the preceding backslash run, so the cost is O(escapes) calls, not O(bytes/8)
+SWAR steps. Embedded JSON in a `msg=` field is the worst realistic shape: every
+JSON quote becomes `\"`, i.e. roughly one call per two bytes. At a **fixed**
+1 KB value the sweep runs 65 ns (0 escapes) → 6100 ns (500 escapes), about 90×,
+falling from ~15 GB/s to ~0.17 GB/s. `Benchmark_IterateEscaped` pins that axis;
+it exists because `sample_big.txt` has 2 escaped quotes in 1.4 KB (~4%) and so
+makes the quoted scan look like pure `IndexByte` throughput.
+
+This is **not** the rejected "inline first-word `hasByte` before `IndexByte`"
+item, which was about sparing short *clean* values a call. An adaptive fix here
+(on seeing the first escaped quote, switch that value to a SWAR scan for `"` and
+`\` in one word) would leave clean values on today's path entirely. Unmeasured —
+it needs a control-clean interleaved A/B before anyone lands it.
 
 Reading: short fields are **overhead-bound** (~6 ns of loop/callback per pair,
 scan is noise), long values are **scan-bound**. The 8 B/iter SWAR only starts
 paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
 `sample2` averages ~8.3 ns/field, consistent with the sweep.
 
+## The `iterate` / `Iterate` split (2026-08-08) — UNMEASURED, please A/B
+
+`Iterate` is now a thin adapter over an unexported `iterate` whose callback
+takes a third argument, `quoted bool`. This was a **correctness** fix, not an
+optimization: `AppendValue` used to run `AppendUnescape` over every value it
+found, including unquoted ones, so `path=C:\Users\bob\new` came back as
+`C:Usersbob` with an embedded newline (`\U`→`U`, `\b`→`b`, `\n`→newline).
+Escapes are meaningful only inside quotes, the raw value cannot tell you which
+it was, and go-logfmt's encoder does **not** quote a value merely for containing
+a backslash — so this was silent corruption on ordinary input. `GetQuoted`
+exports the bit; `Get`/`GetMany`/`Validate` call `iterate` directly and so pay
+only the extra (ignored) argument; `Iterate` and `All` pay one adapter call per
+field.
+
+**The cost of that adapter hop is not known.** It could not be measured on the
+machine this landed on: an unrelated ffmpeg job held ~10 cores for the whole
+session (load average 15–50), and a four-way interleaved sweep with an embedded
+A/A control put the control itself at −7.8% / +3.75% — far above any effect
+worth finding, so by this file's own control rule none of those numbers count.
+What *is* known, deterministically from `-gcflags=-S`:
+
+- **Both SWAR scan loops are byte-identical to the previous code** (same two
+  `TZCNT` sites, same loop bodies), so per-*byte* scan throughput is unchanged
+  and only the per-*field* term can have moved.
+- The adapter closure does not escape (`func literal does not escape`), so the
+  zero-allocation contract holds — pinned now by `Test_Unit_HotPath_Allocs`.
+
+Please re-run the A/B on quiet hardware before quoting any new figure.
+`/tmp` harnesses do not survive, so the recipe: copy the pre-split tree, then
+interleave with `taskset -c N`, rotating order each round, and **measure an A/A
+control inside the same sweep**. If `Iterate` has regressed more than ~1%, two
+things are worth trying before anything drastic: deriving `quoted` at the
+callback site as `data[vStart-1] == '"'` instead of carrying a live flag
+(`vStart` is only ever set just past a `"` or a `=`, so the byte is already hot
+— a working variant was built and passes the suite), or making the exported
+`Iterate` take the three-argument callback itself, which removes the adapter
+entirely at the price of a breaking change. Do not "fix" it by duplicating the
+parser; that has been tried and rejected (see below).
+
 ## How the general parser is optimized (logfmt.go)
 
-- **SWAR scanning** (`hasCtrlOrSpace`, `hasByte`): scans keys/values 8 bytes per
+- **SWAR scanning** (`hasCtrlOrSpace`, `hasKeyStop`): scans keys/values 8 bytes per
   iteration. `hasCtrlOrSpace` flags bytes `<= 0x20` with one subtract (covers
   all whitespace); the located byte is re-checked so rare non-whitespace control
   bytes (0x00–0x08, 0x0E–0x1F) fall back to the scalar tail. Masks are only

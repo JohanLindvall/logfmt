@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/bits"
+	"slices"
+	"strconv"
 	"testing"
 )
 
 // iterateRef is a straightforward byte-by-byte reference implementation used
-// to validate the SWAR-accelerated Iterate. It must stay behaviourally
-// identical to the scalar version Iterate was derived from.
-func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
+// to validate the SWAR-accelerated iterate. It must stay behaviourally
+// identical to the scalar version iterate was derived from, including the
+// quoted flag.
+func iterateRef(buf []byte, fn func(key, val []byte, quoted bool) bool) error {
 	for i, n := 0, len(buf); i < n; {
 		for i < n && isSpace(buf[i]) {
 			i++
@@ -23,7 +26,7 @@ func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
 
 		if i >= n {
 			if kStart < n {
-				fn(buf[kStart:n], trueSlice)
+				fn(buf[kStart:n], trueSlice, false)
 			}
 			return nil
 		}
@@ -31,7 +34,7 @@ func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
 		kEnd := i
 
 		if buf[i] != '=' {
-			if !fn(buf[kStart:i], trueSlice) {
+			if !fn(buf[kStart:i], trueSlice, false) {
 				return nil
 			}
 			continue
@@ -39,21 +42,23 @@ func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
 		i++
 
 		vStart, vEnd := i, i
+		quoted := false
 
 		if i >= n {
-			fn(buf[kStart:kEnd], buf[vStart:vEnd])
+			fn(buf[kStart:kEnd], buf[vStart:vEnd], false)
 			return nil
 		}
 
-		// `key=` before whitespace is an empty value (see Iterate).
+		// `key=` before whitespace is an empty value (see iterate).
 		if isSpace(buf[i]) {
-			if !fn(buf[kStart:kEnd], buf[vStart:vEnd]) {
+			if !fn(buf[kStart:kEnd], buf[vStart:vEnd], false) {
 				return nil
 			}
 			continue
 		}
 
 		if buf[i] == '"' {
+			quoted = true
 			i++
 			vStart = i
 			for {
@@ -88,7 +93,7 @@ func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
 			vEnd = i
 		}
 
-		if !fn(buf[kStart:kEnd], buf[vStart:vEnd]) {
+		if !fn(buf[kStart:kEnd], buf[vStart:vEnd], quoted) {
 			return nil
 		}
 	}
@@ -96,10 +101,21 @@ func iterateRef(buf []byte, fn func(key, val []byte) bool) error {
 	return nil
 }
 
-func collectPairs(it func([]byte, func(k, v []byte) bool) error, buf []byte) ([]string, error) {
+// collectPairs records four facts per pair, not two. The key and value are the
+// obvious ones; the other two exist because comparing only string(k)/string(v)
+// makes the fuzzer blind to properties this package exports:
+//
+//   - IsBareKey(v) pins the trueSlice sentinel's IDENTITY. Without it, replacing
+//     either trueSlice call site with a fresh []byte("true") is invisible —
+//     byte-identical, but it flips IsBareKey, the only way a caller can tell
+//     `debug` from `debug=true`.
+//   - quoted pins the flag AppendValue relies on to decide whether unescaping a
+//     value is correct at all.
+func collectPairs(it func([]byte, func(k, v []byte, quoted bool) bool) error, buf []byte) ([]string, error) {
 	var out []string
-	err := it(buf, func(k, v []byte) bool {
-		out = append(out, string(k), string(v))
+	err := it(buf, func(k, v []byte, quoted bool) bool {
+		out = append(out, string(k), string(v),
+			strconv.FormatBool(IsBareKey(v)), strconv.FormatBool(quoted))
 		return true
 	})
 	return out, err
@@ -126,32 +142,47 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		// corpus is machine-local; CI executes only these seeds.
 		"k=aaaa\x06bbbbbbbbbbbb next=ok",
 		"ƒƒƒƒƒƒƒƒ=ƒ aaaaaaaaaaaaaaaaaa=bbbbbbbbbbbbbbbbbbbb",
+		// A TRAILING bare key, which leaves iterate through a different
+		// trueSlice call site than a mid-line one ("the i >= n exit"), and is
+		// the commonest shape for a bare flag.
+		"level=info debug",
+		// Backslashes in an UNQUOTED value: literal bytes, never escapes. The
+		// quoted flag collectPairs records is what keeps this distinct from the
+		// quoted seeds above.
+		`path=C:\Users\bob re=\d+\s`,
+		// Malformed shapes. Until these were added no seed reached an error path
+		// at all, so on CI — which runs seeds, not a corpus — the entire error
+		// space of iterate went unexercised. The pair comparison below runs on
+		// these too, so the "valid prefix before the error" promise is checked.
+		`a=1 b="unterminated`,
+		`a="x"y`,
+		`a="x\"y`,
+		`a="" b="x"z c=3`,
+		`a=1 b="\\" c="x`,
 	}
 	for _, s := range seeds {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, buf []byte) {
-		gotV, gotErr := collectPairs(Iterate, buf)
+		gotV, gotErr := collectPairs(iterate, buf)
 		wantV, wantErr := collectPairs(iterateRef, buf)
 		if (gotErr == nil) != (wantErr == nil) {
 			t.Fatalf("err mismatch: got %v want %v for %q", gotErr, wantErr, buf)
 		}
-		if gotErr == nil && !slicesEqual(gotV, wantV) {
-			t.Fatalf("value mismatch for %q:\n got  %q\n want %q", buf, gotV, wantV)
+		// Compared unconditionally, including on malformed input. Both sides
+		// promise to deliver every pair preceding the fault, so both must
+		// deliver the SAME ones; skipping the comparison whenever an error came
+		// back discarded that check on ~12% of short inputs — exactly the region
+		// where the quoted-value state machine is trickiest.
+		if !slicesEqual(gotV, wantV) {
+			t.Fatalf("value mismatch for %q (err %v/%v):\n got  %q\n want %q",
+				buf, gotErr, wantErr, gotV, wantV)
 		}
 	})
 }
 
 func slicesEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }
 
 // isSpace is shared by Iterate and by iterateRef, the differential fuzzer's

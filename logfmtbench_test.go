@@ -2,6 +2,7 @@ package logfmt
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"testing"
 )
@@ -44,6 +45,39 @@ func Benchmark_Unescape(b *testing.B) {
 	dst := make([]byte, 0, len(buffer)*2)
 	for i := 0; i < b.N; i++ {
 		_ = AppendUnescape(dst[:0], buffer)
+	}
+}
+
+// Benchmark_IterateEscaped sweeps escape DENSITY at a fixed line length, which
+// is the one axis sample2 cannot show: it carries 2 escaped quotes in 1.4 KB, so
+// the quoted scan looks like pure bytes.IndexByte throughput there.
+//
+// Every escaped quote makes the quoted-value loop restart the non-inlinable
+// bytes.IndexByte and re-walk the preceding backslash run, so the cost is
+// O(escapes) calls rather than O(bytes/8) SWAR steps. Embedded JSON in a msg=
+// field — the commonest hard shape in real logfmt — turns every JSON quote into
+// \", which is the worst case: roughly one call per two bytes. Keep the length
+// fixed across the sweep so the numbers isolate density from size.
+func Benchmark_IterateEscaped(b *testing.B) {
+	const width = 1024
+	for _, esc := range []int{0, 8, 32, 128, 500} {
+		payload := make([]byte, 0, width)
+		for len(payload) < width {
+			if esc > 0 && len(payload)*esc/width < (len(payload)+2)*esc/width {
+				payload = append(payload, '\\', '"')
+			} else {
+				payload = append(payload, 'a')
+			}
+		}
+		line := append(append([]byte(`msg="`), payload[:width]...), '"')
+		b.Run(fmt.Sprintf("esc=%d", esc), func(b *testing.B) {
+			b.SetBytes(int64(len(line)))
+			for i := 0; i < b.N; i++ {
+				if err := Iterate(line, func(k, v []byte) bool { return true }); err != nil {
+					b.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
 	}
 }
 

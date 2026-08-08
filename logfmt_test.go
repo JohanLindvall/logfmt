@@ -64,6 +64,27 @@ func Test_Unit_LogFmt_Values(t *testing.T) {
 			// documented divergences from go-logfmt, which rejects each.
 			`=v a==b`,
 			[]string{"", "v", "a", "=b"},
+		},
+		{
+			// A '"' inside an unquoted value is a literal byte, not a syntax
+			// error. Quoting is position-dependent: only a '"' immediately
+			// after '=' opens a string.
+			`a=x" b=c`,
+			[]string{"a", `x"`, "b", "c"},
+		},
+		{
+			// Keys are never unquoted, for the same reason: the leading '"' is
+			// an ordinary key byte, so this is a bare key followed by a pair
+			// whose key ends in a quote.
+			`"a b"=c`,
+			[]string{`"a`, "true", `b"`, "c"},
+		},
+		{
+			// A '\' in an unquoted value is a literal byte, never an escape
+			// introducer. go-logfmt's encoder emits Windows paths exactly this
+			// way, because '\' is not one of the bytes that force quoting.
+			`path=C:\Users\bob re=\d+\s`,
+			[]string{"path", `C:\Users\bob`, "re", `\d+\s`},
 		}} {
 		t.Run(fmt.Sprintf("test-%d-%s", i, tt.line), func(t *testing.T) {
 			var result []string
@@ -232,6 +253,81 @@ func Test_Unit_GetMany(t *testing.T) {
 	}
 }
 
+// Sinks keep the compiler from optimizing away the work being measured.
+var (
+	sinkBytes []byte
+	sinkBool  bool
+	sinkErr   error
+	sinkMany  [][]byte
+)
+
+// Test_Unit_HotPath_Allocs pins the allocation-free contract across every entry
+// point that documents one — not just the two that used to be covered. The line
+// deliberately carries a quoted value, an escape and a bare key, because
+// Iterate's quoted branch and the bare-key path are outside the reach of a
+// plain unquoted sample.
+//
+// Append* are measured against a pre-sized dst[:0]: with a nil dst they must
+// allocate the buffer itself, so asserting zero there would be asserting
+// something the API never promised.
+func Test_Unit_HotPath_Allocs(t *testing.T) {
+	line := []byte(`level=info msg="user login" r="esc\tval" id=42 path=C:\tmp flag`)
+	keys := []string{"level", "id", "missing"}
+	many := make([][]byte, len(keys))
+	dst := make([]byte, 0, 128)
+	buf := []byte(`a=1 b=2` + "\n" + `c=3`)
+
+	for _, tt := range []struct {
+		name string
+		fn   func()
+	}{
+		{"Iterate", func() {
+			sinkErr = Iterate(line, func(k, v []byte) bool { sinkBytes = v; return true })
+		}},
+		{"Iterate/sample2", func() {
+			sinkErr = Iterate(sample2, func(k, v []byte) bool { sinkBytes = v; return true })
+		}},
+		{"All", func() {
+			All(line)(func(k, v []byte) bool { sinkBytes = v; return true })
+		}},
+		{"Validate", func() { sinkErr = Validate(line) }},
+		{"Get", func() { sinkBytes, sinkBool = Get(line, "r") }},
+		{"Get/absent", func() { sinkBytes, sinkBool = Get(line, "nope") }},
+		{"GetQuoted", func() { sinkBytes, sinkBool, sinkBool = GetQuoted(line, "r") }},
+		{"GetMany", func() { sinkMany = GetMany(line, keys, many) }},
+		{"SplitRecord", func() { sinkBytes, sinkBytes = SplitRecord(buf) }},
+		{"IsBareKey", func() { sinkBool = IsBareKey(line) }},
+		{"NeedsUnescape", func() { sinkBool = NeedsUnescape(line) }},
+		{"AppendValue/quoted", func() { sinkBytes, sinkBool = AppendValue(dst[:0], line, "r") }},
+		{"AppendValue/unquoted", func() { sinkBytes, sinkBool = AppendValue(dst[:0], line, "path") }},
+		{"AppendUnescape", func() { sinkBytes = AppendUnescape(dst[:0], []byte(`esc\tval`)) }},
+	} {
+		if n := testing.AllocsPerRun(100, tt.fn); n != 0 {
+			t.Errorf("%s allocs/op = %v, want 0", tt.name, n)
+		}
+	}
+}
+
+// A malformed record costs exactly one allocation — the *SyntaxError — and only
+// when the parse actually reaches the fault. That is the single carve-out in the
+// package's allocation-free claim, so pin the shape of it rather than leaving
+// the docs to assert it alone.
+func Test_Unit_Malformed_Allocs(t *testing.T) {
+	bad := []byte(`level=info b="unterminated`)
+
+	if n := testing.AllocsPerRun(100, func() { sinkErr = Validate(bad) }); n != 1 {
+		t.Errorf("Validate(malformed) allocs/op = %v, want 1 (the SyntaxError)", n)
+	}
+	// A lookup that settles before the fault never reaches it, so it stays free.
+	if n := testing.AllocsPerRun(100, func() { sinkBytes, sinkBool = Get(bad, "level") }); n != 0 {
+		t.Errorf("Get(malformed, key before fault) allocs/op = %v, want 0", n)
+	}
+	// One that has to walk past the fault pays for the error it then discards.
+	if n := testing.AllocsPerRun(100, func() { sinkBytes, sinkBool = Get(bad, "nope") }); n != 1 {
+		t.Errorf("Get(malformed, absent key) allocs/op = %v, want 1 (the discarded SyntaxError)", n)
+	}
+}
+
 func Test_Unit_GetMany_Allocs(t *testing.T) {
 	line := []byte(`ts=2025-01-01 level=info id=42 msg=hello`)
 	keys := []string{"level", "id", "ts"}
@@ -276,15 +372,35 @@ func Test_Unit_Lookups_CapValues(t *testing.T) {
 		}
 		check(t, "Get("+key+")", v, line)
 
+		// The checks above are all satisfied by a heap COPY — cap == len holds
+		// for one, and appending to one cannot touch line either. Zero-copy is
+		// the actual contract, so assert the value really is a window onto line:
+		// its bytes must live at the offset where the key's value sits.
+		off := strings.Index(orig, key+"=") + len(key) + 1
+		if orig[off] == '"' {
+			off++ // quoted: the value starts past the opening quote
+		}
+		if len(v) > 0 && &v[0] != &line[off] {
+			t.Errorf("Get(%q) does not alias line at offset %d — it copied", key, off)
+		}
+
 		// AppendValue writes into the caller's buffer, so its result must not
-		// point into line at all.
+		// point into line at all. Compared against line's own byte rather than
+		// against v, which would be vacuous if Get had started copying.
 		av, ok := AppendValue(nil, line, key)
 		if !ok {
 			t.Fatalf("AppendValue(%q): not found", key)
 		}
-		if len(av) > 0 && &av[0] == &v[0] {
+		if len(av) > 0 && &av[0] == &line[off] {
 			t.Errorf("AppendValue(%q) aliases the input; it must copy", key)
 		}
+	}
+
+	// Get must not allocate: it hands back a window, never a copy. This is the
+	// other half of the zero-copy pin above, and the one that fails loudly if a
+	// future edit reintroduces a defensive copy.
+	if n := testing.AllocsPerRun(100, func() { Get(line, "q") }); n != 0 {
+		t.Errorf("Get allocs/op = %v, want 0 (it must alias, not copy)", n)
 	}
 
 	keys := []string{"a", "b", "empty", "q", "missing"}
@@ -402,6 +518,79 @@ func Test_Unit_AppendValue(t *testing.T) {
 	// A malformed record is not an error; the reachable prefix still resolves.
 	if v, ok := AppendValue(nil, []byte(`a=1 b="x`), "a"); !ok || string(v) != "1" {
 		t.Errorf("AppendValue on malformed tail = %q, %v; want 1, true", v, ok)
+	}
+}
+
+// Escapes are meaningful only inside quotes. Unescaping an unquoted value eats
+// backslashes the emitter meant literally — go-logfmt writes path=C:\Users\bob
+// unquoted, since '\' is not one of the bytes that force quoting — so a lookup
+// that decodes blindly turns \U into U, \b into b and \n into a newline. That is
+// silent corruption: every byte of the input is valid logfmt either way.
+func Test_Unit_Unquoted_Backslashes_Are_Literal(t *testing.T) {
+	line := []byte(`path=C:\Users\bob\new re=\d+\s msg="ok\tdone" q="a\"b" u=\u0041 empty= flag`)
+
+	for _, tt := range []struct {
+		key           string
+		raw           string
+		quoted        bool
+		appended      string
+		isBare        bool
+		needsUnescape bool
+	}{
+		{"path", `C:\Users\bob\new`, false, `C:\Users\bob\new`, false, true},
+		{"re", `\d+\s`, false, `\d+\s`, false, true},
+		{"u", `\u0041`, false, `\u0041`, false, true},
+		{"msg", `ok\tdone`, true, "ok\tdone", false, true},
+		{"q", `a\"b`, true, `a"b`, false, true},
+		{"empty", "", false, "", false, false},
+		{"flag", "true", false, "true", true, false},
+	} {
+		t.Run(tt.key, func(t *testing.T) {
+			raw, quoted, ok := GetQuoted(line, tt.key)
+			if !ok {
+				t.Fatalf("GetQuoted(%q): not found", tt.key)
+			}
+			if string(raw) != tt.raw {
+				t.Errorf("raw = %q, want %q", raw, tt.raw)
+			}
+			if quoted != tt.quoted {
+				t.Errorf("quoted = %v, want %v", quoted, tt.quoted)
+			}
+			if got := NeedsUnescape(raw); got != tt.needsUnescape {
+				t.Errorf("NeedsUnescape = %v, want %v", got, tt.needsUnescape)
+			}
+			// Get must agree with GetQuoted on everything but the flag.
+			if gv, gok := Get(line, tt.key); gok != ok || string(gv) != tt.raw {
+				t.Errorf("Get = %q/%v, disagrees with GetQuoted %q/%v", gv, gok, raw, ok)
+			}
+			// The whole point: AppendValue decodes only what was quoted.
+			av, ok := AppendValue(nil, line, tt.key)
+			if !ok {
+				t.Fatalf("AppendValue(%q): not found", tt.key)
+			}
+			if string(av) != tt.appended {
+				t.Errorf("AppendValue = %q, want %q", av, tt.appended)
+			}
+			if got := IsBareKey(raw); got != tt.isBare {
+				t.Errorf("IsBareKey(GetQuoted result) = %v, want %v", got, tt.isBare)
+			}
+		})
+	}
+
+	// An absent key reports quoted == false, like every other field of a
+	// not-found result.
+	if v, quoted, ok := GetQuoted(line, "missing"); ok || quoted || v != nil {
+		t.Errorf("GetQuoted(missing) = %q, %v, %v; want nil, false, false", v, quoted, ok)
+	}
+
+	// Duplicate resolution is unchanged, and the flag follows the value that
+	// actually won rather than the first occurrence.
+	dup := []byte(`d= d=C:\x d="y\tz"`)
+	if v, quoted, ok := GetQuoted(dup, "d"); !ok || string(v) != `C:\x` || quoted {
+		t.Errorf("GetQuoted(dup) = %q, quoted=%v, ok=%v; want C:\\x, false, true", v, quoted, ok)
+	}
+	if v, ok := AppendValue(nil, dup, "d"); !ok || string(v) != `C:\x` {
+		t.Errorf("AppendValue(dup) = %q; want C:\\x undecoded", v)
 	}
 }
 

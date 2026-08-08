@@ -104,14 +104,32 @@ func hasKeyStop(w uint64) uint64 {
 // separates the next token: "key= value" yields ("key", "") and then the bare
 // key ("value", "true"). go-logfmt reads it the same way, bar the bare-key
 // sentinel. A quoted value is returned without its surrounding double quotes
-// but is NOT unescaped — backslash escapes are left intact; pass val to
-// AppendUnescape to decode them, or guard with NeedsUnescape to skip the copy
-// when there is nothing to decode.
+// but is NOT unescaped — backslash escapes are left intact.
+//
+// val does not record whether it was quoted, and that distinction is the one
+// that decides whether decoding it is correct: escapes mean something only
+// inside quotes, so an unquoted path=C:\Users\bob holds three literal
+// backslashes. Running val through AppendUnescape from inside this callback
+// therefore corrupts every unquoted value that contains one. Use AppendValue,
+// which decodes only what was quoted, or GetQuoted, which hands back the bit.
 //
 // fn may return false to stop iteration early, in which case Iterate returns
-// nil. Iterate returns ErrBadFormat if data contains a malformed quoted value,
-// and otherwise nil. It performs no allocations.
+// nil. Iterate returns a *SyntaxError (which errors.Is matches against
+// ErrBadFormat) if data contains a malformed quoted value, and otherwise nil.
+// Every pair before the fault has already been delivered. It allocates nothing
+// on well-formed input; a returned SyntaxError is the only allocation it can
+// make.
 func Iterate(data []byte, fn func(key, val []byte) bool) error {
+	return iterate(data, func(key, val []byte, _ bool) bool { return fn(key, val) })
+}
+
+// iterate is the parser; every exported entry point funnels through it. It
+// reports one fact Iterate's callback signature has no room for: whether the
+// value came from a double-quoted token, which is the only position where a
+// backslash escape means anything. The lookups take that bit straight from here
+// rather than guessing at it afterwards, which is what stops AppendValue from
+// "decoding" a Windows path.
+func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 	// cap == len stops a callback's append reaching past the end of the record
 	// — a tightening of the read-only contract, never a loosening — for one
 	// instruction once per call. (Its original bounds-check role is now played
@@ -120,9 +138,16 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 	n := len(data)
 	// Loop invariant worth stating because two steps below rely on it: a field
 	// consumes its own trailing separator, so i can finish a step at n+1 rather
-	// than n. Every bound in here is "uint(i) < uint(n)" or "i <= n-8", and
-	// both treat n+1 exactly as they treat n — which is what lets those steps
-	// be branchless. The spellings are deliberate: i is never negative, so the
+	// than n. Only one step actually leaves i at n+1 (the unconditional i++ at
+	// valEnd), and the very next bound it meets is this loop's head. That head
+	// and the two SWAR heads are spelled "uint(i) < uint(n)" and "i <= n-8", and
+	// both treat n+1 exactly as they treat n — which is what lets that step be
+	// branchless. (The remaining "i < n" bounds further down are ordinary
+	// scalar-tail guards, reached only with i <= n; they are not part of this
+	// invariant, and an earlier version of this comment wrongly claimed EVERY
+	// bound in the function used the two spellings above.)
+	//
+	// The spellings are deliberate: i is never negative, so the
 	// unsigned compare means i < n, but it also hands the prove pass the
 	// i >= 0 fact it otherwise never has, and "i <= n-8" proves i+8 <= n
 	// without an add that could overflow. The pair is what eliminates every
@@ -137,7 +162,10 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		// which keyBare handles once, off the hot path.
 		kStart := i
 		// Declared up here so the gotos, which jump forward, skip no declaration.
+		// quoted re-zeroes every iteration by virtue of being declared inside the
+		// loop body; only the quoted branch below ever sets it.
 		var kEnd, vStart, vEnd int
+		var quoted bool
 
 		for i <= n-8 {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
@@ -165,7 +193,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 
 		if i >= n {
 			if kStart < n {
-				fn(data[kStart:n], trueSlice)
+				fn(data[kStart:n], trueSlice, false)
 			}
 			return nil
 		}
@@ -185,7 +213,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 			}
 			continue
 		}
-		if !fn(data[kStart:i], trueSlice) {
+		if !fn(data[kStart:i], trueSlice, false) {
 			return nil
 		}
 		i++ // step past the separator the key stopped on
@@ -198,7 +226,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		vStart, vEnd = i, i
 
 		if i >= n {
-			fn(data[kStart:kEnd], data[vStart:vEnd])
+			fn(data[kStart:kEnd], data[vStart:vEnd], false)
 			return nil
 		}
 
@@ -218,6 +246,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 		// leaves vEnd == vStart — the same empty value, one branch and one
 		// isSpace cheaper on every field.
 		if data[i] == '"' {
+			quoted = true
 			i++
 			vStart = i
 			for {
@@ -288,7 +317,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 			i++
 		}
 
-		if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
+		if !fn(data[kStart:kEnd], data[vStart:vEnd], quoted) {
 			return nil
 		}
 	}
@@ -303,6 +332,14 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 // \\) is emitted as the byte itself. A lone surrogate half decodes to U+FFFD,
 // matching encoding/json. A malformed \u (bad or truncated hex) and a trailing
 // lone backslash are kept verbatim rather than rejected.
+//
+// Pass it ONLY a value that was quoted in the input. Escapes are meaningful
+// only inside quotes: an emitter writes path=C:\Users\bob unquoted and means
+// every byte literally, so decoding that yields C:Usersbob with an embedded
+// newline. Iterate, All, Get and GetMany all hand out quoted and unquoted
+// values alike without distinguishing them; GetQuoted reports which it was, and
+// AppendValue applies this function only when it should. Feeding raw values
+// through here unconditionally is the one way to corrupt data with this package.
 //
 // It always appends — the result never aliases raw — so it composes like the
 // other Append functions in the standard library. Pass dst[:0] to reuse a
@@ -400,12 +437,16 @@ func hex4(b []byte) rune {
 // returns the extended slice along with whether the key was present. When the
 // key is absent it returns dst unchanged and false.
 //
-// It always appends, so the result never aliases data and is safe to keep.
-// Callers who would rather not copy values that need no decoding should use Get
-// with NeedsUnescape instead:
+// Only a quoted value carries escapes, and AppendValue knows which values were
+// quoted, so an unquoted one is copied through byte for byte — path=C:\Users\bob
+// comes back intact rather than "decoded" into nonsense.
 //
-//	if v, ok := logfmt.Get(line, "msg"); ok {
-//		if logfmt.NeedsUnescape(v) {
+// It always appends, so the result never aliases data and is safe to keep.
+// Callers who would rather not copy values that need no decoding should use
+// GetQuoted with NeedsUnescape instead:
+//
+//	if v, quoted, ok := logfmt.GetQuoted(line, "msg"); ok {
+//		if quoted && logfmt.NeedsUnescape(v) {
 //			v = logfmt.AppendUnescape(buf[:0], v)
 //		}
 //		// v now aliases line (no copy) or buf (decoded)
@@ -416,20 +457,33 @@ func hex4(b []byte) rune {
 // exists. A malformed record yields whatever could be parsed before the fault;
 // use Validate when you need to know.
 func AppendValue(dst, data []byte, key string) ([]byte, bool) {
-	raw, ok := Get(data, key)
+	raw, quoted, ok := GetQuoted(data, key)
 	if !ok {
 		return dst, false
 	}
-	if !NeedsUnescape(raw) {
+	// Only a quoted value carries escapes. Decoding an unquoted one would eat
+	// the backslashes an emitter meant literally — path=C:\Users\bob becomes
+	// C:Usersbob with an embedded newline — so it is copied through verbatim.
+	if !quoted || !NeedsUnescape(raw) {
 		return append(dst, raw...), true
 	}
 	return AppendUnescape(dst, raw), true
 }
 
-// NeedsUnescape reports whether raw contains a backslash escape, i.e. whether
-// passing it through AppendUnescape would change it. Values returned by
-// Iterate, All, Get and GetMany are raw; use this to skip the decode (and its
-// copy) when it is unnecessary.
+// NeedsUnescape reports whether raw contains a backslash at all. Values
+// returned by Iterate, All, Get, GetQuoted and GetMany are raw; use this to skip
+// the decode (and its copy) when it is unnecessary.
+//
+// It is conservative in one direction: a false result guarantees AppendUnescape
+// would not change raw, but a true one does not guarantee it would. The
+// sequences AppendUnescape deliberately keeps verbatim — a malformed \u such as
+// `\uZZZZ`, and a trailing lone backslash — contain a backslash and so report
+// true while decoding to themselves. That costs a needless copy, never a wrong
+// answer.
+//
+// A true result also does not mean decoding is CORRECT: escapes are meaningful
+// only inside quotes, so check the value was quoted first (GetQuoted), or let
+// AppendValue handle both questions.
 func NeedsUnescape(raw []byte) bool {
 	return bytes.IndexByte(raw, '\\') >= 0
 }
@@ -440,15 +494,23 @@ func NeedsUnescape(raw []byte) bool {
 // The two are otherwise indistinguishable, since both arrive as the bytes
 // "true".
 //
-// It compares identity, not contents, so it is only meaningful for a val handed
-// to a callback by this package; anything else reports false.
+// It compares identity, not contents. Values delivered by Iterate and All and
+// values returned by Get, GetQuoted and GetMany all report true for a bare key;
+// AppendValue's result never does, since it copies. A []byte of the caller's own
+// reports false however it reads.
 func IsBareKey(val []byte) bool {
 	return len(val) == len(trueSlice) && &val[0] == &trueSlice[0]
 }
 
 // Get returns the raw value for key in data — the value as it appears in the
 // input, with any surrounding quotes removed but escape sequences left intact —
-// and whether the key was present. An absent key yields (nil, false); a key
+// and whether the key was present. A bare key (one written with no '=' at all)
+// yields the shared "true" sentinel that IsBareKey recognises, which is the one
+// result that does not alias data.
+//
+// Raw means raw: do not pass the result to AppendUnescape without first
+// establishing that the value was quoted, since escapes are meaningful only
+// inside quotes. GetQuoted reports that, and AppendValue handles it for you. An absent key yields (nil, false); a key
 // present with an empty value yields a non-nil empty slice and true, so the two
 // stay distinguishable. Decode escapes with AppendUnescape, or use AppendValue
 // for a one-call unescaped lookup.
@@ -467,27 +529,50 @@ func IsBareKey(val []byte) bool {
 // malformed tail beyond that point is never examined; what it can reach, it
 // returns. Call Validate when you need the record checked.
 func Get(data []byte, key string) ([]byte, bool) {
-	var rawVal []byte
-	var found bool
+	val, _, found := GetQuoted(data, key)
+	return val, found
+}
 
-	_ = Iterate(data, func(k, v []byte) bool {
+// GetQuoted is Get plus the one fact Get throws away: whether the value was
+// written as a double-quoted token.
+//
+// That matters because logfmt escape sequences are meaningful only inside
+// quotes. An emitter writes path=C:\Users\bob unquoted and means every byte of
+// it literally, so unescaping a value without knowing how it was written turns
+// \U into U and \n into a newline. GetQuoted is the zero-copy way to decode
+// correctly:
+//
+//	if v, quoted, ok := logfmt.GetQuoted(line, "msg"); ok {
+//		if quoted && logfmt.NeedsUnescape(v) {
+//			v = logfmt.AppendUnescape(buf[:0], v)
+//		}
+//		// v now aliases line (no copy) or buf (decoded)
+//	}
+//
+// AppendValue does the same job in one call, at the cost of always copying.
+//
+// quoted is false for an absent key and for a bare key's implicit "true".
+// Everything else — aliasing, capping, duplicate resolution, the absence of
+// syntax errors — is exactly as described on Get.
+func GetQuoted(data []byte, key string) (val []byte, quoted, found bool) {
+	_ = iterate(data, func(k, v []byte, q bool) bool {
 		if string(k) != key {
 			return true
 		}
 		// cap == len, so a caller's append cannot reach into data.
 		if len(v) > 0 {
-			rawVal, found = v[:len(v):len(v)], true
+			val, quoted, found = v[:len(v):len(v)], q, true
 			return false // settled: first non-empty occurrence wins
 		}
 		if !found {
 			// Provisional empty; keep looking for a non-empty one. Slicing a
 			// non-nil slice keeps it non-nil even at zero length, so a
 			// present-but-empty value stays distinct from an absent key.
-			rawVal, found = v[:len(v):len(v)], true
+			val, quoted, found = v[:len(v):len(v)], q, true
 		}
 		return true
 	})
-	return rawVal, found
+	return val, quoted, found
 }
 
 // GetMany looks up several keys in a single pass over data. It returns a slice
@@ -509,8 +594,12 @@ func Get(data []byte, key string) ([]byte, bool) {
 //
 // The returned values alias data (treat them as read-only) and are valid only
 // until data is modified; each has capacity equal to its length, so appending
-// to one copies rather than overwriting the bytes that follow it in data.
-// Decode escapes with AppendUnescape if needed. buf is reused as the result
+// to one copies rather than overwriting the bytes that follow it in data. A
+// bare key yields the shared "true" sentinel, which does not alias data.
+//
+// GetMany does not report which values were quoted, so it cannot tell you which
+// ones AppendUnescape may safely decode; use GetQuoted or AppendValue for keys
+// whose values you intend to unescape. buf is reused as the result
 // slice when it is large enough, avoiding a [][]byte allocation; pass back a
 // previous result. If a key appears more than once with a non-empty value, the
 // first such occurrence wins; iteration stops once every key has a non-empty
@@ -537,7 +626,7 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	clear(buf)
 
 	remaining := n
-	_ = Iterate(data, func(k, v []byte) bool {
+	_ = iterate(data, func(k, v []byte, _ bool) bool {
 		for j := range keys {
 			// Length check first: a key already settled with a non-empty value
 			// short-circuits cheaply on every later field, skipping the key
@@ -568,7 +657,7 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 // Validate when a record's validity matters, and errors.Is(err, ErrBadFormat)
 // or a *SyntaxError type assertion to inspect the result.
 func Validate(data []byte) error {
-	return Iterate(data, func(key, val []byte) bool { return true })
+	return iterate(data, func(key, val []byte, quoted bool) bool { return true })
 }
 
 // All returns an iterator over data's key/value pairs, for use with range:
@@ -581,12 +670,16 @@ func Validate(data []byte) error {
 // on Iterate. Ranging over a function requires Go 1.23 in the calling module;
 // this package itself still builds on Go 1.21, where All is callable directly.
 //
+// A range loop yields two values, so All cannot report whether a value was
+// quoted any more than it can report an error. Values that need unescaping are
+// GetQuoted's and AppendValue's job.
+//
 // A range loop has nowhere to deliver an error, so All simply stops at a
 // malformed field, having yielded the valid prefix. Call Validate if you need
 // to know; use Iterate to get the error and the pairs in one pass.
 func All(data []byte) func(yield func(key, val []byte) bool) {
 	return func(yield func(key, val []byte) bool) {
-		_ = Iterate(data, yield)
+		_ = iterate(data, func(key, val []byte, _ bool) bool { return yield(key, val) })
 	}
 }
 
