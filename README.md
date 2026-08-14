@@ -301,11 +301,21 @@ through unquoted values (word-at-a-time SWAR) and ~27 GB/s through quoted ones
 overhead-bound, long values scan-bound. Lookups are linear in how deep the key
 sits: ~8 ns per field skipped.
 
-That 27 GB/s is for quoted values with **no escaped quotes in them**. Each `\"`
-makes the scan restart `bytes.IndexByte`, so cost is linear in the number of
-escapes rather than in bytes: a 1 KB value holding embedded JSON (where every
-quote is escaped) parses roughly 90× slower than the same 1 KB with none.
-`Benchmark_IterateEscaped` sweeps that axis.
+That 27 GB/s is for quoted values with **no escaped quotes in them**, which is
+very nearly all of them. A `\"` is the hard case: `bytes.IndexByte` finds the
+next quote at SIMD speed but cannot say whether it is escaped, so a value full of
+them costs a call apiece. Values that prove to carry one are switched to a
+forward, escape-aware word-at-a-time walk that visits each byte once — and
+switched back if the escapes turn out to be far apart, since over a long clean
+stretch the SIMD scan wins again. The parser picks per value, from how far apart
+that value's escapes actually are.
+
+Escape-dense values are still the slow shape, just much less so: embedded JSON in
+a `msg=` field, where every quote is escaped, roughly halved in cost when the
+walk landed, and a 1 KB value of it now parses tens of times slower than 1 KB
+with no escapes rather than a hundred-odd. `Benchmark_IterateEscaped` sweeps that
+axis, and is what to re-run if the thresholds ever need retuning for a different
+CPU.
 
 On amd64, building with `GOAMD64=v3` (Haswell+, 2013 onwards) makes the parser
 ~3% faster (BMI's `TZCNT` for the word-at-a-time scanning). It is a consumer

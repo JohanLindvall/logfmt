@@ -808,3 +808,96 @@ func Test_Unit_ParseTime_NoAliasing(t *testing.T) {
 		}
 	}
 }
+
+// Test_Unit_QuotedEscapeScanPaths drives every branch of the two scans a quoted
+// value with escapes is split between. Which one runs depends on how far apart
+// the value's escapes are, so the shapes below are built from the thresholds
+// rather than written out: change escGap or escClean and these follow.
+//
+// It exists because those branches are otherwise unreachable from the rest of
+// the suite — coverage sat at 95.0% with the whole IndexByte fallback unexecuted
+// — and because the two scans must agree on every value, not merely on the ones
+// that happen to be fast. The same shapes are carried as fuzz seeds, which is
+// what checks them against the byte-by-byte reference; these check the values.
+func Test_Unit_QuotedEscapeScanPaths(t *testing.T) {
+	far := strings.Repeat("x", escGap+8)       // pushes the first escape past escGap
+	long := strings.Repeat("y", escClean*8+16) // a clean run long enough to demote
+
+	for _, tt := range []struct {
+		name string
+		line string
+		want []string // nil means "expect a syntax error"
+	}{{
+		// First escape beyond escGap: classified sparse before the walk runs.
+		name: "entry-sparse",
+		line: `a="` + far + `\"z" b=2`,
+		want: []string{"a", far + `\"z`, "b", "2"},
+	}, {
+		// Same, but the sparse scan has to step over a second escaped quote
+		// before it reaches the real one.
+		name: "entry-sparse-two-escapes",
+		line: `a="` + far + `\"mid\"end" b=2`,
+		want: []string{"a", far + `\"mid\"end`, "b", "2"},
+	}, {
+		// Sparse and never terminated: IndexByte runs out of quotes.
+		name: "entry-sparse-unterminated",
+		line: `a="` + far + `\"zzz`,
+		want: nil,
+	}, {
+		// Sparse, and the escaped quote is the last byte there is, so the scan
+		// resumes at exactly len(data) and the loop head is what stops it.
+		name: "entry-sparse-ends-on-escape",
+		line: `a="` + far + `\"`,
+		want: nil,
+	}, {
+		// Starts dense, then a clean run long enough to demote mid-value.
+		name: "dense-then-demoted",
+		line: `a="q\"` + long + `" b=2`,
+		want: []string{"a", `q\"` + long, "b", "2"},
+	}, {
+		// Demoted and then never terminated.
+		name: "dense-then-demoted-unterminated",
+		line: `a="q\"` + long,
+		want: nil,
+	}, {
+		// Stays dense the whole way: escapes never far enough apart to demote.
+		name: "dense-throughout",
+		line: `a="` + strings.Repeat(`\"`, 40) + `" b=2`,
+		want: []string{"a", strings.Repeat(`\"`, 40), "b", "2"},
+	}, {
+		// An escaped backslash immediately before the closing quote: the pair is
+		// stepped over, so the quote after it really does terminate.
+		name: "escaped-backslash-then-close",
+		line: `a="q\"\\" b=2`,
+		want: []string{"a", `q\"\\`, "b", "2"},
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			err := Iterate([]byte(tt.line), func(k, v []byte) bool {
+				got = append(got, string(k), string(v))
+				return true
+			})
+			if tt.want == nil {
+				if err == nil {
+					t.Fatalf("expected a syntax error, got nil (pairs %q)", got)
+				}
+				var se *SyntaxError
+				if !errors.As(err, &se) || !errors.Is(err, ErrBadFormat) {
+					t.Fatalf("error = %v (%T), want a *SyntaxError matching ErrBadFormat", err, err)
+				}
+				// Every unterminated value reports the opening quote, whichever
+				// scan gave up on it.
+				if se.Offset != 2 {
+					t.Errorf("offset = %d, want 2 (the opening quote)", se.Offset)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

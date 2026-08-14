@@ -18,7 +18,7 @@ func getManyRef(data []byte, keys []string) ([][]byte, []bool) {
 	var pairs []pair
 	// The error is deliberately ignored: iterate delivers every pair preceding
 	// a fault, and that valid prefix is exactly what the lookups see too.
-	_ = iterate(data, func(k, v []byte, quoted bool) bool {
+	_ = iterate3(data, func(k, v []byte, quoted bool) bool {
 		pairs = append(pairs, pair{k, v, quoted})
 		return true
 	})

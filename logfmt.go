@@ -94,6 +94,144 @@ func hasKeyStop(w uint64) uint64 {
 	return ((w - swarLo*0x21) | (x - swarLo*0x21)) &^ w & swarHi
 }
 
+// hasQuoteOrEsc flags every byte of w that is '"' or '\\' — the two bytes that
+// matter once a quoted value is known to carry an escaped quote, since from
+// there the value has to be walked escape by escape.
+//
+// Each half is the classic hasZero(w ^ broadcast(c)) equality test. The shared
+// "&^ w" factors out for the same reason it does in hasKeyStop: both '"' (0x22)
+// and '\\' (0x5c) have bit 7 clear, so bit 7 of w^c equals bit 7 of w, and bit 7
+// is the only position the result is ever read at.
+//
+// The borrow caveat is the usual one and is why the halves are OR-ed rather than
+// subtracted: a byte of 0x01 immediately above a true match (here, a '#' above a
+// '"', or a ']' above a '\\') is flagged spuriously, but only ever ABOVE a real
+// one, so the lowest set bit of either half — and therefore of their union — is
+// always genuine.
+func hasQuoteOrEsc(w uint64) uint64 {
+	q := w ^ (swarLo * '"')
+	e := w ^ (swarLo * '\\')
+	return ((q - swarLo) | (e - swarLo)) &^ w & swarHi
+}
+
+// Thresholds for the two scans a quoted value with escapes is split between.
+// Both are distances between escaped quotes, and both sit on the same measured
+// crossover: bytes.IndexByte scans clean bytes about 4.5x faster than the SWAR
+// walk (26.5 vs 5.9 GB/s on the arm64 machine this was tuned on) but costs
+// roughly a call per escaped quote, so the walk wins while escapes stay within
+// about 70 bytes of each other and loses beyond that. The ratio, not the
+// machine, is what sets these; Benchmark_IterateEscaped sweeps the axis that
+// re-measures them.
+//
+// The floor under escGap is the real sample line in testdata, whose two escaped
+// quotes are 38 bytes apart with level= immediately after them: classify that
+// one sparse and most of the GetMany and LevelTS win goes with it (-6.4% and
+// -8.0% became -0.8% and ~).
+const (
+	escClean = 8  // consecutive clean words after which the walk gives up
+	escGap   = 48 // bytes to the first escape at or below which the walk wins
+)
+
+// scanQuotedEscapeDense walks a quoted value that has just been shown to carry
+// an escaped quote, stepping over each "\x" pair, and reports the terminating
+// quote. i is an offset at which no escape is pending — the byte just past that
+// first escaped quote — and vStart is where the value began, so i-1-vStart is
+// how far in the first escape was.
+//
+// It returns (index of the terminating quote, true), or (a position to carry on
+// from, false) when the value's escapes turn out to be too far apart for the
+// walk to be the right tool, including when they are already too far apart on
+// entry. It never reports the value unterminated: running off the end returns a
+// position past the last byte, and the caller's scan reports that.
+//
+// This exists because a plain IndexByte loop degrades badly on escaped values.
+// IndexByte finds the next quote at SIMD speed but cannot say whether it is
+// escaped, so every escaped quote costs a fresh non-inlinable call plus a
+// re-walk of the backslash run behind it: O(escapes) calls rather than
+// O(bytes/8) scan steps. A msg= field holding embedded JSON turns every JSON
+// quote into \", roughly one call per two bytes, and measured ~130x slower per
+// byte than the same value with no escapes at all. Walking forward instead
+// visits every byte once and needs no backward re-walk — but it reads 8 bytes a
+// step where IndexByte reads a vector, so it only pays while the escapes stay
+// close together, which is exactly what this hands back when they do not.
+//
+// Keeping it free of calls is not incidental: it is what makes it a leaf, and a
+// leaf needs no frame and no stack-growth check. Folding the IndexByte fallback
+// in here instead of into scanQuotedSparse gave it a $64 frame and cost +10.9%
+// on a short escaped value, which is most of them.
+func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
+	if i-1-vStart > escGap {
+		return i, false // already sparse on arrival; never mind the walk
+	}
+	n := len(data)
+	clean := 0
+	// The loop heads are spelled exactly as iterate's are, and for the same
+	// reason: "uint(i) < uint(n)" is i < n plus the i >= 0 fact the prove pass
+	// otherwise never has, and "i <= n-8" proves i+8 <= n without materialising
+	// an add that could overflow. Together they take the bounds check off the
+	// SWAR load; neither does it alone. The outer head doubles as the
+	// ran-off-the-end exit, which is why the backslash step below can be
+	// unconditional: it may leave i at n+1, and this head rejects n+1 exactly as
+	// it rejects n.
+	for uint(i) < uint(n) {
+		for i <= n-8 && clean < escClean {
+			w := binary.LittleEndian.Uint64(data[i : i+8])
+			m := hasQuoteOrEsc(w)
+			if m != 0 {
+				clean = 0
+				i += bits.TrailingZeros64(m) >> 3
+				goto stop
+			}
+			i += 8
+			clean++
+		}
+		if clean >= escClean {
+			return i, false // a long clean run: IndexByte covers it faster
+		}
+		for i < n && data[i] != '"' && data[i] != '\\' {
+			i++
+		}
+		if i >= n {
+			break
+		}
+	stop:
+		if data[i] == '"' {
+			return i, true
+		}
+		i += 2 // a backslash escapes whatever follows it, so step over both
+	}
+	return i, false
+}
+
+// scanQuotedSparse finishes a quoted value whose escapes are far enough apart
+// that bytes.IndexByte's SIMD scan more than pays for its call, which is the way
+// every quoted value used to be scanned. It returns the index of the terminating
+// quote, or -1 if the value is never terminated. i must be an offset at which no
+// escape is pending.
+//
+// The backslash walk needs no lower-bound guard for the same reason it does not
+// in iterate: the value's opening quote is not a backslash, and neither is any
+// escaped quote already passed, so the run always stops on its own.
+func scanQuotedSparse(data []byte, i int) int {
+	n := len(data)
+	for uint(i) < uint(n) {
+		q := bytes.IndexByte(data[i:], '"')
+		if q < 0 {
+			break
+		}
+		i += q
+		bs := 0
+		for j := i - 1; data[j] == '\\'; j-- {
+			bs++
+		}
+		if bs&1 == 0 {
+			return i
+		}
+		i++
+	}
+	return -1
+}
+
 // Iterate parses data as a logfmt record and calls fn once for each key/value
 // pair, in order. key and val are sub-slices that alias data — except for a
 // bare key with no '=' (for example "debug", or a trailing token), whose val is
@@ -120,7 +258,8 @@ func hasKeyStop(w uint64) uint64 {
 // on well-formed input; a returned SyntaxError is the only allocation it can
 // make.
 func Iterate(data []byte, fn func(key, val []byte) bool) error {
-	return iterate(data, func(key, val []byte, _ bool) bool { return fn(key, val) })
+	var quoted bool
+	return iterate(data, &quoted, fn)
 }
 
 // iterate is the parser; every exported entry point funnels through it. It
@@ -129,7 +268,22 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 // backslash escape means anything. The lookups take that bit straight from here
 // rather than guessing at it afterwards, which is what stops AppendValue from
 // "decoding" a Windows path.
-func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
+//
+// It travels through *quotedOut, written immediately before every callback, and
+// not as a third callback argument — which is what it used to be, and which
+// reads better. The reason is that a third argument forces Iterate and All to
+// wrap the caller's fn in an adapter closure, and that adapter is an extra
+// indirect call PER FIELD: measured on its own it cost Iterate 2.1% (383 -> 391
+// ns on the 1.4 KB sample), and removing it won Iterate 1.58%, ParseAll_Big
+// 1.41% and ParseEscaped 1.97%. A store is not free either, and the lookups —
+// which never wanted the bit and used to pay only an ignored argument — give
+// back 0.3-0.5% (GetMany +0.52%, Extract +0.34%) for it. Both suite geomeans
+// came out ahead, so the trade stands, but it IS a trade.
+//
+// Anything reading the flag must read it from inside the callback, where the
+// store has just happened; iterate3 in the differential fuzzer is built that way
+// on purpose, so the ordering is checked rather than assumed.
+func iterate(data []byte, quotedOut *bool, fn func(key, val []byte) bool) error {
 	// cap == len stops a callback's append reaching past the end of the record
 	// — a tightening of the read-only contract, never a loosening — for one
 	// instruction once per call. (Its original bounds-check role is now played
@@ -193,7 +347,8 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 
 		if i >= n {
 			if kStart < n {
-				fn(data[kStart:n], trueSlice, false)
+				*quotedOut = false
+				fn(data[kStart:n], trueSlice)
 			}
 			return nil
 		}
@@ -213,7 +368,8 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 			}
 			continue
 		}
-		if !fn(data[kStart:i], trueSlice, false) {
+		*quotedOut = false
+		if !fn(data[kStart:i], trueSlice) {
 			return nil
 		}
 		i++ // step past the separator the key stopped on
@@ -226,7 +382,8 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 		vStart, vEnd = i, i
 
 		if i >= n {
-			fn(data[kStart:kEnd], data[vStart:vEnd], false)
+			*quotedOut = false
+			fn(data[kStart:kEnd], data[vStart:vEnd])
 			return nil
 		}
 
@@ -249,44 +406,59 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 			quoted = true
 			i++
 			vStart = i
-			for {
-				q := bytes.IndexByte(data[i:], '"')
-				if q == -1 {
-					// vStart is just past the opening quote, which is the
-					// position worth reporting.
-					return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
-				}
-				i += q
+			// One IndexByte call settles a value with no escaped quote, which
+			// is nearly every value: it finds the terminator at SIMD speed and
+			// the walk below confirms it in a byte or two.
+			q := bytes.IndexByte(data[i:], '"')
+			if q < 0 {
+				// vStart is just past the opening quote, which is the
+				// position worth reporting.
+				return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
+			}
+			i += q
 
-				// Determine whether this quote is escaped by counting the
-				// run of backslashes immediately preceding it: an odd count
-				// means the quote is escaped and we keep scanning. The walk
-				// needs no lower-bound guard: data[vStart-1] is the opening
-				// quote (this path is entered only via '=' then '"'), any
-				// earlier escaped quote inside the value is also '"', and
-				// neither is a backslash, so the run always stops on its own.
-				// bs&1 rather than bs%2 spares the signed-modulo dance the
-				// compiler emits when it cannot prove bs >= 0 across the loop.
-				bs := 0
-				for j := i - 1; data[j] == '\\'; j-- {
-					bs++
-				}
-				if bs&1 == 1 {
-					i++
-					continue
-				}
-
-				vEnd = i
-				i++
-				if i < n {
-					// ' ' first: the usual delimiter short-circuits past
-					// the isSpace test.
-					if c := data[i]; c != ' ' && !isSpace(c) {
-						return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
+			// Determine whether this quote is escaped by counting the run of
+			// backslashes immediately preceding it: an odd count means the
+			// quote is escaped and the value continues. The walk needs no
+			// lower-bound guard: data[vStart-1] is the opening quote (this path
+			// is entered only via '=' then '"'), any earlier escaped quote
+			// inside the value is also '"', and neither is a backslash, so the
+			// run always stops on its own. bs&1 rather than bs%2 spares the
+			// signed-modulo dance the compiler emits when it cannot prove
+			// bs >= 0 across the loop.
+			bs := 0
+			for j := i - 1; data[j] == '\\'; j-- {
+				bs++
+			}
+			if bs&1 == 1 {
+				// Escaped, so the value continues and has to be scanned
+				// escape-aware from here. Which scan is right depends on how far
+				// apart this value's escapes turn out to be, so the walk goes
+				// first and hands over when they are too sparse for it.
+				//
+				// vStart, not q, carries the entry reading, and that is not
+				// cosmetic: vStart is needed after this call anyway, so passing
+				// it keeps nothing extra alive, whereas keeping q live across the
+				// backslash walk above measured +2.3% on Iterate and +1.7% on
+				// Extract — more than the sharper reading is worth.
+				pos, done := scanQuotedEscapeDense(data, i+1, vStart)
+				if !done {
+					if pos = scanQuotedSparse(data, pos); pos < 0 {
+						return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
 					}
-					i++
 				}
-				break
+				i = pos
+			}
+
+			vEnd = i
+			i++
+			if i < n {
+				// ' ' first: the usual delimiter short-circuits past
+				// the isSpace test.
+				if c := data[i]; c != ' ' && !isSpace(c) {
+					return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
+				}
+				i++
 			}
 		} else {
 			vStart = i
@@ -317,7 +489,8 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 			i++
 		}
 
-		if !fn(data[kStart:kEnd], data[vStart:vEnd], quoted) {
+		*quotedOut = quoted
+		if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
 			return nil
 		}
 	}
@@ -555,7 +728,8 @@ func Get(data []byte, key string) ([]byte, bool) {
 // Everything else — aliasing, capping, duplicate resolution, the absence of
 // syntax errors — is exactly as described on Get.
 func GetQuoted(data []byte, key string) (val []byte, quoted, found bool) {
-	_ = iterate(data, func(k, v []byte, q bool) bool {
+	var q bool
+	_ = iterate(data, &q, func(k, v []byte) bool {
 		if string(k) != key {
 			return true
 		}
@@ -626,7 +800,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	clear(buf)
 
 	remaining := n
-	_ = iterate(data, func(k, v []byte, _ bool) bool {
+	var quoted bool
+	_ = iterate(data, &quoted, func(k, v []byte) bool {
 		for j := range keys {
 			// Length check first: a key already settled with a non-empty value
 			// short-circuits cheaply on every later field, skipping the key
@@ -657,7 +832,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 // Validate when a record's validity matters, and errors.Is(err, ErrBadFormat)
 // or a *SyntaxError type assertion to inspect the result.
 func Validate(data []byte) error {
-	return iterate(data, func(key, val []byte, quoted bool) bool { return true })
+	var quoted bool
+	return iterate(data, &quoted, func(key, val []byte) bool { return true })
 }
 
 // All returns an iterator over data's key/value pairs, for use with range:
@@ -679,7 +855,8 @@ func Validate(data []byte) error {
 // to know; use Iterate to get the error and the pairs in one pass.
 func All(data []byte) func(yield func(key, val []byte) bool) {
 	return func(yield func(key, val []byte) bool) {
-		_ = iterate(data, func(key, val []byte, _ bool) bool { return yield(key, val) })
+		var quoted bool
+		_ = iterate(data, &quoted, yield)
 	}
 }
 

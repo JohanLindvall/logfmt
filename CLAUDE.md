@@ -36,10 +36,18 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   whole quoted-value error region), and it carries malformed seeds — before those
   were added, **no seed reached an error path at all**, so CI, which runs seeds
   rather than a corpus, never exercised it. Also `Test_Unit_SWARMasks`
-  (exhaustive: every byte value in every lane, for both masks, plus "the lower of
-  two stops wins") and `Test_Unit_IsSpace`. `isSpace` needs its own test
-  precisely *because* the reference above shares it — a bug there cancels out and
-  the fuzzer sees nothing.
+  (exhaustive: every byte value in every lane, for all THREE masks, plus "the
+  lower of two stops wins" — including, for `hasQuoteOrEsc`, the two byte pairs
+  that actually manufacture a spurious borrow bit, `'#'` above a `'"'` and `']'`
+  above a `'\\'`) and `Test_Unit_IsSpace`. `isSpace` needs its own test precisely
+  *because* the reference above shares it — a bug there cancels out and the
+  fuzzer sees nothing.
+  Since 2026-08-14 it also holds `iterate3`, a shim putting the old
+  three-argument callback shape back on top of the parser's `quotedOut *bool`, so
+  the fuzzer keeps comparing pair-for-pair AND exercises the store-before-callback
+  ordering `GetQuoted` depends on. Its threshold-derived seeds (built from
+  `escGap`/`escClean` rather than written out) are the only ones that reach the
+  escape scan's `IndexByte` fallback; they follow the constants if those move.
 - `getmany_fuzz_test.go` — `FuzzGetManyAgainstRef`: differential fuzz of
   `GetMany`/`Get`/`GetQuoted`'s first-non-empty duplicate resolution against a
   naive collect-all reference, which also tracks the quoted flag so
@@ -56,8 +64,13 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   aliases the input at a known offset — `cap == len` plus "append didn't touch
   the line" is satisfied by a heap copy, so the old form passed with `Get`
   copying. `Test_Unit_Unquoted_Backslashes_Are_Literal` pins the quoted/unquoted
-  decode split. `Benchmark_IterateEscaped` sweeps escape density at fixed
-  length.
+  decode split. `Test_Unit_QuotedEscapeScanPaths` (2026-08-14) drives every
+  branch of the two escape scans — entry-sparse, demote-mid-value, dense
+  throughout, and each unterminated form — from shapes built out of `escGap` and
+  `escClean`, so retuning those cannot silently stop reaching the branch a case
+  was written for; without it the whole fallback went unexecuted and coverage sat
+  at 95.0%. `Benchmark_IterateEscaped` sweeps escape density at fixed length and
+  is what to re-run if those constants are ever retuned for another CPU.
 - `bench/` — separate module, **declares go 1.23** (above the library floor) so
   it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
   with `for … range`. CI skips this module on the 1.21 floor job.
@@ -92,9 +105,11 @@ requirement lands on the consumer's module, not this one. `bench/go.mod` is
 Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — see
 "API design rules" below before changing any of it.
 
-- `Iterate(data, func(k, v) bool) error` — exported adapter over the unexported
-  `iterate`, whose callback takes a third `quoted bool` (see "The `iterate` /
-  `Iterate` split" below). Calls back per pair,
+- `Iterate(data, func(k, v) bool) error` — passes `fn` straight down to the
+  unexported `iterate`, which takes the same two-argument callback plus a
+  `quotedOut *bool` (see "How `quoted` reaches the lookups" below; it used to be
+  a third callback argument, and the adapter that cost was measured and
+  removed 2026-08-14). Calls back per pair,
   `k`/`v` alias `data` (bare key → shared `trueSlice`; all results read-only).
   Quoted values have quotes stripped but escapes left intact (raw). `false` from
   the callback stops. **The only function that reports errors alongside data.**
@@ -166,8 +181,10 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   unquoted value containing a backslash.
 - **Escapes are a property of the QUOTED form, not of the value.** Anything that
   unescapes has to know how the value was written, so the parser reports it
-  rather than letting callers guess. This is why `iterate` carries a third
-  callback argument and why `GetQuoted` exists.
+  rather than letting callers guess. This is why `iterate` carries the bit at all
+  and why `GetQuoted` exists. *How* it carries it is a performance question and
+  has changed once already (third callback argument → `quotedOut *bool`); the
+  principle is that the parser reports it, not the mechanism.
 - **Destination first** (`AppendUnescape(dst, raw)`, `AppendValue(dst, data,
   key)`), matching `append` and the stdlib `Append*` family.
 
@@ -214,21 +231,31 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   itself; the lower bound is 1970, not the 2001-09-09 that unpadded ten-digit
   values start at. Don't "fix" this by rejecting a leading zero — `0999999999`
   is a legitimate epoch.
-- Statement coverage is 99.5%, and the one uncovered statement is
-  `parseUnixTS`'s defensive ParseInt error guard, which is unreachable (10
-  digits cannot overflow int64). The value-scan SWAR control-byte break —
-  formerly the other uncovered line, reachable on CI by no seed — is pinned by
-  a fuzz seed and a unit case since 2026-08-06. Both differential fuzzers pass
-  90 s clean (24.9 M and 22.4 M execs, no new failures).
+- Statement coverage is 99.6% (`logfmt.go` is fully covered), and the one
+  uncovered statement is `parseUnixTS`'s defensive ParseInt error guard, which is
+  unreachable (10 digits cannot overflow int64). The value-scan SWAR control-byte
+  break — formerly the other uncovered line, reachable on CI by no seed — is
+  pinned by a fuzz seed and a unit case since 2026-08-06; the escape scan's two
+  hand-over branches and its whole IndexByte fallback are pinned the same way by
+  `Test_Unit_QuotedEscapeScanPaths` and matching seeds since 2026-08-14 (they
+  landed at 95.0% before those were written). Both differential fuzzers pass
+  90 s clean (6.6 M and 6.1 M execs on arm64, no new failures).
 
-## Current benchmarks (Ryzen 7 8840HS, amd64)
+## Current benchmarks (two machines — check which before comparing anything)
+
+**Everything down to the 2026-07-27 evening pass is Ryzen 7 8840HS / amd64. The
+2026-08-14 pass is Azure Neoverse-N2 / arm64.** Absolutes are not comparable
+across that line, and the escape-scan tuning constants are architecture-sensitive
+besides. Each pass below states its machine; if a future pass adds a third, state
+that one too rather than appending to a table.
 
 Quoted as **before → after from one interleaved run**, not as standalone
-absolutes. This machine's power state moves the absolute numbers by ~30% between
+absolutes. The Ryzen's power state moves its absolute numbers by ~30% between
 sessions (`Iterate` measured 270 ns, 307 ns and 358 ns for the *same* code
 within one afternoon), so a bare ns/op figure here ages into a lie and invites
 exactly the stale-baseline comparison the methodology section forbids. The
-ratios are the portable part.
+ratios are the portable part. (The arm64 VM behaves quite differently — see the
+note at the end of the 2026-08-14 pass — but the rule stands for both.)
 
 2026-07-27 pass, n=10 interleaved pinned rounds, control (two identical trees)
 `~` on every row at +0.13% geomean:
@@ -262,12 +289,19 @@ claimed "regenerated by CI" although nothing in `bench.yml` ever writes README.
 Don't reintroduce that pattern; if the numbers must appear in two places, have
 the renderers splice into marker-delimited blocks so the claim is true.
 
-Table currency, as of 2026-08-08: the committed tables are **current through
-`e048e5d`** (the −13.8% pass — `dcd5687` is its direct child, stamped 95 s
-later) and **stale for `3a55c5e`, `c04fbed` and everything after**, this pass
-included. Note `bench.yml` is `workflow_dispatch` only, so nothing refreshes
-them automatically; run `make bench-md` deliberately. Don't hand-edit them with
-laptop figures.
+Table currency, as of 2026-08-14 — and it now differs **per architecture**,
+because the filenames are per-`GOARCH` and a run only rewrites its own:
+
+- `*_arm64.md` — **current**, regenerated by `make bench-md` at the end of the
+  2026-08-14 escape/adapter pass on the machine that pass was measured on.
+- `*_amd64.md` — **current through `e048e5d`** (the −13.8% pass; `dcd5687` is its
+  direct child, stamped 95 s later) and **stale for `3a55c5e`, `c04fbed`,
+  `b83eade` and everything after**, the 2026-08-14 pass included. Someone with
+  amd64 hardware needs to run `make bench-md` there; nothing in this repo can do
+  it from an arm64 host.
+
+`bench.yml` is `workflow_dispatch` only, so nothing refreshes either
+automatically. Don't hand-edit them with laptop figures.
 
 2026-07-27 **evening** pass (same machine, faster power state — do not compare
 absolutes across the two tables), n=8 interleaved pinned 1 s rounds, control
@@ -277,6 +311,56 @@ Extract 51.0 → 49.3 ns (−3.4%), ParseEscaped 124.3 → 120.2 ns (−3.3%), L
 −1.4%, ParseAll_Typical −0.6%, ParseAll_Big/Unescape `~`, **DecodeKeyval 391.0
 → 395.6 µs (+1.2%)** — the accepted trade (see the optimization-notes bullet).
 Geomean −1.0% (root) / −2.0% (bench). CI tables are stale for this pass too.
+
+2026-08-14 **escape sweep + adapter removal** — measured on a DIFFERENT MACHINE
+and a different architecture from everything above: **Azure Neoverse-N2, arm64,
+2 cores, Go 1.26.5**. Do not compare any absolute here against the amd64 tables;
+`Iterate` on the same sample line reads 391 ns here where the Ryzen read 231–358
+depending on power state. Ratios remain the portable part, and even they are
+architecture-sensitive for this pass in particular — see the crossover note under
+"Escaped quoted values" below.
+
+Two changes landed together but were measured separately (each n=6 interleaved
+pinned rounds, control clean) and then jointly at n=8, every row p=0.000:
+
+| Benchmark | before | after | Δ | allocs |
+|---|---:|---:|---:|---:|
+| `IterateEscaped/esc=500` (1 KB, dense `\"`) | 4.726 µs | 2.111 µs | **−55.3%** | 0 |
+| `IterateEscaped/esc=128` | 1194.5 ns | 556.7 ns | **−53.4%** | 0 |
+| `IterateEscaped/esc=32` | 333.6 ns | 220.2 ns | **−34.0%** | 0 |
+| `LevelTS` logfmt | 72.05 ns | 65.18 ns | **−9.5%** | 0 |
+| `GetMany` (sample2) | 81.32 ns | 75.89 ns | **−6.7%** | 0 |
+| `Extract_Mine` (bench/) | 81.41 ns | 76.18 ns | **−6.4%** | 0 |
+| `Iterate` (sample2, 1.4 KB real line) | 391.3 ns | 379.1 ns | **−3.1%** | 0 |
+| `ParseAll_Big_Mine` (same line, bench/) | 391.6 ns | 379.9 ns | **−3.0%** | 0 |
+| `IterateEscaped/esc=0` | 36.20 ns | 35.86 ns | −0.95% | 0 |
+| `ParseAll_Typical_Mine` | 85.03 ns | 84.56 ns | −0.55% | 0 |
+| `ParseEscaped_Mine` | 214.1 ns | 213.6 ns | −0.26% | 0 |
+| `DecodeKeyval` (10k short-field rows) | 725.6 µs | 729.0 µs | +0.47% | 0 |
+| `IterateEscaped/esc=8` | 107.9 ns | 108.8 ns | +0.79% | 0 |
+| `Unescape` (parser untouched) | 28.34 ns | 28.55 ns | +0.72% | 0 |
+
+Geomean **−19.6% (root)** / **−2.6% (bench)**; still zero allocations everywhere.
+The three regressions are all sub-1%: `Unescape` does not touch the parser at all,
+so its +0.72% is pure code layout and wanders between ±0.7% run to run —
+treat anything at that scale on that benchmark as layout noise, not signal.
+
+The `GetMany`/`LevelTS`/`Extract` wins are larger than `Iterate`'s because they
+are **not** proportional to how much of the line is parsed: all four improve by
+roughly the same ~6 ns, which is the signature of a fixed per-line cost. That
+cost is `sample_big.txt`'s one `message=` field, whose two escaped quotes sit 38
+bytes apart, and which every one of them has to cross before reaching `level`.
+That single field is also why `escGap` cannot be tuned below ~38 (see the
+constants in `logfmt.go`).
+
+**A note on the machine, because it inverts a standing assumption in this file.**
+Everything above warns that the Ryzen laptop drifts ~30% between sessions and
+±8–16% run to run. This Azure arm64 VM does not: the A/A control came back `~`
+on every row at −0.02% geomean with ±0–1% variance, and repeated runs of the same
+binary landed within 0.1%. That makes 1% effects trivially resolvable at n=6, and
+it is why several sub-1% figures above are quoted at all. **Do not carry that
+confidence back to the laptop.** Run the control either way; it is what tells you
+which machine you are on.
 
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
@@ -293,68 +377,81 @@ sweep before quoting the overhead figure again.
 | Fixed per-field overhead (4–16 B values) | ~5.8–7.2 ns/field |
 | Unquoted value scan (SWAR), 256 B values | ~11.7 GB/s |
 | Quoted value scan (`bytes.IndexByte`), 512 B, **no escaped quotes** | ~27 GB/s |
-| Quoted value scan, **per escaped quote** | ~10 ns each (see below) |
+| Quoted value scan, **per escaped quote** | ~10 ns each — **obsolete, see below** |
 | `Get` per skipped field | ~8.6 ns (10.7 ns for field 0, 551 ns for field 63) |
 
-**The 27 GB/s row is escape-free only** — do not quote it unqualified. Each `\"`
-makes the quoted loop restart the non-inlinable `bytes.IndexByte` and re-walk
-the preceding backslash run, so the cost is O(escapes) calls, not O(bytes/8)
-SWAR steps. Embedded JSON in a `msg=` field is the worst realistic shape: every
-JSON quote becomes `\"`, i.e. roughly one call per two bytes. At a **fixed**
-1 KB value the sweep runs 65 ns (0 escapes) → 6100 ns (500 escapes), about 90×,
-falling from ~15 GB/s to ~0.17 GB/s. `Benchmark_IterateEscaped` pins that axis;
-it exists because `sample_big.txt` has 2 escaped quotes in 1.4 KB (~4%) and so
-makes the quoted scan look like pure `IndexByte` throughput.
+**The 27 GB/s row is escape-free only** — do not quote it unqualified, and the
+"per escaped quote" row is now **obsolete**: it described the old single-scan
+behaviour, where each `\"` made the quoted loop restart the non-inlinable
+`bytes.IndexByte` and re-walk the preceding backslash run, i.e. O(escapes) calls
+rather than O(bytes/8) scan steps. Embedded JSON in a `msg=` field is the worst
+realistic shape (every JSON quote becomes `\"`, roughly one call per two bytes),
+and at a fixed 1 KB value that ran ~90x slower than the escape-free case on
+amd64 and ~130x on arm64.
 
-This is **not** the rejected "inline first-word `hasByte` before `IndexByte`"
-item, which was about sparing short *clean* values a call. An adaptive fix here
-(on seeing the first escaped quote, switch that value to a SWAR scan for `"` and
-`\` in one word) would leave clean values on today's path entirely. Unmeasured —
-it needs a control-clean interleaved A/B before anyone lands it.
+**Fixed 2026-08-14** by the adaptive scan described below, which took −55%/−53%/
+−34% off the 500/128/32-escape rows. The axis is still real — dense escapes
+remain tens of times slower per byte than clean ones — but it is no longer a
+cliff. `Benchmark_IterateEscaped` pins it, and exists because `sample_big.txt`
+has only 2 escaped quotes in 1.4 KB (~4%) and so makes the quoted scan look like
+pure `IndexByte` throughput.
 
 Reading: short fields are **overhead-bound** (~6 ns of loop/callback per pair,
 scan is noise), long values are **scan-bound**. The 8 B/iter SWAR only starts
 paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
 `sample2` averages ~8.3 ns/field, consistent with the sweep.
 
-## The `iterate` / `Iterate` split (2026-08-08) — UNMEASURED, please A/B
+## How `quoted` reaches the lookups (2026-08-08, re-measured and changed 2026-08-14)
 
-`Iterate` is now a thin adapter over an unexported `iterate` whose callback
-takes a third argument, `quoted bool`. This was a **correctness** fix, not an
-optimization: `AppendValue` used to run `AppendUnescape` over every value it
-found, including unquoted ones, so `path=C:\Users\bob\new` came back as
-`C:Usersbob` with an embedded newline (`\U`→`U`, `\b`→`b`, `\n`→newline).
-Escapes are meaningful only inside quotes, the raw value cannot tell you which
-it was, and go-logfmt's encoder does **not** quote a value merely for containing
-a backslash — so this was silent corruption on ordinary input. `GetQuoted`
-exports the bit; `Get`/`GetMany`/`Validate` call `iterate` directly and so pay
-only the extra (ignored) argument; `Iterate` and `All` pay one adapter call per
-field.
+`GetQuoted` needs one fact the parser knows and `Iterate`'s callback has no room
+for: whether the value came from a double-quoted token. That was a **correctness**
+fix, not an optimization — `AppendValue` used to run `AppendUnescape` over every
+value it found, including unquoted ones, so `path=C:\Users\bob\new` came back as
+`C:Usersbob` with an embedded newline (`\U`→`U`, `\b`→`b`, `\n`→newline). Escapes
+are meaningful only inside quotes, the raw value cannot tell you which it was, and
+go-logfmt's encoder does **not** quote a value merely for containing a backslash,
+so this was silent corruption on ordinary input.
 
-**The cost of that adapter hop is not known.** It could not be measured on the
-machine this landed on: an unrelated ffmpeg job held ~10 cores for the whole
-session (load average 15–50), and a four-way interleaved sweep with an embedded
-A/A control put the control itself at −7.8% / +3.75% — far above any effect
-worth finding, so by this file's own control rule none of those numbers count.
-What *is* known, deterministically from `-gcflags=-S`:
+It originally travelled as a **third callback argument**, which forced `Iterate`
+and `All` to wrap the caller's `fn` in an adapter closure — one extra indirect
+call per field. That cost went unmeasured at the time (the machine was loaded;
+the A/A control itself came out at −7.8%/+3.75%, so by this file's own rule none
+of those numbers counted). **It has now been measured, and the adapter is gone.**
 
-- **Both SWAR scan loops are byte-identical to the previous code** (same two
-  `TZCNT` sites, same loop bodies), so per-*byte* scan throughput is unchanged
-  and only the per-*field* term can have moved.
-- The adapter closure does not escape (`func literal does not escape`), so the
-  zero-allocation contract holds — pinned now by `Test_Unit_HotPath_Allocs`.
+The measurement did not need an A/B of two trees at all, which is worth
+remembering: `iterate` and `Iterate` live in the same package, so benchmarking
+both in **one binary** isolates the adapter exactly, with nothing else able to
+differ. It cost **+8.2 ns on the 1.4 KB sample line (382.9 → 391.1 ns, +2.14%)**
+and +0.83% on the field-dense shape — a per-field term, ~0.28 ns/field.
 
-Please re-run the A/B on quiet hardware before quoting any new figure.
-`/tmp` harnesses do not survive, so the recipe: copy the pre-split tree, then
-interleave with `taskset -c N`, rotating order each round, and **measure an A/A
-control inside the same sweep**. If `Iterate` has regressed more than ~1%, two
-things are worth trying before anything drastic: deriving `quoted` at the
-callback site as `data[vStart-1] == '"'` instead of carrying a live flag
-(`vStart` is only ever set just past a `"` or a `=`, so the byte is already hot
-— a working variant was built and passes the suite), or making the exported
-`Iterate` take the three-argument callback itself, which removes the adapter
-entirely at the price of a breaking change. Do not "fix" it by duplicating the
-parser; that has been tried and rejected (see below).
+The bit now travels through a `*bool` out-param written immediately before every
+callback, so `Iterate` and `All` pass the user's `fn` straight down:
+
+```go
+func iterate(data []byte, quotedOut *bool, fn func(key, val []byte) bool) error
+```
+
+Measured for that change alone (n=6 interleaved pinned, control clean): `Iterate`
+**−1.58%**, `ParseAll_Big` −1.41%, `ParseEscaped` −1.97%, `LevelTS` −0.75%,
+`DecodeKeyval` −0.43%; and against it, `GetMany` **+0.52%** and `Extract` +0.34%
+— the lookups never wanted the bit and used to pay only an ignored argument,
+where now they pay a store per field. Both suite geomeans came out ahead
+(−0.53% root, −0.79% bench), so the trade stands, but it **is** a trade, and it
+is the reason to think twice before adding a second out-param the same way.
+
+`quotedOut` does not escape (`-gcflags=-m`), so the zero-allocation contract
+holds; `Test_Unit_HotPath_Allocs` pins it.
+
+**The ordering is load-bearing**: anything reading the flag must read it from
+inside the callback, where the store has just happened. `iterate3` in
+`logfmt_swar_test.go` — the shim that puts the three-argument shape back for the
+differential fuzzer — is deliberately built that way, so the fuzzer exercises the
+ordering rather than bypassing it.
+
+Rejected while doing this: making the exported `Iterate` take the three-argument
+callback (removes the adapter, but breaks the public API for a smaller win than
+the out-param gives), and duplicating the parser (tried and rejected before, see
+below).
 
 ## How the general parser is optimized (logfmt.go)
 
@@ -410,6 +507,38 @@ parser; that has been tried and rejected (see below).
   `n-8` alone (without `i >= 0`) removes nothing and adds an op — which is
   exactly why the old "hoisted `lim := n - 8`" attempt measured worse (see
   Rejected, now superseded).
+- **Escaped quoted values are scanned by whichever of two scans suits them**
+  (2026-08-14). A quoted value is opened with a single `bytes.IndexByte` for the
+  closing quote plus a backward walk of the backslash run in front of it — one
+  call settles any value with no escaped quote, which is very nearly all of them,
+  and that path is untouched. Only when the walk comes back odd (the quote was
+  escaped) does anything new happen, and then the value is handed to one of:
+  - `scanQuotedEscapeDense` — a forward SWAR walk over `"` and `\` 8 bytes at a
+    time (`hasQuoteOrEsc`), stepping over each `\x` pair. Visits each byte once,
+    needs no backward re-walk, and pays no call per escape.
+  - `scanQuotedSparse` — `IndexByte` + backward parity walk in a loop, i.e.
+    exactly what the whole quoted path used to be.
+
+  Neither wins outright, and that is the entire point: `IndexByte` scans clean
+  bytes ~4.5x faster than the walk (26.5 vs 5.9 GB/s measured on arm64) but costs
+  roughly a call per escaped quote, so **the walk wins while escapes are closer
+  together than ~70 bytes and loses beyond that**. Picking wrong is expensive in
+  both directions — an early version that always walked was −55% on the
+  128-byte-apart row but **+49%** on the 128-byte-*spacing* row.
+- **The scan is chosen per value, from evidence that is already free.** On entry,
+  `i-1-vStart` is how far in the first escape was (`escGap`, 48 B); mid-value,
+  `escClean` (8) consecutive clean words hand back to `IndexByte`. `escGap` is
+  deliberately **below** `escClean*8` so the switch has hysteresis: a demotion
+  happens part-way along a gap, so the distance the next `IndexByte` reports is
+  only what *remained* of it, and reading that short measurement against the
+  threshold that caused the demotion promotes straight back and thrashes. With
+  both at 64 B that thrash cost +49% on `esc=8` instead of +8%.
+- **`scanQuotedEscapeDense` must stay call-free, and that is a hard requirement,
+  not tidiness.** No calls means leaf, means no frame and no stack-growth check.
+  Folding the `IndexByte` fallback into the same function instead of splitting it
+  out gave it a `$64` frame and cost **+10.9% on a short escaped value** — and
+  short is what most escaped values are. If you ever add a call in there, measure
+  `Benchmark_ParseEscaped_Mine` before and after.
 - **The backslash-run walk before a closing quote has no lower-bound guard**
   (2026-07-27 evening): `data[vStart-1]` is the opening quote, any earlier
   escaped quote inside the value is also `"`, and neither is a backslash, so
@@ -631,6 +760,48 @@ noisy). Each was **neutral or worse**:
     region. Revisit only with the prototype under differential fuzz and a
     control-clean series.
 
+- **2026-08-14 escape-scan pass — variants built, measured and rejected.** All
+  were correctness-verified and differential-fuzz-clean before losing; every
+  figure is n=5–6 interleaved pinned rounds against a clean control. They are
+  listed because each one looks like the obvious simplification of what landed:
+  - *Always walk once an escaped quote is seen* (no fallback at all): the
+    original shape of the idea, and the best numbers on dense input (esc=128
+    −53%, esc=500 −55%, GetMany −6.2%, LevelTS −7.8%) — but **+52% on `esc=8`**,
+    where escapes sit 128 B apart and the SWAR walk crawls over the clean
+    stretches that `IndexByte` vectorises. Any "just always use the fast scan"
+    proposal here has to answer that row.
+  - *Bounded probe with a per-escape bail* (walk a few words, hand back on the
+    first clean word, re-decide next escape): thrashes. Near the crossover you
+    pay the probe AND the call on every escape. Demotion has to be sticky.
+  - *Thresholds at 32 B* (`escClean=4`): demotes `sample_big.txt`'s own
+    `message=` field, whose escapes are 38 B apart, and gives back nearly the
+    whole realistic win — GetMany −6.2% → −0.8%, LevelTS −7.8% → `~`. The real
+    sample line is the floor on `escGap`, and it is 38.
+  - *Passing the caller's `q` (the exact first-gap distance) instead of `vStart`*:
+    a strictly better classifier, and it lost anyway — **+2.3% on Iterate, +1.7%
+    on Extract**. `q` is dead by the call site whereas `vStart` is needed after
+    it, so `q` extends a live value across the backslash walk in the hot path.
+    Deriving the same reading from a value already live is free; adding one is
+    not. Generalises: prefer recomputing from something live over threading in
+    something dead.
+  - *Merging the fallback into the walk* (one function instead of two): +10.9% on
+    a short escaped value, from the `$64` frame and stack check the `IndexByte`
+    call forces on it. See the leaf requirement above.
+  - *Returning a single `int` with `^pos` encoding "handed back" instead of
+    `(int, bool)`*: tried purely to drop the frame to `$0`. It does not — the
+    frame stays `$16` (LR+FP, no actual spills) — so it bought nothing and cost
+    clarity.
+  - Still **unexplored** and plausible: consuming several matches from one SWAR
+    word before reloading (dense `\"` runs set 4 bits per word, and the walk
+    currently reloads for each), and re-promoting a value from the sparse scan
+    back to the walk when gaps close up again (dropped as unmeasured, so a value
+    with a long clean head and a dense JSON tail stays on `IndexByte` throughout).
+- **`Benchmark_Unescape` moves ±0.7% on changes that cannot touch it** (it calls
+  only `AppendUnescape`). Observed repeatedly across the 2026-08-14 series in both
+  directions. Treat sub-1% movement on that row as code layout, not signal — and
+  as a reminder that a p-value proves an effect is repeatable, not that it is
+  caused by the thing you changed.
+
 The parser is **memory-latency / per-field-overhead bound**, not scan-throughput
 bound. Further wins require an API change (non-callback) or accepting a
 correctness/maintainability cost. Don't chase sub-ns micro-ops; they read as
@@ -641,6 +812,20 @@ wins in `-count=1` runs but vanish when averaged.
 - **Differential fuzz** every parser change: `go test -run='^$'
   -fuzz=FuzzIterateAgainstRef -fuzztime=20s` (compares against a byte-by-byte
   reference). This has caught real bugs (SWAR borrow, inline-GetMany bare keys).
+- **If both sides live in the same package, benchmark them in ONE binary**
+  instead of A/B-ing two trees. That is how the `Iterate`-adapter cost was
+  finally pinned (2026-08-14) after a loaded machine had defeated the tree-based
+  attempt: `iterate` and `Iterate` differ by exactly the adapter, so two
+  benchmarks in one binary isolate it with nothing else able to vary — no tree
+  copies, no build skew, no run-order effect, and the numbers repeated to within
+  0.1%. Reach for this before the full harness whenever the change can be
+  expressed as two callable variants side by side.
+- **Know which machine you are on before trusting a threshold.** The A/A control
+  is not only a harness check, it is the reading that tells you how much
+  resolution you have: the Ryzen laptop drifts ~30% between sessions and ±8–16%
+  run to run, while the Azure arm64 VM used on 2026-08-14 held ±0–1% with a
+  −0.02% control geomean. Same discipline either way; very different conclusions
+  about whether a 1% row means anything.
 - **A/B with averaging**, not single runs: `-count=8 -benchtime=2s` and compare
   medians/means; ±3–4 ns is noise on this machine, and machine power-state
   drifts between sessions (absolute numbers shift ~30%).

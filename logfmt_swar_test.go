@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -101,6 +102,16 @@ func iterateRef(buf []byte, fn func(key, val []byte, quoted bool) bool) error {
 	return nil
 }
 
+// iterate3 puts the three-argument callback shape back on top of the parser's
+// two-argument one, so the differential comparison against iterateRef can stay
+// a straight pair-for-pair check. Reading q inside the closure is ordered: the
+// parser stores the quoted bit before every callback, which is the contract
+// GetQuoted depends on, so this shim exercises it rather than working around it.
+func iterate3(data []byte, fn func(k, v []byte, quoted bool) bool) error {
+	var q bool
+	return iterate(data, &q, func(k, v []byte) bool { return fn(k, v, q) })
+}
+
 // collectPairs records four facts per pair, not two. The key and value are the
 // obvious ones; the other two exist because comparing only string(k)/string(v)
 // makes the fuzzer blind to properties this package exports:
@@ -159,12 +170,44 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		`a="x\"y`,
 		`a="" b="x"z c=3`,
 		`a=1 b="\\" c="x`,
+		// Shapes that reach scanQuotedEscapeDense, the forward escape walk the
+		// quoted scan switches to at the FIRST escaped quote. Nothing else in
+		// this seed list gets past that switch with enough bytes left to run
+		// its SWAR loop, so without these CI only ever saw the scalar tail.
+		// Between them they cover every exit: a SWAR hit, the scalar tail, the
+		// ran-off-the-end return, a terminating quote and a backslash step that
+		// walks past the end.
+		`a="\"0123456789abcdef\"0123456789abcdef" b=2`,
+		`a="\"\"\"\"\"\"\"\"\"\"" b=2`,  // dense: escapes straddling every word
+		`a="\"aaaaaaaaaaaaaaaaaaaaaaaa`, // unterminated, long tail, SWAR path
+		`a="\"xy`,                       // unterminated, scalar tail
+		`a="\"x\`,                       // trailing lone backslash: i steps to n+1
+		`a="\"\\" b=2`,                  // escaped quote, escaped backslash, close
+		`a="\"\\\"\\" b=2`,
+		`a="\"" b=2`,
 	}
+	// Shapes built from the scan thresholds rather than written out, so they
+	// keep reaching the branch they are for if escGap or escClean move. These
+	// are the only seeds that get past the dense walk into the IndexByte
+	// fallback, in both its terminated and unterminated forms; without them the
+	// fallback is differentially untested. Test_Unit_QuotedEscapeScanPaths
+	// checks the same shapes for their values.
+	far := strings.Repeat("x", escGap+8)
+	long := strings.Repeat("y", escClean*8+16)
+	seeds = append(seeds,
+		`a="`+far+`\"z" b=2`,                   // sparse on arrival, terminated
+		`a="`+far+`\"mid\"end" b=2`,            // sparse, stepping over a second escape
+		`a="`+far+`\"zzz`,                      // sparse, never terminated
+		`a="`+far+`\"`,                         // sparse, resuming at exactly len(data)
+		`a="q\"`+long+`" b=2`,                  // dense, then demoted mid-value
+		`a="q\"`+long,                          // demoted, then never terminated
+		`a="`+strings.Repeat(`\"`, 40)+`" b=2`, // dense throughout
+	)
 	for _, s := range seeds {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, buf []byte) {
-		gotV, gotErr := collectPairs(iterate, buf)
+		gotV, gotErr := collectPairs(iterate3, buf)
 		wantV, wantErr := collectPairs(iterateRef, buf)
 		if (gotErr == nil) != (wantErr == nil) {
 			t.Fatalf("err mismatch: got %v want %v for %q", gotErr, wantErr, buf)
@@ -231,6 +274,14 @@ func Test_Unit_SWARMasks(t *testing.T) {
 			if got := firstStop(hasCtrlOrSpace(w)); got != want {
 				t.Fatalf("hasCtrlOrSpace: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
 			}
+
+			want = 8
+			if v == '"' || v == '\\' {
+				want = pos
+			}
+			if got := firstStop(hasQuoteOrEsc(w)); got != want {
+				t.Fatalf("hasQuoteOrEsc: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
 		}
 	}
 
@@ -252,6 +303,28 @@ func Test_Unit_SWARMasks(t *testing.T) {
 					if got := firstStop(hasCtrlOrSpace(w)); got != lo {
 						t.Fatalf("hasCtrlOrSpace: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
 					}
+				}
+			}
+		}
+	}
+
+	// Same "lower stop wins" property for hasQuoteOrEsc, plus the two shapes
+	// that actually manufacture a spurious bit there. hasQuoteOrEsc is a pair of
+	// equality tests, so the borrow that sets a false bit is the one out of a
+	// matched byte into a 0x01 above it: after the XOR that is '#' (0x22^0x23)
+	// sitting above a '"', and ']' (0x5c^0x5d) sitting above a '\\'. Both must
+	// stay invisible, because the true match below them is the one reported.
+	for lo := 0; lo < 8; lo++ {
+		for hi := lo + 1; hi < 8; hi++ {
+			for _, pair := range [][2]byte{
+				{'"', '\\'}, {'\\', '"'}, {'"', '"'}, {'\\', '\\'},
+				{'"', '#'}, {'\\', ']'}, {'"', ']'}, {'\\', '#'},
+			} {
+				buf := []byte("aaaaaaaa")
+				buf[lo], buf[hi] = pair[0], pair[1]
+				w := binary.LittleEndian.Uint64(buf)
+				if got := firstStop(hasQuoteOrEsc(w)); got != lo {
+					t.Fatalf("hasQuoteOrEsc: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
 				}
 			}
 		}
