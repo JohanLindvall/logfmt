@@ -102,6 +102,93 @@ func Test_Unit_LogFmt_Values(t *testing.T) {
 	}
 }
 
+// Test_Unit_Quoted_EscapeDense_Scan pins the two-mode quoted-value scan: the
+// bytes.IndexByte mode that a value with no escaped quote never leaves, the
+// inline SWAR mode that an escape-dense one switches to, and — the part nothing
+// else covers — both transitions between them. The transitions are where the
+// bugs live: the scan changes mode mid-value, so each mode has to be able to
+// pick up from wherever the other left off, and the hand-back can be reached
+// with the scan already one byte past the end of the input.
+func Test_Unit_Quoted_EscapeDense_Scan(t *testing.T) {
+	// Longer than denseGap, so a gap spanning it flips the scan's mode.
+	long := strings.Repeat("x", denseGap+8)
+
+	for _, tt := range []struct {
+		name    string
+		line    string
+		raw     string // the value as Iterate reports it, escapes intact
+		decoded string // the same value as AppendValue reports it
+	}{{
+		name:    "dense throughout",
+		line:    `msg="{\"user\":\"bob\",\"id\":42}" next=ok`,
+		raw:     `{\"user\":\"bob\",\"id\":42}`,
+		decoded: `{"user":"bob","id":42}`,
+	}, {
+		name:    "escaped backslash reached from dense mode",
+		line:    `msg="x\"y\\" next=ok`,
+		raw:     `x\"y\\`,
+		decoded: `x"y\`,
+	}, {
+		// Escapes seven bytes apart, so a backslash and the quote it protects
+		// straddle two SWAR word loads.
+		name:    "escape pair straddling a word",
+		line:    `msg="aaaaaaa\"aaaaaaa\"aaaaaaa\"" next=ok`,
+		raw:     `aaaaaaa\"aaaaaaa\"aaaaaaa\"`,
+		decoded: `aaaaaaa"aaaaaaa"aaaaaaa"`,
+	}, {
+		name:    "dense, then gaps open up",
+		line:    `msg="\"` + long + `\"yy" next=ok`,
+		raw:     `\"` + long + `\"yy`,
+		decoded: `"` + long + `"yy`,
+	}, {
+		name:    "sparse, then escapes bunch up",
+		line:    `msg="` + long + `\"\"\"" next=ok`,
+		raw:     long + `\"\"\"`,
+		decoded: long + `"""`,
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			line := []byte(tt.line)
+			if err := Validate(line); err != nil {
+				t.Fatalf("Validate: unexpected error: %v", err)
+			}
+			got, quoted, ok := GetQuoted(line, "msg")
+			if !ok || !quoted {
+				t.Fatalf("GetQuoted: got ok=%v quoted=%v, want both true", ok, quoted)
+			}
+			if string(got) != tt.raw {
+				t.Errorf("raw value:\n got  %q\n want %q", got, tt.raw)
+			}
+			if dec, _ := AppendValue(nil, line, "msg"); string(dec) != tt.decoded {
+				t.Errorf("decoded value:\n got  %q\n want %q", dec, tt.decoded)
+			}
+			// The pair after it must still be found, which is the check that
+			// the scan stopped on the right quote rather than one further on.
+			if v, _ := Get(line, "next"); string(v) != "ok" {
+				t.Errorf("next: got %q, want \"ok\"", v)
+			}
+		})
+	}
+
+	// Malformed shapes that only the dense mode can reach.
+	for _, tt := range []struct{ name, line string }{{
+		name: "unterminated after switching to dense",
+		line: `msg="\"` + long + `\"yy`,
+	}, {
+		// The escape runs off the end while the scan is in dense mode, which
+		// steps two bytes at a time and so lands PAST the end rather than on
+		// it. Handing that back to the IndexByte mode used to panic.
+		name: "trailing lone backslash in dense mode",
+		line: `msg="\"` + long + `\`,
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Validate([]byte(tt.line))
+			if !errors.Is(err, ErrBadFormat) {
+				t.Fatalf("Validate: got %v, want ErrBadFormat", err)
+			}
+		})
+	}
+}
+
 func Test_Unit_LogFmt_Values_Invalid(t *testing.T) {
 	for i, tt := range []string{
 		`foo="bar"xx`,

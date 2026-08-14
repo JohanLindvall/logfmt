@@ -150,6 +150,38 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		// quoted flag collectPairs records is what keeps this distinct from the
 		// quoted seeds above.
 		`path=C:\Users\bob re=\d+\s`,
+		// Escape-DENSE quoted values, which are what switches a value over to
+		// the SWAR escape scan. No seed above reaches it: each carries at most
+		// one escaped quote, near the end of a short value, so the scan's word
+		// loop, its skip-two step and its own unterminated exit were all
+		// seed-unreachable — and CI runs seeds, not a corpus. Embedded JSON is
+		// the shape that hits this hardest in the wild.
+		`msg="a\"bbbbbbbbbbbbbbbbbbbb\"ccccccccccccccccc\"d" next=ok`,
+		`json="{\"user\":\"bob\",\"id\":42,\"ok\":true}" level=info`,
+		// Gaps of seven bytes, so an escape pair straddles two SWAR loads: the
+		// backslash is the last byte of one word and the quote it protects is
+		// the first byte of the next, where a scan that forgot the pair was
+		// split would read that quote as the closing one.
+		`k="aaaaaaa\"aaaaaaa\"aaaaaaa\"aaaaaaa\"" trailing=1`,
+		// Gaps of six, for the same pair landing wholly inside one word.
+		`k="aaaaaa\"aaaaaa\"aaaaaa\"aaaaaa\"" trailing=1`,
+		// An escaped backslash reached from inside the scan: skipping two lands
+		// on the following quote, which must then read as the CLOSING quote.
+		`a="x\"y\\" b=2`,
+		// The two mode TRANSITIONS, which nothing else here reaches. A value
+		// that starts dense and then opens up hands the scan back to
+		// bytes.IndexByte mid-value; the second seed does that with the escape
+		// running off the end of the input, which is the shape that panicked
+		// (the hand-back left i at n+1 and the outer data[i:] is a slice, not a
+		// lookup — it does not fail to match, it crashes).
+		`a="\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"yy" b=2`,
+		`a="\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\`,
+		// Unterminated after the switch — the escape scan has its own exit for
+		// that, distinct from the first probe's.
+		`a="x\"yyyyyyyyyyyyyyyyyyyyyyyy`,
+		// A trailing lone backslash in escape mode, where skipping two steps
+		// clean over the end of the input rather than landing on it.
+		`a="x\"y\`,
 		// Malformed shapes. Until these were added no seed reached an error path
 		// at all, so on CI — which runs seeds, not a corpus — the entire error
 		// space of iterate went unexercised. The pair comparison below runs on
@@ -231,6 +263,14 @@ func Test_Unit_SWARMasks(t *testing.T) {
 			if got := firstStop(hasCtrlOrSpace(w)); got != want {
 				t.Fatalf("hasCtrlOrSpace: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
 			}
+
+			want = 8
+			if v == '"' || v == '\\' {
+				want = pos
+			}
+			if got := firstStop(hasQuoteOrEsc(w)); got != want {
+				t.Fatalf("hasQuoteOrEsc: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
 		}
 	}
 
@@ -252,6 +292,21 @@ func Test_Unit_SWARMasks(t *testing.T) {
 					if got := firstStop(hasCtrlOrSpace(w)); got != lo {
 						t.Fatalf("hasCtrlOrSpace: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
 					}
+				}
+			}
+
+			// Same property for the escape scan, whose two terms are exact
+			// equalities rather than ranges: a '\\' immediately before a '"'
+			// is the shape it walks through constantly, and reading anything
+			// but the lower stop would end the value at the wrong byte.
+			for _, pair := range [][2]byte{
+				{'"', '\\'}, {'\\', '"'}, {'"', '"'}, {'\\', '\\'},
+			} {
+				buf := []byte("aaaaaaaa")
+				buf[lo], buf[hi] = pair[0], pair[1]
+				w := binary.LittleEndian.Uint64(buf)
+				if got := firstStop(hasQuoteOrEsc(w)); got != lo {
+					t.Fatalf("hasQuoteOrEsc: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
 				}
 			}
 		}

@@ -62,12 +62,50 @@ const (
 	swarHi = 0x8080808080808080 // 0x80 in every byte
 )
 
+// denseGap is the gap between escaped quotes, in bytes, at or below which the
+// quoted value scan switches from bytes.IndexByte to the inline SWAR scan, and
+// above which it switches back. One SWAR word.
+//
+// It is measured, and the measurement is not the obvious one. On the synthetic
+// sweep alone a much wider threshold looks better: at 32 it also catches
+// Benchmark_IterateEscaped's 32-byte-gap case for a further −9.4%. But the same
+// setting sent the bench module's realistic escaped line (four escapes, gaps of
+// 18/2/2/9) into the dense scan and cost it 7.3%, because that value has too
+// few escapes to amortise entering the mode at all. Dropping to one word gives
+// up the synthetic case, returns the realistic line to parity, and keeps the
+// full −33% where the escapes are actually dense. It is the same trade the
+// 2026-07-27 pass made against DecodeKeyval: the realistic suite wins.
+//
+// Both ends of the switch use it, and they have to agree: a value whose escapes
+// sit exactly denseGap apart must not enter dense mode only to hand itself
+// straight back, paying both scans for every escape. The entry test measures
+// the gap to the quote and the exit test measures the whole step over the
+// escape pair, which is why the exit is the strictly-greater one.
+const denseGap = 8
+
 // hasCtrlOrSpace flags every byte of w that is <= 0x20. This covers all logfmt
 // whitespace ('\t'..'\r' and ' '); the only other bytes it flags are control
 // bytes 0x00..0x08 and 0x0E..0x1F, which the caller rules out by re-checking
 // the located byte. UTF-8 continuation/lead bytes (>= 0x80) are never flagged.
 func hasCtrlOrSpace(w uint64) uint64 {
 	return (w - swarLo*0x21) &^ w & swarHi
+}
+
+// hasQuoteOrEsc flags every byte of w that is '"' or '\\'. It is used only once
+// a quoted value is known to contain an escaped quote, where the two bytes
+// together are what drives the scan: a '\\' means "skip the next byte", a '"'
+// means the value ends here.
+//
+// Unlike the two masks around it these are exact equalities, so the terms
+// cannot share a subtrahend the way hasKeyStop's do; each is the classic
+// "does any byte equal zero" test applied to w XOR-ed with a broadcast of the
+// byte being sought. They are still only OR-ed together, never subtracted, so
+// the borrow caveat above stays harmless: every spurious high bit sits above a
+// true match, and only the lowest set bit is ever read.
+func hasQuoteOrEsc(w uint64) uint64 {
+	q := w ^ (swarLo * '"')
+	e := w ^ (swarLo * '\\')
+	return ((q-swarLo)&^q | (e-swarLo)&^e) & swarHi
 }
 
 // hasKeyStop flags every byte of w that can end a key: '=' or <= 0x20. It is
@@ -249,9 +287,30 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 			quoted = true
 			i++
 			vStart = i
+
+			// Finding the closing quote runs in two modes, because no single
+			// scan wins on both shapes of quoted value.
+			//
+			// bytes.IndexByte is SIMD and unbeatable on a clean span — one
+			// call, one scan, done — and that is what a quoted value almost
+			// always is. What it is bad at is an escape-DENSE value, where
+			// every escaped quote restarts the non-inlinable call over a span
+			// one or two bytes long, so the cost becomes O(escapes) calls
+			// instead of O(bytes/8) inline steps. Embedded JSON is exactly that
+			// shape — every quote in it arrives as \" — and it is the commonest
+			// hard case in real logfmt.
+			//
+			// So: start in IndexByte mode, and switch to the inline SWAR scan
+			// only once an escape has been seen AND the gap that preceded it
+			// was short enough for the call overhead to dominate; switch back
+			// as soon as the gaps grow again. Measured on 1 KB values
+			// (Benchmark_IterateEscaped): −33% at 8-byte gaps, −33% at 2-byte
+			// ones, and at 128-byte gaps +2.5%, which is one compare per
+			// escaped quote and the whole price of the mode test. A value with
+			// no escaped quote in it never even reaches that compare.
 			for {
 				q := bytes.IndexByte(data[i:], '"')
-				if q == -1 {
+				if q < 0 {
 					// vStart is just past the opening quote, which is the
 					// position worth reporting.
 					return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
@@ -260,33 +319,53 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 
 				// Determine whether this quote is escaped by counting the
 				// run of backslashes immediately preceding it: an odd count
-				// means the quote is escaped and we keep scanning. The walk
+				// means the quote is escaped and the scan goes on. The walk
 				// needs no lower-bound guard: data[vStart-1] is the opening
 				// quote (this path is entered only via '=' then '"'), any
 				// earlier escaped quote inside the value is also '"', and
 				// neither is a backslash, so the run always stops on its own.
 				// bs&1 rather than bs%2 spares the signed-modulo dance the
 				// compiler emits when it cannot prove bs >= 0 across the loop.
+				// Parity is a purely local property of the bytes before the
+				// quote, which is why the two modes can hand the scan back and
+				// forth mid-value without agreeing on where it started.
 				bs := 0
 				for j := i - 1; data[j] == '\\'; j-- {
 					bs++
 				}
-				if bs&1 == 1 {
-					i++
-					continue
+				if bs&1 == 0 {
+					break // unescaped: this is the closing quote
+				}
+				i++
+				if q > denseGap {
+					continue // escapes are far apart; IndexByte still wins
 				}
 
-				vEnd = i
-				i++
-				if i < n {
-					// ' ' first: the usual delimiter short-circuits past
-					// the isSpace test.
-					if c := data[i]; c != ' ' && !isSpace(c) {
-						return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
-					}
-					i++
+				// Escape-dense from here. The scan itself lives in its own
+				// function rather than inline, and that is a measured choice,
+				// not a stylistic one: inlining it grew iterate by enough to
+				// cost GetMany ~5% and Extract ~3% — benchmarks that never
+				// reach this code at all — while the call it replaces is paid
+				// once per dense value rather than once per escape.
+				var closed bool
+				if i, closed = scanEscapeDense(data, i); closed {
+					break
 				}
-				break
+				if uint(i) >= uint(n) {
+					return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
+				}
+				// Otherwise the gaps opened up and the scan was handed back.
+			}
+
+			vEnd = i
+			i++
+			if i < n {
+				// ' ' first: the usual delimiter short-circuits past
+				// the isSpace test.
+				if c := data[i]; c != ' ' && !isSpace(c) {
+					return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
+				}
+				i++
 			}
 		} else {
 			vStart = i
@@ -323,6 +402,72 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 	}
 
 	return nil
+}
+
+// scanEscapeDense finds the closing quote of a quoted value that has turned out
+// to be escape-dense, scanning a word at a time inline instead of restarting
+// bytes.IndexByte at every escape. It is entered with i just past an escaped
+// quote — a position that cannot itself be inside an escape sequence — which is
+// what lets it step over two bytes at a '\\' and never walk a backslash run
+// again: stepping over the pair IS the run-parity rule, since `\\` lands on the
+// following quote and reports it unescaped while `\"` steps past it.
+//
+// It returns where it stopped and whether that is the closing quote. There are
+// three ways to stop, which those two values tell apart:
+//
+//   - the closing quote, at i < n, closed true;
+//   - the gaps between escapes grew past denseGap, at i < n, closed false — the
+//     caller hands the rest of the value back to bytes.IndexByte, which wins
+//     again once there are enough bytes between calls to pay for one;
+//   - the input ran out, at i >= n, closed false: the value is unterminated.
+//     i can be n+1 here, because the step over an escape pair may cross the end.
+func scanEscapeDense(data []byte, i int) (int, bool) {
+	// n is derived here rather than passed: the caller's n IS len(data), and
+	// spelling it that way inside this function is what lets the prove pass
+	// relate i to the slice at all. Passed in as a plain int it cannot, and
+	// every access below — the word load included — keeps a bounds check.
+	n := len(data)
+	for {
+		// Both of this loop's bounds are spelled unsigned, and iterate's loop
+		// heads explain why: it reads "i >= n" (i is never negative) while also
+		// handing the prove pass the i >= 0 fact — which the n+1 step at the
+		// bottom otherwise destroys, taking every bounds-check elimination in
+		// this loop with it, the word load's included. The pair is what keeps
+		// this scan checked as lightly as the other two; neither half does it
+		// alone.
+		if uint(i) >= uint(n) {
+			return i, false
+		}
+		dStart := i
+		for i <= n-8 {
+			w := binary.LittleEndian.Uint64(data[i : i+8])
+			if m := hasQuoteOrEsc(w); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				break
+			}
+			i += 8
+		}
+		// Reached both on a SWAR hit, where it exits at once because the stop
+		// byte fails both tests, and on the final fewer-than-8 bytes.
+		for uint(i) < uint(n) && data[i] != '"' && data[i] != '\\' {
+			i++
+		}
+		if uint(i) >= uint(n) {
+			return i, false // nothing left that could close the value
+		}
+		if data[i] == '"' {
+			return i, true
+		}
+		i += 2 // '\\': step over it and the byte it escapes
+		if i-dStart > denseGap && i < n {
+			// The i < n half is not redundant: the step above can leave i at
+			// n+1, where the caller's bytes.IndexByte(data[i:]) does not merely
+			// fail to match but panics. Staying in the loop sends that case to
+			// the check at the top instead, which reports it as the
+			// unterminated value it is.
+			return i, false
+		}
+	}
 }
 
 // AppendUnescape decodes the backslash escapes in a raw logfmt value, appends

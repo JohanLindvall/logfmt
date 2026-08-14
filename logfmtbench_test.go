@@ -61,21 +61,52 @@ func Benchmark_Unescape(b *testing.B) {
 func Benchmark_IterateEscaped(b *testing.B) {
 	const width = 1024
 	for _, esc := range []int{0, 8, 32, 128, 500} {
-		payload := make([]byte, 0, width)
-		for len(payload) < width {
-			if esc > 0 && len(payload)*esc/width < (len(payload)+2)*esc/width {
-				payload = append(payload, '\\', '"')
-			} else {
-				payload = append(payload, 'a')
-			}
-		}
-		line := append(append([]byte(`msg="`), payload[:width]...), '"')
+		payload := escapedPayload(width, esc)
+		line := append(append([]byte(`msg="`), payload...), '"')
 		b.Run(fmt.Sprintf("esc=%d", esc), func(b *testing.B) {
 			b.SetBytes(int64(len(line)))
 			for i := 0; i < b.N; i++ {
 				if err := Iterate(line, func(k, v []byte) bool { return true }); err != nil {
 					b.Fatalf("unexpected error: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// escapedPayload builds width bytes carrying esc escaped quotes, spread evenly.
+// Shared by the two density sweeps so they measure the same shape at the same
+// densities: one parses it, the other decodes it, and their numbers are only
+// comparable if the bytes are.
+func escapedPayload(width, esc int) []byte {
+	payload := make([]byte, 0, width)
+	for len(payload) < width {
+		if esc > 0 && len(payload)*esc/width < (len(payload)+2)*esc/width {
+			payload = append(payload, '\\', '"')
+		} else {
+			payload = append(payload, 'a')
+		}
+	}
+	return payload[:width]
+}
+
+// Benchmark_UnescapeEscaped sweeps escape density for the DECODE half of the
+// package, which Benchmark_Unescape (2 escapes in 130 bytes) cannot show any
+// more than sample2 could show it for the parse half.
+//
+// AppendUnescape restarts bytes.IndexByte at every escape, so like the quoted
+// value scan its cost is O(escapes) non-inlinable calls rather than O(bytes) of
+// copying — and the same input drives both, since a value dense enough to be
+// worth this benchmark is one whose escapes the parser just had to scan past.
+func Benchmark_UnescapeEscaped(b *testing.B) {
+	const width = 1024
+	for _, esc := range []int{0, 8, 32, 128, 500} {
+		payload := escapedPayload(width, esc)
+		dst := make([]byte, 0, width)
+		b.Run(fmt.Sprintf("esc=%d", esc), func(b *testing.B) {
+			b.SetBytes(int64(len(payload)))
+			for i := 0; i < b.N; i++ {
+				dst = AppendUnescape(dst[:0], payload)
 			}
 		})
 	}
