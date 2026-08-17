@@ -70,6 +70,35 @@ func hasCtrlOrSpace(w uint64) uint64 {
 	return (w - swarLo*0x21) &^ w & swarHi
 }
 
+// hasBackslash flags every byte of w that is '\\': the classic has-zero-byte
+// test applied to w XOR-ed with the broadcast byte. AppendUnescape uses it to
+// find the next escape of an escape-dense value without another IndexByte call.
+func hasBackslash(w uint64) uint64 {
+	b := w ^ (swarLo * '\\')
+	return (b - swarLo) &^ b & swarHi
+}
+
+// hasQuoteOrBackslash flags every byte of w that is '"' or '\\', for the
+// escape-dense quoted-value scan. Two has-zero-byte tests OR-ed together; the
+// OR keeps the borrow caveat above harmless, so the lowest set bit is always a
+// genuine match.
+func hasQuoteOrBackslash(w uint64) uint64 {
+	q := w ^ (swarLo * '"')
+	b := w ^ (swarLo * '\\')
+	return (((q - swarLo) &^ q) | ((b - swarLo) &^ b)) & swarHi
+}
+
+// escWindow is how many quiet 8-byte words the escape-dense scans (the quoted
+// branch of iterate, and AppendUnescape) tolerate before handing back to
+// bytes.IndexByte. Escapes in real input come in clusters — every '"' of a JSON
+// document embedded in a msg= field is one — and within a cluster the next
+// event is nearly always inside the next couple of words, where an inlined SWAR
+// step beats a fresh IndexByte call by an order of magnitude; past the cluster
+// IndexByte's wider stride wins again. Measured at 2, 4 and 8: 2 drops JSON
+// string values longer than 16 bytes back to IndexByte every time, 8 makes
+// sparse values pay for nothing.
+const escWindow = 4
+
 // hasKeyStop flags every byte of w that can end a key: '=' or <= 0x20. It is
 // two "<= 0x20" tests OR-ed together, with everything they share factored out.
 //
@@ -120,16 +149,27 @@ func hasKeyStop(w uint64) uint64 {
 // on well-formed input; a returned SyntaxError is the only allocation it can
 // make.
 func Iterate(data []byte, fn func(key, val []byte) bool) error {
-	return iterate(data, func(key, val []byte, _ bool) bool { return fn(key, val) })
+	var quoted bool // set by iterate; this callback signature has no room for it
+	return iterate(data, &quoted, fn)
 }
 
 // iterate is the parser; every exported entry point funnels through it. It
 // reports one fact Iterate's callback signature has no room for: whether the
 // value came from a double-quoted token, which is the only position where a
-// backslash escape means anything. The lookups take that bit straight from here
-// rather than guessing at it afterwards, which is what stops AppendValue from
-// "decoding" a Windows path.
-func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
+// backslash escape means anything. The lookups take that bit straight from
+// here rather than guessing at it afterwards, which is what stops AppendValue
+// from "decoding" a Windows path.
+//
+// The reporting protocol is deliberately lopsided: iterate sets *quoted to true
+// just before delivering a quoted value and never clears it, so a caller that
+// wants the bit reads and resets it inside its callback (GetQuoted does; so
+// does the fuzz reference), and everyone else hands in a throwaway. That keeps
+// the common unquoted path free of any store. The alternatives both measured
+// worse on Neoverse N2: storing the bit before every callback cost GetMany
+// +1.8%, and the earlier design — a three-argument callback with a closure
+// adapting Iterate's two-argument one — cost an extra indirect call per field
+// (+2.3% Iterate, +4.4% LevelTS).
+func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 	// cap == len stops a callback's append reaching past the end of the record
 	// — a tightening of the read-only contract, never a loosening — for one
 	// instruction once per call. (Its original bounds-check role is now played
@@ -162,15 +202,11 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 		// which keyBare handles once, off the hot path.
 		kStart := i
 		// Declared up here so the gotos, which jump forward, skip no declaration.
-		// quoted re-zeroes every iteration by virtue of being declared inside the
-		// loop body; only the quoted branch below ever sets it.
 		var kEnd, vStart, vEnd int
-		var quoted bool
 
 		for i <= n-8 {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
-			m := hasKeyStop(w)
-			if m != 0 {
+			if m := hasKeyStop(w); m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
 				// '=' first: keys overwhelmingly end there. Each stop byte
 				// jumps straight to the label that already knows both what was
@@ -193,7 +229,7 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 
 		if i >= n {
 			if kStart < n {
-				fn(data[kStart:n], trueSlice, false)
+				fn(data[kStart:n], trueSlice)
 			}
 			return nil
 		}
@@ -213,7 +249,7 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 			}
 			continue
 		}
-		if !fn(data[kStart:i], trueSlice, false) {
+		if !fn(data[kStart:i], trueSlice) {
 			return nil
 		}
 		i++ // step past the separator the key stopped on
@@ -226,7 +262,7 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 		vStart, vEnd = i, i
 
 		if i >= n {
-			fn(data[kStart:kEnd], data[vStart:vEnd], false)
+			fn(data[kStart:kEnd], data[vStart:vEnd])
 			return nil
 		}
 
@@ -246,7 +282,7 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 		// leaves vEnd == vStart — the same empty value, one branch and one
 		// isSpace cheaper on every field.
 		if data[i] == '"' {
-			quoted = true
+			*quoted = true
 			i++
 			vStart = i
 			for {
@@ -271,29 +307,57 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 				for j := i - 1; data[j] == '\\'; j-- {
 					bs++
 				}
-				if bs&1 == 1 {
-					i++
-					continue
+				if bs&1 == 0 {
+					break // an unescaped quote: the value ends here
 				}
 
-				vEnd = i
+				// An escaped quote. Each one costs a fresh, non-inlinable
+				// IndexByte call plus the walk above, so a value dense with
+				// them — JSON in a msg= field turns every '"' into \" —
+				// used to run at roughly one call per two bytes. Instead
+				// scan forward a word at a time for the next '"' or '\\',
+				// consuming every backslash together with the byte it
+				// escapes; a '"' reached this way is unescaped by
+				// construction and needs no walk. After escWindow quiet
+				// words the value has gone sparse again and IndexByte takes
+				// over from a fresh position (the walk is context-free, so
+				// nothing needs to be carried across).
 				i++
-				if i < n {
-					// ' ' first: the usual delimiter short-circuits past
-					// the isSpace test.
-					if c := data[i]; c != ' ' && !isSpace(c) {
-						return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
+				for quiet := 0; quiet < escWindow && i <= n-8; {
+					w := binary.LittleEndian.Uint64(data[i : i+8])
+					m := hasQuoteOrBackslash(w)
+					if m == 0 {
+						i += 8
+						quiet++
+						continue
 					}
-					i++
+					i += bits.TrailingZeros64(m) >> 3
+					if data[i] == '"' {
+						goto closingQuote
+					}
+					i += 2 // the backslash and whatever it escapes
+					quiet = 0
 				}
-				break
+				// A trailing backslash may have stepped one past the end;
+				// IndexByte then reports the value unterminated, as it is.
+				i = min(i, n)
+			}
+		closingQuote:
+			vEnd = i
+			i++
+			if i < n {
+				// ' ' first: the usual delimiter short-circuits past the
+				// isSpace test.
+				if c := data[i]; c != ' ' && !isSpace(c) {
+					return &SyntaxError{Offset: i, Reason: "unexpected byte after closing quote"}
+				}
+				i++
 			}
 		} else {
 			vStart = i
 			for i <= n-8 {
 				w := binary.LittleEndian.Uint64(data[i : i+8])
-				m := hasCtrlOrSpace(w)
-				if m != 0 {
+				if m := hasCtrlOrSpace(w); m != 0 {
 					i += bits.TrailingZeros64(m) >> 3
 					// ' ' first: it is the usual value delimiter, so the cheap
 					// compare short-circuits past the isSpace test.
@@ -317,7 +381,7 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 			i++
 		}
 
-		if !fn(data[kStart:kEnd], data[vStart:vEnd], quoted) {
+		if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
 			return nil
 		}
 	}
@@ -348,14 +412,35 @@ func iterate(data []byte, fn func(key, val []byte, quoted bool) bool) error {
 // unconditionally, since most values contain no escapes at all.
 func AppendUnescape(dst []byte, raw []byte) []byte {
 	i, n := 0, len(raw)
+	// dense is set once an escape has been decoded: the next one is then
+	// probably close (every '"' of embedded JSON is one), and a few inlined
+	// SWAR steps find it for less than a fresh bytes.IndexByte call costs. Past
+	// escWindow quiet words IndexByte takes over, exactly as in the parser.
+	dense := false
 	for i < n {
-		q := bytes.IndexByte(raw[i:], '\\')
-		if q < 0 {
-			// no more escapes
-			return append(dst, raw[i:]...)
+		j := -1 // index of the next backslash, once found
+		s := i  // scan position; raw[i:s] is known to hold none
+		if dense {
+			for quiet := 0; quiet < escWindow && s <= n-8; quiet++ {
+				w := binary.LittleEndian.Uint64(raw[s : s+8])
+				if m := hasBackslash(w); m != 0 {
+					j = s + bits.TrailingZeros64(m)>>3
+					break
+				}
+				s += 8
+			}
 		}
-		dst = append(dst, raw[i:i+q]...)
-		i += q + 1
+		if j < 0 {
+			q := bytes.IndexByte(raw[s:], '\\')
+			if q < 0 {
+				// no more escapes
+				return append(dst, raw[i:]...)
+			}
+			j = s + q
+		}
+		dst = append(dst, raw[i:j]...)
+		i = j + 1
+		dense = true
 		if i < n {
 			next := raw[i]
 			i++
@@ -555,20 +640,25 @@ func Get(data []byte, key string) ([]byte, bool) {
 // Everything else — aliasing, capping, duplicate resolution, the absence of
 // syntax errors — is exactly as described on Get.
 func GetQuoted(data []byte, key string) (val []byte, quoted, found bool) {
-	_ = iterate(data, func(k, v []byte, q bool) bool {
+	// iterate sets q before delivering a quoted value and never clears it, so
+	// the callback consumes the flag: read it, then reset it for the next pair.
+	var q bool
+	_ = iterate(data, &q, func(k, v []byte) bool {
+		wasQuoted := q
+		q = false
 		if string(k) != key {
 			return true
 		}
 		// cap == len, so a caller's append cannot reach into data.
 		if len(v) > 0 {
-			val, quoted, found = v[:len(v):len(v)], q, true
+			val, quoted, found = v[:len(v):len(v)], wasQuoted, true
 			return false // settled: first non-empty occurrence wins
 		}
 		if !found {
 			// Provisional empty; keep looking for a non-empty one. Slicing a
 			// non-nil slice keeps it non-nil even at zero length, so a
 			// present-but-empty value stays distinct from an absent key.
-			val, quoted, found = v[:len(v):len(v)], q, true
+			val, quoted, found = v[:len(v):len(v)], wasQuoted, true
 		}
 		return true
 	})
@@ -626,7 +716,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	clear(buf)
 
 	remaining := n
-	_ = iterate(data, func(k, v []byte, _ bool) bool {
+	var quoted bool // throwaway: GetMany hands out raw values without the bit
+	_ = iterate(data, &quoted, func(k, v []byte) bool {
 		for j := range keys {
 			// Length check first: a key already settled with a non-empty value
 			// short-circuits cheaply on every later field, skipping the key
@@ -657,7 +748,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 // Validate when a record's validity matters, and errors.Is(err, ErrBadFormat)
 // or a *SyntaxError type assertion to inspect the result.
 func Validate(data []byte) error {
-	return iterate(data, func(key, val []byte, quoted bool) bool { return true })
+	var quoted bool // throwaway
+	return iterate(data, &quoted, func(key, val []byte) bool { return true })
 }
 
 // All returns an iterator over data's key/value pairs, for use with range:
@@ -679,7 +771,8 @@ func Validate(data []byte) error {
 // to know; use Iterate to get the error and the pairs in one pass.
 func All(data []byte) func(yield func(key, val []byte) bool) {
 	return func(yield func(key, val []byte) bool) {
-		_ = iterate(data, func(key, val []byte, _ bool) bool { return yield(key, val) })
+		var quoted bool // throwaway; a range loop has no room for the bit either
+		_ = iterate(data, &quoted, yield)
 	}
 }
 

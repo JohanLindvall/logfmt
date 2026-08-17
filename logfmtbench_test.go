@@ -81,6 +81,41 @@ func Benchmark_IterateEscaped(b *testing.B) {
 	}
 }
 
+// sampleJSONMsg is the commonest hard shape in real logfmt: a structured event
+// serialised into a msg= field by an encoder that escapes every inner quote.
+// It is what the escape-dense scan in the parser (and the matching one in
+// AppendUnescape) exists for; the density here — one escape per ~7 bytes — is
+// between the esc=128 and esc=500 rows of the synthetic sweep above.
+var sampleJSONMsg = []byte(`time=2025-01-01T00:00:00Z level=info msg="{\"level\":\"info\",\"ts\":\"2025-01-01T00:00:00Z\",\"caller\":\"server/handler.go:42\",\"msg\":\"request completed\",\"user\":\"bob\",\"path\":\"/api/v1/users\",\"status\":200,\"duration_ms\":12.4}" request_id=abc123`)
+
+func Benchmark_IterateJSONMsg(b *testing.B) {
+	b.SetBytes(int64(len(sampleJSONMsg)))
+	for i := 0; i < b.N; i++ {
+		if err := Iterate(sampleJSONMsg, func(k, v []byte) bool { return true }); err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+// Benchmark_UnescapeJSONMsg decodes the msg value of sampleJSONMsg — the step
+// a consumer of embedded JSON cannot skip, and one that used to cost more than
+// parsing the whole line.
+func Benchmark_UnescapeJSONMsg(b *testing.B) {
+	raw, quoted, ok := GetQuoted(sampleJSONMsg, "msg")
+	if !ok || !quoted {
+		b.Fatal("msg not found or not quoted")
+	}
+	dst := make([]byte, 0, len(raw))
+	b.SetBytes(int64(len(raw)))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		dst = AppendUnescape(dst[:0], raw)
+	}
+	if len(dst) == 0 {
+		b.Fatal("empty decode")
+	}
+}
+
 // go test -bench=Benchmark_DecodeKeyval -benchmem -memprofile memprofile.out -cpuprofile profile.out -benchtime=30s
 // Benchmark_DecodeKeyval-22           2197            549836 ns/op         909.36 MB/s       40000 B/op      10000 allocs/op
 func Benchmark_DecodeKeyval_Custom(b *testing.B) {

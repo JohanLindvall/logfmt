@@ -35,19 +35,33 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   `gotErr == nil &&` guard discarded the check on ~12% of short inputs, i.e. the
   whole quoted-value error region), and it carries malformed seeds — before those
   were added, **no seed reached an error path at all**, so CI, which runs seeds
-  rather than a corpus, never exercised it. Also `Test_Unit_SWARMasks`
-  (exhaustive: every byte value in every lane, for both masks, plus "the lower of
-  two stops wins") and `Test_Unit_IsSpace`. `isSpace` needs its own test
-  precisely *because* the reference above shares it — a bug there cancels out and
-  the fuzzer sees nothing.
+  rather than a corpus, never exercised it. Since 2026-08-17 it also carries
+  escape-dense seeds (JSON in `msg=`, backslash runs of both parities before a
+  quote, an escaping backslash as the last byte of an 8-byte word and as the
+  last byte of the input) for the SWAR follow-up scan in the quoted branch, and
+  drives the parser through `iterateQ`, the test-side adapter that reads and
+  resets the `*bool` out-parameter (see "The quoted-bit protocol").
+  Also `Test_Unit_SWARMasks` (exhaustive: every byte value in every lane, for
+  all four masks — `hasKeyStop`, `hasCtrlOrSpace`, `hasQuoteOrBackslash`,
+  `hasBackslash` — plus "the lower of two stops wins") and `Test_Unit_IsSpace`.
+  `isSpace` needs its own test precisely *because* the reference above shares
+  it — a bug there cancels out and the fuzzer sees nothing.
 - `getmany_fuzz_test.go` — `FuzzGetManyAgainstRef`: differential fuzz of
   `GetMany`/`Get`/`GetQuoted`'s first-non-empty duplicate resolution against a
   naive collect-all reference, which also tracks the quoted flag so
   `AppendValue`'s decode-only-if-quoted rule is checked rather than assumed.
-  **Run after any change to the lookup state machine.** Caveat worth knowing: it
-  uses `AppendUnescape` as its own oracle for `AppendValue`, so a bug inside
-  `AppendUnescape` cancels on both sides — the unescape half of the API has no
-  independent oracle.
+  **Run after any change to the lookup state machine.** It uses
+  `AppendUnescape` as its own oracle for `AppendValue`, so a bug inside
+  `AppendUnescape` cancels on both sides there — which is what the next file
+  is for.
+- `unescape_fuzz_test.go` — `FuzzAppendUnescapeAgainstRef` (added 2026-08-17,
+  when `AppendUnescape` gained its SWAR follow-up scan): a byte-at-a-time
+  reference decoder spelled out independently, checked three ways — append to
+  nil, append behind a prefix, and **decode in place** (`dst = raw[:0]`, legal
+  because decoding never lengthens, and the one case a read-ahead can break) —
+  plus `NeedsUnescape(raw) == false ⇒ raw decodes to itself`. **Run after any
+  change to `AppendUnescape`.** Mutation-checked: swapping `\r` for `\n` in the
+  decoder fails on the seeds alone.
 - `*_test.go` — unit tests, benchmarks, and a regex-vs-logfmt comparison.
   `Test_Unit_HotPath_Allocs` pins the allocation-free contract across all 14
   entry points that claim one (previously only 2 were asserted, and three
@@ -57,7 +71,10 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   the line" is satisfied by a heap copy, so the old form passed with `Get`
   copying. `Test_Unit_Unquoted_Backslashes_Are_Literal` pins the quoted/unquoted
   decode split. `Benchmark_IterateEscaped` sweeps escape density at fixed
-  length.
+  length; `Benchmark_IterateJSONMsg` / `Benchmark_UnescapeJSONMsg` (2026-08-17)
+  are the realistic point on that axis — a structured event serialised into a
+  `msg=` field, one escape per ~7 bytes — for the parser and the decoder
+  respectively.
 - `bench/` — separate module, **declares go 1.23** (above the library floor) so
   it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
   with `for … range`. CI skips this module on the 1.21 floor job.
@@ -138,7 +155,10 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   through, and malformed `\u` stays verbatim. `NeedsUnescape` is a single
   `IndexByte('\\')` so callers skip the decode when unnecessary — keep it a
   single expression so it stays inlinable (a SWAR helper here measurably
-  regressed).
+  regressed). Inside `AppendUnescape` the *first* backslash is still found by
+  `IndexByte`; after each decoded escape it probes the next `escWindow` words
+  inline with `hasBackslash` before calling `IndexByte` again (2026-08-17:
+  `Unescape` −8.5%, the JSON `msg=` value −40%; see "Escape-dense values").
 - `ParseTime(ts []byte)` — `[]byte` like everything else. A caller holding a
   `[]byte` pays the same allocs on the named-zone layout either way (measured
   both sides); the old `string` benchmark only looked cheaper because it fed a
@@ -214,12 +234,14 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   itself; the lower bound is 1970, not the 2001-09-09 that unpadded ten-digit
   values start at. Don't "fix" this by rejecting a leading zero — `0999999999`
   is a legitimate epoch.
-- Statement coverage is 99.5%, and the one uncovered statement is
+- Statement coverage is 99.6%, and the one uncovered statement is
   `parseUnixTS`'s defensive ParseInt error guard, which is unreachable (10
   digits cannot overflow int64). The value-scan SWAR control-byte break —
   formerly the other uncovered line, reachable on CI by no seed — is pinned by
-  a fuzz seed and a unit case since 2026-08-06. Both differential fuzzers pass
-  90 s clean (24.9 M and 22.4 M execs, no new failures).
+  a fuzz seed and a unit case since 2026-08-06. All three differential fuzzers
+  pass clean after the 2026-08-17 pass (`FuzzIterateAgainstRef` 90 s,
+  `FuzzGetManyAgainstRef` 60 s, `FuzzAppendUnescapeAgainstRef` 60 s, no new
+  failures).
 
 ## Current benchmarks (Ryzen 7 8840HS, amd64)
 
@@ -262,11 +284,14 @@ claimed "regenerated by CI" although nothing in `bench.yml` ever writes README.
 Don't reintroduce that pattern; if the numbers must appear in two places, have
 the renderers splice into marker-delimited blocks so the claim is true.
 
-Table currency, as of 2026-08-08: the committed tables are **current through
-`e048e5d`** (the −13.8% pass — `dcd5687` is its direct child, stamped 95 s
-later) and **stale for `3a55c5e`, `c04fbed` and everything after**, this pass
-included. Note `bench.yml` is `workflow_dispatch` only, so nothing refreshes
-them automatically; run `make bench-md` deliberately. Don't hand-edit them with
+Table currency, as of 2026-08-17: the committed tables are **current through
+`b83eade`** (`90c6c75`, stamped 2026-08-08T16:36Z, is its direct child) and
+**stale for the 2026-08-17 pass**. The CI arm64 table's `IterateOur 391.3 ns` /
+`GetMany 81.4 ns` are byte-for-byte what the Neoverse N2 VM used for that pass
+measures for the same commit, so the arm64 CI runner is that machine class and
+the pass's ratios should reproduce there. Note `bench.yml` is
+`workflow_dispatch` only, so nothing refreshes them automatically; run
+`make bench-md` deliberately (dispatch the workflow). Don't hand-edit them with
 laptop figures.
 
 2026-07-27 **evening** pass (same machine, faster power state — do not compare
@@ -277,6 +302,68 @@ Extract 51.0 → 49.3 ns (−3.4%), ParseEscaped 124.3 → 120.2 ns (−3.3%), L
 −1.4%, ParseAll_Typical −0.6%, ParseAll_Big/Unescape `~`, **DecodeKeyval 391.0
 → 395.6 µs (+1.2%)** — the accepted trade (see the optimization-notes bullet).
 Geomean −1.0% (root) / −2.0% (bench). CI tables are stale for this pass too.
+
+### 2026-08-17 pass — Neoverse N2 (Azure Cobalt-class arm64, 2 vCPU), Go 1.26.5
+
+A different machine from everything above: **do not compare its absolutes with
+the Ryzen tables**, only its ratios. It is, however, a far better benchmarking
+platform — a quiet VM, no turbo/power-state drift, run-to-run variance ±0%,
+and an A/A control of two identical trees came back `~` on every row at
++0.03% geomean. It is also the same microarchitecture as GitHub's
+`ubuntu-24.04-arm` runners, so the committed `*_arm64.md` tables should track
+these ratios once `bench.yml` is dispatched.
+
+Before = `90c6c75` (HEAD), after = this pass; n=8 pinned (`taskset -c 1`)
+interleaved 1 s rounds, order rotated per round; benchstat p=0.000 on every
+non-`~` row:
+
+| Benchmark | before | after | Δ | allocs |
+|---|---:|---:|---:|---:|
+| `Iterate` (sample2, 1.4 KB, 29 fields) | 391.4 ns | 382.3 ns | −2.3% | 0 |
+| `ParseAll_Big_Mine` (bench/) | 391.6 ns | 383.4 ns | −2.1% | 0 |
+| `ParseAll_Typical_Mine` (130 B) | 85.1 ns | 83.4 ns | −1.9% | 0 |
+| `LevelTS` logfmt | 72.0 ns | 69.9 ns | −3.0% | 0 |
+| `GetMany` / `Extract_Mine` | 81.3 / 81.5 ns | 80.4 / 80.2 ns | −1.0% / −1.6% | 0 |
+| `DecodeKeyval` (10k short rows) | 726.1 µs | 720.1 µs | −0.8% | 0 |
+| `ParseEscaped_Mine` (bench/) | 214.1 ns | 193.3 ns | **−9.7%** | 0 |
+| `Unescape` | 28.3 ns | 26.0 ns | −8.5% | 0 |
+| `IterateJSONMsg` (JSON in `msg=`, 28 escapes) | 301.5 ns | 171.0 ns | **−43.3%** | 0 |
+| `UnescapeJSONMsg` (that value, decoded) | 318.3 ns | 191.8 ns | **−39.7%** | 0 |
+| `IterateEscaped/esc=0` (1 KB clean) | 36.2 ns | 35.1 ns | −3.2% | 0 |
+| `IterateEscaped/esc=8` | 107.8 ns | 137.7 ns | **+27.7%** (accepted, see below) | 0 |
+| `IterateEscaped/esc=32` | 333.6 ns | 250.3 ns | −25.0% | 0 |
+| `IterateEscaped/esc=128` | 1194 ns | 570 ns | −52.3% | 0 |
+| `IterateEscaped/esc=500` | 4.72 µs | 2.17 µs | −54.0% | 0 |
+
+Root geomean −21.0% (dominated by the escape rows); bench/ `Mine` geomean
+−3.9%; the four layout-stable core rows (Iterate, GetMany, DecodeKeyval,
+LevelTS) −0.8% to −3.0%, none regressed. Three changes landed: the quoted-bit
+protocol (above), the escape-dense follow-up scan in the quoted branch and in
+`AppendUnescape` (next section), and the `if m := hasKeyStop(w); m != 0`
+spelling (drops a real `NOOP` per SWAR iteration on both arches; measured
+neutral, kept for the cleaner loop). The `esc=8` row is the one accepted
+regression: one escaped quote per 128 bytes pays a wasted four-word probe
+(~3.7 ns) per escape; gating the probe on the previous gap being short fixed
+that row (+7%) but cost `Unescape` +11% and the realistic prose shape
+(`\"word\"` pairs are close together even when the pairs are far apart), so the
+ungated form stayed. Both differential fuzzers plus the new unescape one pass
+90 s / 60 s / 60 s clean; coverage 99.6% (the one uncovered statement is still
+`parseUnixTS`'s unreachable guard).
+
+What `perf stat` says about this core, for whoever optimizes next (the
+hypervisor exposes only the generic events; the N2 IMPDEF ones read 0):
+`Iterate` runs at **IPC 4.41 with 0.00% branch mispredictions** (111 K misses
+in 7.8 G branches), ~200 instructions and ~46 cycles per field at 3.4 GHz.
+Cutting 14% of the instructions (holding the two non-bitmask SWAR constants in
+registers, see Rejected) moved cycles by only 0.4% and pushed IPC to 3.81 with
+backend stalls doubling — the removed instructions were free filler. Adding
+two dependent cycles to each scan's `load→mask→tz→i` chain (a semantically
+neutral `m|m<<1` before the `TrailingZeros64`) cost +3.9%, i.e. about 40% of
+the added latency showed through. So the per-field cost is roughly half
+dependency chain (key hit ~13 cycles, value hit ~11, plus a store→load
+forward of the spilled `i` around every callback, since Go's ABI has no
+callee-saved registers) and half throughput limits that instruction count
+alone does not move. Neither lever is cheap any more.
 
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
@@ -297,64 +384,77 @@ sweep before quoting the overhead figure again.
 | `Get` per skipped field | ~8.6 ns (10.7 ns for field 0, 551 ns for field 63) |
 
 **The 27 GB/s row is escape-free only** — do not quote it unqualified. Each `\"`
-makes the quoted loop restart the non-inlinable `bytes.IndexByte` and re-walk
-the preceding backslash run, so the cost is O(escapes) calls, not O(bytes/8)
-SWAR steps. Embedded JSON in a `msg=` field is the worst realistic shape: every
-JSON quote becomes `\"`, i.e. roughly one call per two bytes. At a **fixed**
-1 KB value the sweep runs 65 ns (0 escapes) → 6100 ns (500 escapes), about 90×,
-falling from ~15 GB/s to ~0.17 GB/s. `Benchmark_IterateEscaped` pins that axis;
-it exists because `sample_big.txt` has 2 escaped quotes in 1.4 KB (~4%) and so
-makes the quoted scan look like pure `IndexByte` throughput.
+found by `IndexByte` costs a fresh, non-inlinable call plus a re-walk of the
+preceding backslash run: ~9.4 ns each on the N2 (Ryzen: ~10). Since 2026-08-17
+that price is paid only for the *first* escaped quote of a cluster: from there
+the parser scans forward a word at a time for `"` or `\` (`hasQuoteOrBackslash`),
+consuming each backslash with the byte it escapes, at ~4.3 ns per escape in the
+densest case and no per-escape call at all; after `escWindow` (4) quiet words
+it hands back to `IndexByte`. Embedded JSON in a `msg=` field — every JSON
+quote becomes `\"`, one escape per ~2–8 bytes — is the realistic shape this
+serves: `Benchmark_IterateJSONMsg` −43%, `Benchmark_UnescapeJSONMsg` −40%. At a
+**fixed** 1 KB value the sweep now runs 35 ns (0 escapes) → 2.17 µs (500), about
+60× (it was 36 → 4.72 µs, 130×, on this machine; 65 → 6100 ns, 90×, on the
+Ryzen). `Benchmark_IterateEscaped` pins that axis; it exists because
+`sample_big.txt` has 2 escaped quotes in 1.4 KB (~4%) and so makes the quoted
+scan look like pure `IndexByte` throughput.
 
 This is **not** the rejected "inline first-word `hasByte` before `IndexByte`"
-item, which was about sparing short *clean* values a call. An adaptive fix here
-(on seeing the first escaped quote, switch that value to a SWAR scan for `"` and
-`\` in one word) would leave clean values on today's path entirely. Unmeasured —
-it needs a control-clean interleaved A/B before anyone lands it.
+item, which was about sparing short *clean* values a call — clean values still
+never touch the SWAR path.
 
 Reading: short fields are **overhead-bound** (~6 ns of loop/callback per pair,
 scan is noise), long values are **scan-bound**. The 8 B/iter SWAR only starts
 paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
 `sample2` averages ~8.3 ns/field, consistent with the sweep.
 
-## The `iterate` / `Iterate` split (2026-08-08) — UNMEASURED, please A/B
+## The quoted-bit protocol (2026-08-08 split, measured and reshaped 2026-08-17)
 
-`Iterate` is now a thin adapter over an unexported `iterate` whose callback
-takes a third argument, `quoted bool`. This was a **correctness** fix, not an
-optimization: `AppendValue` used to run `AppendUnescape` over every value it
-found, including unquoted ones, so `path=C:\Users\bob\new` came back as
-`C:Usersbob` with an embedded newline (`\U`→`U`, `\b`→`b`, `\n`→newline).
+`iterate` reports whether a value was double-quoted — the only position where a
+backslash escape means anything. That bit exists because of a **correctness**
+fix, not an optimization: `AppendValue` used to run `AppendUnescape` over every
+value it found, including unquoted ones, so `path=C:\Users\bob\new` came back
+as `C:Usersbob` with an embedded newline (`\U`→`U`, `\b`→`b`, `\n`→newline).
 Escapes are meaningful only inside quotes, the raw value cannot tell you which
 it was, and go-logfmt's encoder does **not** quote a value merely for containing
 a backslash — so this was silent corruption on ordinary input. `GetQuoted`
-exports the bit; `Get`/`GetMany`/`Validate` call `iterate` directly and so pay
-only the extra (ignored) argument; `Iterate` and `All` pay one adapter call per
-field.
+exports the bit.
 
-**The cost of that adapter hop is not known.** It could not be measured on the
-machine this landed on: an unrelated ffmpeg job held ~10 cores for the whole
-session (load average 15–50), and a four-way interleaved sweep with an embedded
-A/A control put the control itself at −7.8% / +3.75% — far above any effect
-worth finding, so by this file's own control rule none of those numbers count.
-What *is* known, deterministically from `-gcflags=-S`:
+**How it travels (since 2026-08-17):** `iterate(data, quoted *bool, fn
+func(k, v []byte) bool)`. The parser sets `*quoted = true` just before
+delivering a quoted value and **never clears it**; a caller that wants the bit
+reads and resets it inside its callback (`GetQuoted`, and the two fuzz
+references via `iterateQ`), everyone else hands in a throwaway local. The
+protocol is lopsided on purpose: the common unquoted path executes no store at
+all, and `Iterate`/`All` hand the user's callback straight to the parser.
 
-- **Both SWAR scan loops are byte-identical to the previous code** (same two
-  `TZCNT` sites, same loop bodies), so per-*byte* scan throughput is unchanged
-  and only the per-*field* term can have moved.
-- The adapter closure does not escape (`func literal does not escape`), so the
-  zero-allocation contract holds — pinned now by `Test_Unit_HotPath_Allocs`.
+**Why not the 2026-08-08 shape** (three-argument parser callback, `Iterate`
+wrapping the user's two-argument one in an adapter closure): measured on the
+quiet Neoverse N2 box, pre-split `f8d9551` vs `b83eade`, n=6 pinned interleaved
+rounds, control clean: **Iterate +2.33%, LevelTS +4.44%, DecodeKeyval +1.14%,
+GetMany +0.51%**. The adapter is a full non-leaf function per field (stack
+check, frame, two arg spills for the GC, context load, indirect call,
+epilogue — ~15 instructions and a second `CALL`/`RET` pair).
 
-Please re-run the A/B on quiet hardware before quoting any new figure.
-`/tmp` harnesses do not survive, so the recipe: copy the pre-split tree, then
-interleave with `taskset -c N`, rotating order each round, and **measure an A/A
-control inside the same sweep**. If `Iterate` has regressed more than ~1%, two
-things are worth trying before anything drastic: deriving `quoted` at the
-callback site as `data[vStart-1] == '"'` instead of carrying a live flag
-(`vStart` is only ever set just past a `"` or a `=`, so the byte is already hot
-— a working variant was built and passes the suite), or making the exported
-`Iterate` take the three-argument callback itself, which removes the adapter
-entirely at the price of a breaking change. Do not "fix" it by duplicating the
-parser; that has been tried and rejected (see below).
+**Why not the obvious out-parameter** (store `*quoted = q` before *every*
+callback): Iterate −1.69% but **GetMany +1.79%** and Get/GetQuoted worse too —
+the pointer reload plus store on every field is not free on this core (geomean
+−0.1%, i.e. a wash). The set-only protocol landed instead: Iterate −2.36%,
+LevelTS −2.39%, GetMany −0.89%, DecodeKeyval −0.83%; the price is a
+load+store per field inside `GetQuoted`'s closure to consume the flag,
+**Get/GetQuoted +0.6%** on a deep key (measured with a temporary
+`Get(sample2, "session_attr_client_locale")` benchmark), and `Validate` `~`.
+`Get` deliberately shares `GetQuoted`'s closure rather than duplicating the
+first-non-empty state machine to claw that 0.6% back.
+
+**Not taken:** deriving the bit inside `GetQuoted`'s callback from the value's
+capacity (`data[len(data)-cap(v)-1] == '"'` — sound because `iterate` hands
+out uncapped sub-slices of the cap-pinned `data`) would cost nothing anywhere
+in the parser, but it couples `GetQuoted` to the uncapped-`v` property that the
+`Iterate` capping trade-off could one day revisit. Also, the compiler already
+materialises the flag at the call site as `c == '"'` from the spilled byte, so
+the "derive `quoted` at the callback site" idea from the 2026-08-08 notes was
+happening implicitly and bought nothing.
 
 ## How the general parser is optimized (logfmt.go)
 
@@ -449,6 +549,33 @@ parser; that has been tried and rejected (see below).
   found-values are never nil, so `nil` == absent unambiguously.
 - **Closing-quote verify tests `' '` first** (`c != ' ' && !isSpace(c)`) — same
   short-circuit trick as the SWAR verifies; ~1% on quoted-heavy lines.
+- **Escape-dense values: SWAR follow-up scan after the first escaped quote**
+  (2026-08-17). The quoted branch still opens with `bytes.IndexByte('"')` plus
+  the backslash-run parity walk — clean values never see anything else. When
+  the walk says *escaped*, the loop steps past the quote and probes forward a
+  word at a time with `hasQuoteOrBackslash` (two has-zero-byte tests OR-ed; the
+  borrow caveat applies and is harmless as always): a `\` found means "skip it
+  and the byte it escapes" (`i += 2`), a `"` found is the closing quote by
+  construction (every backslash before it was consumed pairwise, so no walk is
+  needed) and jumps to the shared `closingQuote:` label; a word with neither
+  bumps `quiet`, and after `escWindow` = 4 quiet words the loop `continue`s to
+  `IndexByte` from wherever it stopped — sound because the parity walk is
+  context-free, so nothing needs carrying across. `i = min(i, n)` before that
+  hand-back covers the one way `i` reaches `n+1`: an escaping backslash as the
+  last byte of the input (pinned by unit case and seed). Window size was
+  measured at 2/4/8: 4 wins — 2 loses the `esc=32` row (+17%) because a JSON
+  string value longer than 16 bytes drops back to `IndexByte` every time, 8
+  costs the sparse row +59% for no dense gain. `AppendUnescape` applies the same
+  idea with `hasBackslash` after every decoded escape.
+- **`if m := hasKeyStop(w); m != 0 {`, not `m := …` on its own line** (2026-08-17).
+  A call to an inlined function that is alone on its source line leaves the
+  compiler's inline mark with no real instruction to attach to, and it becomes a
+  literal `NOOP` (`HINT $0` on arm64, `XCHGL AX, AX` on amd64) — one per SWAR
+  iteration, in both scan loops. Putting the compare on the call's line gives
+  the mark a home. Measured neutral (the slot was free), kept because it is the
+  same source shape and a cleaner loop; note the mark can come back if the
+  first statement of the `if` body changes (a `:=` declaration there did it in
+  one variant — check with `go tool objdump -s 'logfmt\.iterate$' | grep NOOP`).
 - **`GOAMD64=v3` builds are ~3–4% faster** (re-measured 2026-07-26, interleaved
   A/B: Iterate 275.2 → 266.9 ns = 3.0%; GetMany 54.9 → 53.4 ns = 2.7%) —
   BMI's TZCNT helps the SWAR `TrailingZeros64`. A user build flag, not
@@ -631,8 +758,74 @@ noisy). Each was **neutral or worse**:
     region. Revisit only with the prototype under differential fuzz and a
     control-clean series.
 
+- **2026-08-17 pass (Neoverse N2, arm64) — measured and rejected.** Every item
+  was correctness-verified (suite + fuzzers) before losing on the stopwatch;
+  the harness had a clean A/A control and ±0% run-to-run variance, so these
+  are real, but note the layout caveat in Methodology: on the `IterateEscaped/*`
+  and `Unescape` rows a pure code-layout shift moves numbers ±2%, on the four
+  core rows ±0.2%.
+  - *Holding the two non-bitmask-immediate SWAR constants (`0x2121…`,
+    `0x1d1d…`) in registers via package-level `var`s loaded once per
+    `iterate`.* On arm64 each is rematerialised as `MOVZ`+3×`MOVK` (four
+    instructions apiece, eight per key-scan iteration; amd64 pays one `MOVQ`
+    each) and the var trick cuts the key loop from 21 to 12 instructions.
+    Standalone: Iterate −2.75%, GetMany −1.5%, LevelTS −1.0%, **DecodeKeyval
+    +1.2%**; on top of the quoted-bit protocol only Iterate −1.2%, GetMany
+    −0.8%, DecodeKeyval +0.6%. Instructions −14%, cycles −0.4%: the
+    rematerialisation was free filler (see the perf-stat paragraph in the
+    benchmarks section). Not worth an arm64-only build-tagged pair of files
+    for ~1%, and the amd64 measurement from 2026-07-27 was already negative;
+    parked. If someone wants it: `//go:build arm64` file with `var`, other
+    file with `const`, same names, `sub, xor := …` at the top of `iterate` and
+    pass them into the mask helpers.
+  - *Bounds-check-free post-hit byte load* — `word := data[i:i+8]`, `off :=
+    TrailingZeros64(m)>>3 & 7`, `c := word[off]` — really does remove the
+    `CMP/BLS` after each SWAR hit and compiles the `>>3 & 7` to one `UBFX`, but
+    the word pointer materialises inside the loop (+1 instruction per
+    iteration) and the inline-mark NOOP returns: **Iterate +2.3%**, LevelTS
+    +0.9%, rest `~`. Predicted-never-taken checks are free here; loop-body
+    growth is not. (Same lesson as the 2026-07-27 register-extract item.)
+  - *`*quoted = q` stored before every callback* (the obvious out-parameter):
+    Iterate −1.7% but GetMany +1.8%, Get/GetQuoted worse — a wash (geomean
+    −0.1%). Superseded by the set-only protocol.
+  - *Gating the escape probe on the previous gap being short* (`dense :=
+    i-esc <= escWindow*8` in the parser, `dense = j-i < escWindow*8` in
+    `AppendUnescape`): fixes the sparse synthetic row (`esc=8` +28% → +7%) but
+    `Unescape` +11% (its two escapes are close together after 118 bytes of
+    prose, and the gate says "sparse" from the first gap) and the realistic
+    prose shape — `\"word\"` pairs, close together even when the pairs are far
+    apart — loses the probe on exactly the quote it would have found. The
+    ungated form is also simpler. Rejected.
+  - *Byte-loop copy of literal runs ≤ 16 B in `AppendUnescape`* instead of
+    `append(dst, raw[i:j]...)` (a `memmove` call): JSON −3%, `Unescape` +11%.
+    Rejected. (The 2026-07-27 word-copy variant remains killed on correctness:
+    it corrupts an in-place decode; the new unescape fuzzer now checks that
+    case.)
+  - *Reassociating the mask tail* as `(w - c) & (swarHi &^ w)` to shorten the
+    dependency chain by one op: the compiler canonicalises it back to
+    `&^ w & swarHi` (identical codegen), so it is a no-op. Kept the readable
+    spelling.
+  - *Lookahead-seeded value scan* — load `data[i+8:i+16]` in the key loop as
+    well, so that on the `=` hit the value's end can be found from the key
+    word's remaining bytes and the already-loaded next word without waiting on
+    a load whose address depends on the hit (`hasCtrlOrSpace` shares the
+    `w - 0x2121…` term with `hasKeyStop`, so the second mask is two extra ops
+    per iteration) — is the one structural idea left with real upside: it
+    would take the value hit's ~11-cycle chain off the per-field critical path
+    for values that end within ~8–15 bytes of the `=`, i.e. most of
+    `sample_big`'s. Best case by the chain-exposure measurement above is
+    ~−10%, realistically half the fields qualify, and it costs a load plus ~7
+    ops per key iteration, a tighter loop bound (`i <= n-16`) with its own
+    tail, and a second entry into the value state machine. Given that +2 loop
+    instructions measured +2.3% just above, and the split-callsites result
+    from 2026-07-27, this is a coin flip with real complexity. **Not
+    attempted; prototype under `FuzzIterateAgainstRef` with a control-clean
+    series before landing.**
+
 The parser is **memory-latency / per-field-overhead bound**, not scan-throughput
-bound. Further wins require an API change (non-callback) or accepting a
+bound (confirmed on arm64 with counters, see the 2026-08-17 benchmarks
+section: IPC 4.4, no mispredictions, instruction count barely moves cycles).
+Further wins require an API change (non-callback) or accepting a
 correctness/maintainability cost. Don't chase sub-ns micro-ops; they read as
 wins in `-count=1` runs but vanish when averaged.
 
@@ -664,12 +857,31 @@ wins in `-count=1` runs but vanish when averaged.
   -cum` and `-list=Iterate`. Beware skid: `isSpace` and verify-line "flat %" are
   often attribution of dependent-load latency, not removable work.
 - **Keep only measured wins; revert neutral changes** for clarity.
+- **Calibrate for code layout, not just for noise (learned 2026-08-17).** On a
+  quiet arm64 VM the harness above resolves ±0.2% — good enough to see effects
+  that are *real but not yours*: adding a never-called function after
+  `iterate` (pure address shift, zero instruction change in any hot path)
+  moved `IterateEscaped/esc=32` +2.0%, `esc=8` +1.2%, `Unescape` +0.7%, while
+  `Iterate`, `GetMany`, `DecodeKeyval` and `LevelTS` stayed within ±0.2%. So:
+  run that padding control once per machine, treat the layout-sensitive rows
+  as ±2% no matter what benchstat's p-value says, and only believe sub-2%
+  deltas on rows the control showed to be layout-stable. The 2026-08-17 recipe:
+  `go test -c` once per tree, then a shell loop that runs the two binaries
+  pinned (`taskset -c 1`) with `-test.count=1`, alternating which goes first
+  each round, appending to two files for `benchstat`; each tree is a plain
+  copy of the repo (`git archive` / `rsync`), and the bench module's
+  `replace ../` makes copies self-contained. `perf stat -e
+  cycles,instructions,branches,branch-misses` works in the VM for the generic
+  counters (`taskset -c 1 perf stat … ./x.test -test.bench=…`), the IMPDEF ones
+  do not; a dependent-add loop puts the clock at ~3.4 GHz.
 
 ## Commands
 
 ```sh
 go test ./...                                              # unit tests
 go test -run='^$' -fuzz=FuzzIterateAgainstRef -fuzztime=20s # parser fuzz
+go test -run='^$' -fuzz=FuzzGetManyAgainstRef -fuzztime=20s  # lookup state machine
+go test -run='^$' -fuzz=FuzzAppendUnescapeAgainstRef -fuzztime=20s # decoder
 go test -run='^$' -bench=. -benchmem -count=3             # benchmarks
 go vet ./... && gofmt -l .                                # lint/format
 ```

@@ -101,6 +101,19 @@ func iterateRef(buf []byte, fn func(key, val []byte, quoted bool) bool) error {
 	return nil
 }
 
+// iterateQ adapts the parser to the three-argument shape iterateRef has, so
+// collectPairs can drive both. iterate sets the flag it is handed before
+// delivering a quoted value and never clears it, so this reads and resets it
+// per pair, exactly as GetQuoted does.
+func iterateQ(buf []byte, fn func(k, v []byte, quoted bool) bool) error {
+	var quoted bool
+	return iterate(buf, &quoted, func(k, v []byte) bool {
+		q := quoted
+		quoted = false
+		return fn(k, v, q)
+	})
+}
+
 // collectPairs records four facts per pair, not two. The key and value are the
 // obvious ones; the other two exist because comparing only string(k)/string(v)
 // makes the fuzzer blind to properties this package exports:
@@ -159,12 +172,24 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		`a="x\"y`,
 		`a="" b="x"z c=3`,
 		`a=1 b="\\" c="x`,
+		// Escape-dense values drive the SWAR quoted scan that takes over after
+		// the first escaped quote: JSON in a msg= field, backslash runs of both
+		// parities before a quote, an escape straddling an 8-byte word, and a
+		// value that turns sparse again so IndexByte has to be handed back to.
+		`msg="{\"user\":\"bob\",\"action\":\"login\",\"path\":\"/api/v1/users\"}" id=7`,
+		`a="\\\" b=1" c="\\\\" d=2`,
+		`a="xxxxxx\"yyyyyyy\"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\"end" b=3`,
+		// The escaping backslash is the last byte of the input — including as
+		// the last byte of a full 8-byte word, which steps the scan to n+1.
+		`a="x\"y\`,
+		`a="\"\`,
+		`a="\"xxxxxxx\`,
 	}
 	for _, s := range seeds {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, buf []byte) {
-		gotV, gotErr := collectPairs(iterate, buf)
+		gotV, gotErr := collectPairs(iterateQ, buf)
 		wantV, wantErr := collectPairs(iterateRef, buf)
 		if (gotErr == nil) != (wantErr == nil) {
 			t.Fatalf("err mismatch: got %v want %v for %q", gotErr, wantErr, buf)
@@ -231,6 +256,22 @@ func Test_Unit_SWARMasks(t *testing.T) {
 			if got := firstStop(hasCtrlOrSpace(w)); got != want {
 				t.Fatalf("hasCtrlOrSpace: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
 			}
+
+			want = 8
+			if v == '"' || v == '\\' {
+				want = pos
+			}
+			if got := firstStop(hasQuoteOrBackslash(w)); got != want {
+				t.Fatalf("hasQuoteOrBackslash: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
+
+			want = 8
+			if v == '\\' {
+				want = pos
+			}
+			if got := firstStop(hasBackslash(w)); got != want {
+				t.Fatalf("hasBackslash: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
 		}
 	}
 
@@ -252,6 +293,16 @@ func Test_Unit_SWARMasks(t *testing.T) {
 					if got := firstStop(hasCtrlOrSpace(w)); got != lo {
 						t.Fatalf("hasCtrlOrSpace: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
 					}
+				}
+			}
+			for _, pair := range [][2]byte{
+				{'"', '\\'}, {'\\', '"'}, {'"', '"'}, {'\\', '\\'},
+			} {
+				buf := []byte("aaaaaaaa")
+				buf[lo], buf[hi] = pair[0], pair[1]
+				w := binary.LittleEndian.Uint64(buf)
+				if got := firstStop(hasQuoteOrBackslash(w)); got != lo {
+					t.Fatalf("hasQuoteOrBackslash: %#v at %d,%d: stop %d, want %d", pair, lo, hi, got, lo)
 				}
 			}
 		}

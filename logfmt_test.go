@@ -85,6 +85,23 @@ func Test_Unit_LogFmt_Values(t *testing.T) {
 			// way, because '\' is not one of the bytes that force quoting.
 			`path=C:\Users\bob re=\d+\s`,
 			[]string{"path", `C:\Users\bob`, "re", `\d+\s`},
+		},
+		{
+			// Escape-dense: after the first escaped quote the parser switches
+			// to a word-at-a-time scan that consumes each backslash with the
+			// byte it escapes. JSON in a msg= field is the shape that matters;
+			// the backslash runs check both parities before a quote, and the
+			// long tail checks the hand-back to bytes.IndexByte.
+			`msg="{\"user\":\"bob\",\"n\":1}" a="\\\" b=1" c="\\\\" ` +
+				`d="x\"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\"z" e=2`,
+			[]string{"msg", `{\"user\":\"bob\",\"n\":1}`, "a", `\\\" b=1`, "c", `\\\\`,
+				"d", `x\"yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy\"z`, "e", "2"},
+		},
+		{
+			// An escaping backslash as the last byte of an 8-byte word steps the
+			// scan onto the following word's first byte, here a closing quote.
+			`a="\"xxxxxxx\\" b=2`,
+			[]string{"a", `\"xxxxxxx\\`, "b", "2"},
 		}} {
 		t.Run(fmt.Sprintf("test-%d-%s", i, tt.line), func(t *testing.T) {
 			var result []string
@@ -606,6 +623,11 @@ func Test_Unit_Validate_SyntaxError(t *testing.T) {
 	}{
 		// Offset points at the opening quote that is never closed.
 		{`a=1 b="unterminated`, 6, "unterminated quoted value"},
+		// Same, reached from the escape-dense scan: the escaping backslash is
+		// the last byte of the input, so the scan steps one past the end and
+		// has to be clamped before IndexByte is handed the tail.
+		{`a="\"xxxxxxx\`, 2, "unterminated quoted value"},
+		{`a="\"\`, 2, "unterminated quoted value"},
 		// Offset points at the offending byte itself.
 		{`a="x"y`, 5, "unexpected byte after closing quote"},
 	} {
