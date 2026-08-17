@@ -88,6 +88,21 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   `Test_Unit_Quoted_EscapeDense_Scan` (from PR #2, adapted to `escGap`/
   `escClean`) pins both scans and every transition between them, including the
   two malformed shapes only the walk can reach.
+  **Added 2026-08-17 by the amd64 review, all four to close blind spots that had
+  each already cost a tuning pass:**
+  `Benchmark_IterateEscapedGap` / `Benchmark_UnescapeEscapedGap` sweep the same
+  axis as the two above but parameterised by the **distance between escapes**
+  rather than by a count, with points at 16/32/40/48/64/128/256 — i.e. bracketing
+  the decisions instead of sampling evenly. The count-parameterised sweep's blind
+  spot has now hidden a regression (the 32-byte window, −7% GetMany) *and* a win
+  (`escClean` 5, −10% at a 48-byte gap read as `~` on every committed row).
+  `Benchmark_IteratePrefixJSON` pins the `escGap` cliff (see Known limits).
+  `Benchmark_UnescapeUnicode` / `Benchmark_AppendValueUnicode` are the first
+  benchmarks in this package's history to execute `hex4` or
+  `decodeUnicodeEscape` **at all** — every escaped sample here carries `\" \\ \t
+  \n` and none carried `\u`, though decoding `\u00XX` is the documented
+  round-trip requirement for go-logfmt's own output. Keep them even if `hex4`
+  changes shape again: an unmeasured path is exactly how that one drifted.
 - `bench/` — separate module, **declares go 1.23** (above the library floor) so
   it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
   with `for … range`. CI skips this module on the 1.21 floor job.
@@ -176,6 +191,32 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   re-measured on `Benchmark_UnescapeEscaped`, eight words costs the 128-byte-gap
   row 18.5% and gains nothing anywhere (geomean +2.0%), because this scan only
   looks for the next escape where the parser's consumes them as it goes.
+  **Unlike `escClean`, `unescWindow` = 4 re-measured the same on amd64**
+  (2026-08-17): 2 costs the 32-byte-gap row 18.8% and `UnescapeJSONMsg` 4.3%, 8
+  costs the 128-byte-gap row 28.5%. Both arches agree, so a change here needs
+  both before it lands.
+  **The probe loop carries a redundant-looking `s >= 0` and it is load-bearing**
+  (2026-08-17): it is what removes the bounds check on the `Uint64` load. The
+  `uint(i) < uint(n)` / `i <= n-8` recipe that clears `iterate`'s two SWAR loads
+  does *not* reach here, because `s` is not this loop's induction variable
+  (`quiet` is) so the prove pass never learns `s` is non-negative — this was the
+  one checked SWAR load left in the package. Without it the load pays a `LEA`
+  and two compare-and-branch pairs into `panicBounds` per probed word: 28
+  instructions in that region against 23. Worth −14% at 8-byte gaps, −13% on
+  `UnescapeJSONMsg`, −15% on `UnescapeEscaped/esc=128`; costs +3–4% at 128-byte
+  gaps, where all four probe words are wasted anyway and the extra compare has
+  nothing to amortise against. Three other spellings were tried — a `uint` outer
+  head, `uint(s) <= uint(n-8)` with the `n>=8` guard hoisted, and a precomputed
+  limit with `s` as the induction variable — and **none of them eliminates the
+  check**. Verify with `-d=ssa/check_bce/debug=1` before touching that line.
+- `hex4` / `decodeUnicodeEscape` — **a 256-byte `int8` table since 2026-08-17**,
+  with the sign bit of `h0|h1|h2|h3` doing the validity test in one branch. It
+  was a chain of data-dependent range compares (up to six branches a digit, 24
+  an escape) and had stayed that way because **nothing in the suite executed it**
+  — see the two new benchmarks in Layout. Worth −26% on `UnescapeUnicode` and
+  −21% on `AppendValueUnicode`, fuzz-clean at 40 s. Third win for the
+  table-beats-arithmetic pattern, after `spaceTable` twice; the branches here are
+  genuinely unpredictable, so it is the strongest case of the three.
 - `ParseTime(ts []byte)` — `[]byte` like everything else. A caller holding a
   `[]byte` pays the same allocs on the named-zone layout either way (measured
   both sides); the old `string` benchmark only looked cheaper because it fed a
@@ -238,6 +279,39 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   broken: slicing keeps a present-but-empty value non-nil, which is how absence
   stays distinguishable.
 - **The bare-key `trueSlice` is a shared global** — mutating it is process-wide.
+- **A caller's stack buffer is forced to the heap** (found 2026-08-17). `iterate`
+  hands `data`'s sub-slices to an opaque `fn`, so escape analysis can only say
+  `leaking param: data`, and that verdict propagates out through **every**
+  exported entry point — `Iterate`, `Get`, `GetQuoted`, `GetMany`, `AppendValue`,
+  `Validate`, `All`. A caller that assembles a record in a `var buf [64]byte` and
+  passes it in pays **1 alloc / 64 B per call** (38.9 ns against 14.2 ns for the
+  identical caller that scans the buffer itself; `-gcflags=-m` says
+  `moved to heap: buf`). The package's own work really is allocation-free, so
+  `Test_Unit_HotPath_Allocs` is right not to catch this — it measures
+  package-level inputs — but "allocates nothing" is a claim about the package,
+  not about the caller, and `doc.go` should say so: reuse a heap buffer, not a
+  stack array. Also worth noting as **new evidence for a rejected item**: the
+  callback-free lookup loop was turned down at "only ~4.5%, and it duplicated the
+  parser", and an allocation per call was not on that ledger.
+- **The `escGap` entry decision is one-way** (priced 2026-08-17, deliberately not
+  fixed). `escGap` is asked once, at the value's first escaped quote. `escClean`
+  can take a value *off* the walk when its escapes thin out, but
+  `scanQuotedSparse` has no way back *on*, so a value that starts sparse and
+  turns dense is scanned by one `IndexByte` call per escape to the closing quote.
+  The shape is ordinary — a prose prefix longer than `escGap` then embedded JSON,
+  `msg="failed to process request: {\"id\":...}"` — and it costs **60%**, as a
+  hard cliff exactly at `escGap` rather than a gradient (`Benchmark_
+  IteratePrefixJSON` pins it: flat either side, a ~55% step between `prefix=032`
+  and `prefix=064`). A prototype letting `scanQuotedSparse` report "these escapes
+  turned dense, resume the walk here" is fuzz-clean and measures **−32%** on that
+  shape and **+3–4%** on values whose escapes really are 64–256 B apart — a trade
+  that depends on the input distribution, not on the stopwatch, which is why it
+  was left out. **If it is ever attempted: the upgrade threshold must sit
+  strictly below the distance `escClean` gives up at, or the two scans oscillate
+  handing back to each other — setting it equal to `escGap` measured +26% at a
+  48-byte gap.** Raising or deleting `escGap` are the cheap alternatives and both
+  measure worse: deleting it fixes the cliff but costs one wasted 40-byte probe
+  on *every* sparse value (+6–9% at 64–128 B gaps).
 - **Keys are never quoted**: `"a b"=c` → bare key `"a`, then `b"`=c. Quoting is
   position-dependent (value position only) — the same property that defeats the
   SIMD substring search below.
@@ -302,22 +376,36 @@ Don't reintroduce that pattern; if the numbers must appear in two places, have
 the renderers splice into marker-delimited blocks so the claim is true.
 
 Table currency, as of 2026-08-17: the committed tables are **current through
-`b28092c`** (`f79d17a`, stamped 2026-08-17T13:16Z) and **stale for the
-escape-scan correction after it**. The CI arm64 numbers reproduce this
-machine's to within 0.1% at both commits (`391.3 / 81.4 / 72.1` at `90c6c75`,
+`6a79ce6`**, the escape-scan correction — `00d92ad` regenerated both of them at
+14:11Z. (An earlier version of this paragraph said they stopped at `b28092c`
+and were stale for the correction; that was written before `00d92ad` landed and
+was already false when it was read. Check the `generated` stamp in the file
+against `git log -- bench/` rather than trusting this line.) They are **stale
+for the 2026-08-17 amd64 review** — `escClean` 5, the `hex4` table and the
+`AppendUnescape` bounds-check hint all postdate them. The CI arm64 numbers
+reproduce this machine's to within 0.1% (`391.3 / 81.4 / 72.1` at `90c6c75`,
 `381.9 / 80.5 / 69.8` at `b28092c`, against local `391.4 / 81.3 / 72.0` and
 `382.3 / 80.4 / 69.8`), so the arm64 runner is this machine class and ratios
 measured here travel to it.
 
-**The amd64 half of `f79d17a` is the only x86 data this repo has for the pass,
-and it caught the same regression independently.** EPYC 7763, `90c6c75` →
-`b28092c`: `Iterate` 414.2 → 394.0 (−4.9%), `LevelTS` 75.5 → 72.6 (−3.8%),
+**The amd64 tables caught the 32-byte-window regression independently, and then
+recorded the correction fixing it.** EPYC 7763, `90c6c75` → `b28092c`:
+`Iterate` 414.2 → 394.0 (−4.9%), `LevelTS` 75.5 → 72.6 (−3.8%),
 `DecodeKeyval` 691.9 → 681.5 µs (−1.5%), `esc=128` 1129 → 671 ns (−40.5%),
 `esc=500` 4410 → 2549 ns (−42.2%) — but **`GetMany` 89.2 → 95.3 (+6.8%)** and
-**`esc=8` 92.0 → 154.8 (+68.3%)**, the 32-byte-window failure the correction
-fixes, and worse there than the +7.3% / +27% it cost on arm64. Nobody has
-measured the correction on x86; the mechanism is identical, so it should
-recover both rows, but say "should" until `bench.yml` is dispatched again.
+**`esc=8` 92.0 → 154.8 (+68.3%)**, the 32-byte-window failure, worse there than
+the +7.3% / +27% it cost on arm64.
+
+**The correction (`b28092c` → `6a79ce6`) recovered both on x86**, which settles
+a question this file used to leave open ("nobody has measured the correction on
+x86 … say 'should' until `bench.yml` is dispatched again" — it had been, in
+`00d92ad`, and the data was sitting in the repo). Same EPYC 7763 tables:
+**`GetMany` 95.3 → 87.5 (−8.2%)** and **`esc=8` 154.8 → 94.8 (−38.8%)**, plus
+`LevelTS` 72.6 → 66.3 (−8.7%), `esc=32` 294.0 → 261.9 (−10.9%), `esc=128`
+671.2 → 630.5 (−6.1%), `esc=500` 2549 → 2372 (−6.9%), `IterateJSONMsg` 196.2 →
+186.1 (−5.1%), `Iterate` 394.0 → 392.4 (−0.4%). The prediction held; the
+mechanism was indeed identical. Diffing two committed tables is the cheapest
+way to answer this class of question — check for it before re-measuring.
 
 Treat these tables as indicative, never as A/B results: they are `-count=1`
 single runs with no interleaving and no control, and the same diff moves
@@ -409,6 +497,67 @@ dependency chain (key hit ~13 cycles, value hit ~11, plus a store→load
 forward of the spilled `i` around every callback, since Go's ABI has no
 callee-saved registers) and half throughput limits that instruction count
 alone does not move. Neither lever is cheap any more.
+
+### 2026-08-17 amd64 review — Ryzen 7 8840HS, Go 1.26.5, GOAMD64=v1
+
+A review pass on x86, aimed deliberately at what the arm64 pass could not see:
+constants tuned on one arch, paths with no benchmark, and the codegen invariants
+this file says to keep re-checking. Three changes landed — `escClean` 8 → 5, the
+`hex4` table, and `AppendUnescape`'s bounds-check hint — each written up at its
+own site above. Measured against `00d92ad`, n=6–8 pinned interleaved rounds,
+**A/A control geomean −0.03% with every row `~`**:
+
+| Benchmark | before | after | Δ |
+|---|---:|---:|---:|
+| `IterateEscapedGap/gap=048` (new) | 144.5 ns | 130.1 ns | **−10.0%** |
+| `UnescapeUnicode` (new) | 71.8 ns | 58.3 ns | **−18.8%** |
+| `AppendValueUnicode` (new) | 91.5 ns | 77.4 ns | **−15.4%** |
+| `UnescapeEscaped/esc=128` | 584.8 ns | 495.7 ns | **−15.3%** |
+| `UnescapeEscaped/esc=500` | 2.120 µs | 1.806 µs | **−14.8%** |
+| `UnescapeJSONMsg` | 137.6 ns | 118.0 ns | −14.2% |
+| `Unescape` | 17.86 ns | 17.29 ns | −3.2% |
+| `Iterate` / `GetMany` / `LevelTS` / `IterateJSONMsg` | | | `~` |
+| `UnescapeEscaped/esc=8` | 86.34 ns | 90.19 ns | **+4.5%** |
+| `DecodeKeyval` | 405.3 µs | 410.9 µs | +1.4% |
+
+Geomean −4.5% on the root suite; the `bench/` module's four `_Mine` rows all
+`~`. Only the `esc=8` regression has a mechanism (the probe's added compare on
+the row where all four probe words are wasted); the other two are layout. All
+three differential fuzzers clean (45 s / 45 s / 30 s), coverage still 99.6%.
+
+**Environment caveat, and it is a real one.** This was measured on a working
+laptop with a browser at ~60% CPU and load average ~2.6 — worse conditions than
+the quiet N2 VM. Pinning plus interleaving plus the clean A/A control keeps the
+large effects honest, and every number quoted above is either ≥8% or has a
+mechanism. But **sub-3% rows from this pass are not resolved**, and the
+code-layout sensitivity the arm64 pass measured at ±2% on the `*Escaped/*` rows
+measured **up to ±8% here** — a constant change that alters nothing on a row's
+code path moved it 8.5% once. Treat any small delta on those rows as noise
+unless a padding control says otherwise.
+
+**Worst-case shapes, characterised (no bugs found, numbers worth keeping).**
+`Iterate` over 1 KB of each: backslash runs of 1/7/31/127 before quotes →
+1422/1407/1371/286 ns, so **the parity walk has no quadratic case**, which is
+the one this file's design most invites. One long unquoted value 15.3 GB/s; one
+long key 9.9 GB/s (`hasKeyStop`'s extra ops); all-whitespace 2.2 GB/s (the
+scalar drain, 1 B/iter, linear); `Get` on the sample's last field 233.8 ns, i.e.
+≈ a full `Iterate`, as the cost model predicts. `GetMany` at 1/2/5/10/20 keys →
+17.5/25.4/63.8/138.9/557.7 ns, so the doc comment's "ahead up to roughly ten
+keys, ~505 ns at 20" still holds.
+**The separator-run trade, finally priced:** 5.54 ns/field at one separator,
+**8.32 at two (+50%)**, 9.04 at four, 12.32 at sixteen. The expensive step is
+1 → 2, and it is not the drain loop — it is the wasted field iteration that
+detects the empty key; each further byte is only ~0.5 ns. Left alone on purpose
+(the cost is structural to having no whitespace-skip loop, and reintroducing a
+skip is what measured worse), but column-aligned or double-spaced emitter output
+is one format string away, so the number belongs here rather than the assertion
+that "no real emitter writes one".
+
+**Codegen invariants re-checked on go1.26.5/amd64, all still holding:** no
+inline-mark `NOOP`s in `iterate`, `AppendUnescape` or `scanQuotedEscapeDense`;
+both of `iterate`'s SWAR loads bounds-check free; all five SWAR helpers still
+inline (cost 8–26 against budget 80) and `iterate` still far from inlinable at
+747; all 14 alloc-free entry points still alloc-free.
 
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
@@ -611,12 +760,18 @@ happening implicitly and bought nothing.
   declines the job two ways, both handing back to `scanQuotedSparse` (the
   `IndexByte`+parity loop, out of line): **`escGap` = 48**, the first escape sat
   more than 48 bytes into the value, so the escapes are sparse and `IndexByte`'s
-  stride wins; and **`escClean` = 8**, eight consecutive words went by with
+  stride wins; and **`escClean` = 5**, five consecutive words went by with
   neither byte in them. Handing back carries nothing, because the parity rule is
-  context-free. Both constants sit on one measured crossover: `IndexByte` scans
-  clean bytes ~4.5× faster than the walk (26.5 vs 5.9 GB/s here) but costs a
-  call per escape, so the walk wins while escapes stay within ~70 bytes of each
-  other. `scanQuotedSparse` returning −1, and its unsigned loop head, are what
+  context-free. The crossover behind both is `IndexByte` scanning clean bytes
+  ~4.5× faster than the walk but costing a call per escape.
+  **The 4.5× ratio travels between machines; the crossover does not** — it also
+  depends on the per-escape call cost, which moves relative to `IndexByte`'s
+  throughput. Measured 4.5× on arm64 (26.5 vs 5.9 GB/s) *and* on amd64 (~60 vs
+  13 GB/s, Ryzen 8840HS), yet the crossover is ~70 bytes on the first and
+  **32–40 bytes** on the second. An earlier version of this bullet said the
+  ratio alone set these constants; that is wrong for `escClean` (below), right
+  for `escGap` and `unescWindow`, both of which re-measured the same on x86.
+  `scanQuotedSparse` returning −1, and its unsigned loop head, are what
   make the `i == n+1` hand-back (a trailing backslash stepped over) report an
   unterminated value instead of panicking — pinned by
   `testdata/fuzz/FuzzIterateAgainstRef/ee6d5b3abecfadf7` and by
@@ -632,6 +787,20 @@ happening implicitly and bought nothing.
   point between 32-byte and 8-byte gaps, which is exactly where real logfmt sits.
   `AppendUnescape` keeps the same shape with its own, smaller window
   (`unescWindow`, above).
+  **`escClean` 8 → 5 (2026-08-17, amd64 review).** Eight words is a 64-byte
+  clean run, nearly twice the amd64 crossover, so a value with escapes 48 bytes
+  apart was walked end to end where `IndexByte` was 17% faster. Five is forced
+  from both sides rather than fitted: the largest value that gives up at the
+  crossover, and the smallest that keeps `sample_big.txt` on the walk — that
+  value's clean run is **exactly four words**, which `escClean` = 4 proves by
+  dropping it off the dense path for **GetMany +11.9% and LevelTS +14.8%**
+  (the same failure mode as the 32-byte window above, found the same way). At 5:
+  the 48-byte-gap shape −8.6%/−10.0% in two series, every other row `~`, control
+  clean. 6 is indistinguishable from 8 (at a 48-byte gap the walk needs 6 clean
+  words, so only ≤5 gives up). **This is an x86-only result so far**, in a band
+  neither machine's committed sweep sampled; it wants one confirming N2 run.
+  Note the blind spot cuts both ways now — the committed `IterateEscaped` rows
+  read `~` for this change, which is why `Benchmark_IterateEscapedGap` was added.
 - **`if m := hasKeyStop(w); m != 0 {`, not `m := …` on its own line** (2026-08-17).
   A call to an inlined function that is alone on its source line leaves the
   compiler's inline mark with no real instruction to attach to, and it becomes a
@@ -641,10 +810,15 @@ happening implicitly and bought nothing.
   same source shape and a cleaner loop; note the mark can come back if the
   first statement of the `if` body changes (a `:=` declaration there did it in
   one variant — check with `go tool objdump -s 'logfmt\.iterate$' | grep NOOP`).
-- **`GOAMD64=v3` builds are ~3–4% faster** (re-measured 2026-07-26, interleaved
-  A/B: Iterate 275.2 → 266.9 ns = 3.0%; GetMany 54.9 → 53.4 ns = 2.7%) —
-  BMI's TZCNT helps the SWAR `TrailingZeros64`. A user build flag, not
-  something the module can set; noted in the README.
+- **`GOAMD64=v3` builds are ~1.5% faster** — BMI's TZCNT helps the SWAR
+  `TrailingZeros64`. A user build flag, not something the module can set; noted
+  in the README. **Re-measured 2026-08-17** on go1.26.5 (Ryzen 8840HS, n=6
+  pinned interleaved): Iterate 230.8 → 227.6 ns = 1.37%, geomean 1.67%,
+  GetMany/LevelTS/DecodeKeyval all `~`. The earlier figure — "~3–4%", Iterate
+  3.0% / GetMany 2.7%, measured 2026-07-26 on the same machine class — no longer
+  reproduces; roughly half of it has gone, presumably to codegen changes between
+  toolchains. Still positive, still worth mentioning to users, but don't quote
+  the old number.
 
 ## The two superseded branches (read before re-deriving their findings)
 
@@ -928,6 +1102,33 @@ noisy). Each was **neutral or worse**:
     attempted; prototype under `FuzzIterateAgainstRef` with a control-clean
     series before landing.**
 
+- **2026-08-17 amd64 review — measured and NOT landed** (the pass's three
+  landed changes are in the benchmarks section):
+  - *A sparse→dense upgrade in `scanQuotedSparse`*, closing the one-way `escGap`
+    entry decision. **Prototyped, fuzz-clean, and it works** — −32% on the
+    prefix-then-dense shape — but +3–4% on values whose escapes really are
+    64–256 B apart, which makes it a bet on the input distribution rather than a
+    stopwatch result. Full writeup, including the oscillation trap that must be
+    avoided if it is revisited, is in Known functional limits above. Deliberately
+    left out; the cliff is documented in `logfmt.go` and pinned by
+    `Benchmark_IteratePrefixJSON`, so it cannot be lost.
+  - *Deleting `escGap` and relying on `escClean` alone.* Fixes the cliff for free
+    in code terms, but every sparse value then pays one wasted probe of up to
+    `escClean` words before handing back: +6.2% at 64 B gaps, +6.0% at 96 B,
+    +8.8% at 128 B. Rejected — the entry gate is earning its keep.
+  - *`escClean` = 4 and = 6.* 4 drops `sample_big.txt` off the walk (GetMany
+    +11.9%, LevelTS +14.8%); 6 is indistinguishable from 8 because a 48-byte gap
+    needs 6 clean words. 5 is the only value that does both jobs — see the
+    constant's own comment.
+  - *`unescWindow` = 2 and = 8 on amd64.* 2: −11% at 128 B gaps but +18.8% at
+    32 B and +4.3% on `UnescapeJSONMsg`. 8: +28.5% at 128 B gaps. 4 stands on
+    both arches now.
+  - *Three alternative spellings of the `AppendUnescape` probe bound* (`uint`
+    outer head; `uint(s) <= uint(n-8)` with `n>=8` hoisted; precomputed limit
+    with `s` as the induction variable). None removes the bounds check; the
+    unsigned form is actively worse (26 instructions vs 23). Only the explicit
+    `s >= 0` works — see that loop's comment.
+
 The parser is **memory-latency / per-field-overhead bound**, not scan-throughput
 bound (confirmed on arm64 with counters, see the 2026-08-17 benchmarks
 section: IPC 4.4, no mispredictions, instruction count barely moves cycles).
@@ -971,7 +1172,17 @@ wins in `-count=1` runs but vanish when averaged.
   `Iterate`, `GetMany`, `DecodeKeyval` and `LevelTS` stayed within ±0.2%. So:
   run that padding control once per machine, treat the layout-sensitive rows
   as ±2% no matter what benchstat's p-value says, and only believe sub-2%
-  deltas on rows the control showed to be layout-stable. The 2026-08-17 recipe:
+  deltas on rows the control showed to be layout-stable.
+  **The ±2% figure is arm64's; do not carry it to x86.** On the Ryzen 8840HS
+  (2026-08-17) the same class of shift moved escape-density rows by up to
+  **8.5%** — a constant change that altered nothing on a row's code path moved
+  it that far — while `Iterate`/`GetMany`/`DecodeKeyval`/`LevelTS` again stayed
+  layout-stable. Same lesson, larger number: the four core rows are the ones to
+  decide on, and a single-digit delta on an `*Escaped/*` row means nothing
+  without a mechanism. Note also that a busy desktop still resolves the large
+  effects — the A/A control came back at −0.03% with a browser eating 60% of the
+  machine — but it widens the per-row ± enough that sub-3% findings should be
+  re-run somewhere quiet rather than believed. The 2026-08-17 recipe:
   `go test -c` once per tree, then a shell loop that runs the two binaries
   pinned (`taskset -c 1`) with `-test.count=1`, alternating which goes first
   each round, appending to two files for `benchstat`; each tree is a plain

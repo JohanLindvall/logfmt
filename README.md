@@ -315,7 +315,7 @@ that axis, and `Benchmark_UnescapeEscaped` sweeps it for `AppendUnescape`, which
 uses the same trick while decoding and is the slower half at high density.
 
 On amd64, building with `GOAMD64=v3` (Haswell+, 2013 onwards) makes the parser
-~3% faster (BMI's `TZCNT` for the word-at-a-time scanning). It is a consumer
+1–2% faster (BMI's `TZCNT` for the word-at-a-time scanning). It is a consumer
 build flag, not something the module can set.
 
 ### vs other Go logfmt parsers
