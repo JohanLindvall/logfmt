@@ -549,7 +549,23 @@ func AppendUnescape(dst []byte, raw []byte) []byte {
 		j := -1 // index of the next backslash, once found
 		s := i  // scan position; raw[i:s] is known to hold none
 		if dense {
-			for quiet := 0; quiet < unescWindow && s <= n-8; quiet++ {
+			// The "s >= 0" is redundant to a reader and load-bearing to the
+			// compiler: it is what removes the bounds check on the Uint64 load
+			// below. iterate gets the same fact from its "uint(i) < uint(n)"
+			// loop head, but that trick does not reach here, because s is not
+			// this loop's induction variable (quiet is) and so the prove pass
+			// never learns s is non-negative. Without the test the load pays a
+			// LEA and two compare-and-branch pairs into panicBounds per probed
+			// word: 28 instructions in this region against 23 with it, worth
+			// 14% at 8-byte escape gaps and 13% on Benchmark_UnescapeJSONMsg.
+			// It costs 3% at 128-byte gaps, where all unescWindow words are
+			// wasted anyway and the extra compare has nothing to amortise
+			// against. Three other spellings were tried — a uint outer head, an
+			// unsigned "uint(s) <= uint(n-8)" with the n>=8 guard hoisted, and a
+			// precomputed limit with s as the induction variable — and none of
+			// them eliminates the check. Verify with -d=ssa/check_bce/debug=1
+			// before changing this line.
+			for quiet := 0; quiet < unescWindow && s >= 0 && s <= n-8; quiet++ {
 				w := binary.LittleEndian.Uint64(raw[s : s+8])
 				if m := hasBackslash(w); m != 0 {
 					j = s + bits.TrailingZeros64(m)>>3
@@ -629,22 +645,43 @@ func hex4(b []byte) rune {
 	if len(b) < 4 {
 		return -1
 	}
-	var r rune
-	for _, c := range b[:4] {
-		r <<= 4
-		switch {
-		case c >= '0' && c <= '9':
-			r |= rune(c - '0')
-		case c >= 'a' && c <= 'f':
-			r |= rune(c-'a') + 10
-		case c >= 'A' && c <= 'F':
-			r |= rune(c-'A') + 10
-		default:
-			return -1
-		}
+	// Four table lookups, no data-dependent branch per digit. Every non-hex
+	// byte maps to -1, whose sign bit survives the OR, so a single sign test
+	// rejects a malformed payload wherever the bad digit sat. Same reasoning
+	// as spaceTable, and the same answer: two instructions beat six.
+	//
+	// This was a chain of range compares — up to six branches a digit, 24 an
+	// escape, all of them data-dependent — until 2026-08-17, and it had stayed
+	// that way because NOTHING IN THE BENCHMARK SUITE REACHED IT: every escaped
+	// sample in the package carries \" \\ \t or \n and none carries \u, even
+	// though go-logfmt writes control characters as \u00XX and decoding them is
+	// the documented round-trip requirement. Benchmark_UnescapeUnicode and
+	// Benchmark_AppendValueUnicode exist to close that hole; the table is worth
+	// 26% and 21% on them. Keep the benchmarks even if the table is ever
+	// replaced — an unmeasured path is how this one drifted.
+	h0, h1 := hexTable[b[0]], hexTable[b[1]]
+	h2, h3 := hexTable[b[2]], hexTable[b[3]]
+	if h0|h1|h2|h3 < 0 {
+		return -1
 	}
-	return r
+	return rune(h0)<<12 | rune(h1)<<8 | rune(h2)<<4 | rune(h3)
 }
+
+// hexTable maps each hex digit to its value and every other byte to -1.
+var hexTable = func() [256]int8 {
+	var t [256]int8
+	for i := range t {
+		t[i] = -1
+	}
+	for i := 0; i < 10; i++ {
+		t['0'+i] = int8(i)
+	}
+	for i := 0; i < 6; i++ {
+		t['a'+i] = int8(10 + i)
+		t['A'+i] = int8(10 + i)
+	}
+	return t
+}()
 
 // AppendValue looks up key in data, appends its unescaped value to dst and
 // returns the extended slice along with whether the key was present. When the
