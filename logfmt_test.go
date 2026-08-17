@@ -611,6 +611,99 @@ func Test_Unit_Unquoted_Backslashes_Are_Literal(t *testing.T) {
 	}
 }
 
+// Test_Unit_Quoted_EscapeDense_Scan pins the two-scan split a quoted value with
+// escapes is handled by: the bytes.IndexByte scan a value with no escaped quote
+// never leaves, the inline SWAR walk an escape-dense one switches to, and — the
+// part nothing else covers — every transition between them. The transitions are
+// where the bugs live: the walk can decline on arrival (the first escape sits
+// more than escGap bytes in), give up part way (escClean clean words go by), and
+// hand back with the position already one byte PAST the end of the input.
+func Test_Unit_Quoted_EscapeDense_Scan(t *testing.T) {
+	// Longer than the walk's clean-run bailout, so a gap spanning it hands the
+	// rest of the value back to the IndexByte scan; also longer than escGap, so
+	// a value whose first escape sits behind it is declined on arrival.
+	long := strings.Repeat("x", escClean*8+8)
+
+	for _, tt := range []struct {
+		name    string
+		line    string
+		raw     string // the value as Iterate reports it, escapes intact
+		decoded string // the same value as AppendValue reports it
+	}{{
+		name:    "dense throughout",
+		line:    `msg="{\"user\":\"bob\",\"id\":42}" next=ok`,
+		raw:     `{\"user\":\"bob\",\"id\":42}`,
+		decoded: `{"user":"bob","id":42}`,
+	}, {
+		name:    "escaped backslash reached from the walk",
+		line:    `msg="x\"y\\" next=ok`,
+		raw:     `x\"y\\`,
+		decoded: `x"y\`,
+	}, {
+		// Escapes seven bytes apart, so a backslash and the quote it protects
+		// straddle two SWAR word loads.
+		name:    "escape pair straddling a word",
+		line:    `msg="aaaaaaa\"aaaaaaa\"aaaaaaa\"" next=ok`,
+		raw:     `aaaaaaa\"aaaaaaa\"aaaaaaa\"`,
+		decoded: `aaaaaaa"aaaaaaa"aaaaaaa"`,
+	}, {
+		name:    "dense, then gaps open up",
+		line:    `msg="\"` + long + `\"yy" next=ok`,
+		raw:     `\"` + long + `\"yy`,
+		decoded: `"` + long + `"yy`,
+	}, {
+		// The first escape sits beyond escGap, so the walk declines on arrival
+		// and the whole value is settled by the IndexByte scan.
+		name:    "first escape too far in: walk declined on arrival",
+		line:    `msg="` + long + `\"\"\"" next=ok`,
+		raw:     long + `\"\"\"`,
+		decoded: long + `"""`,
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			line := []byte(tt.line)
+			if err := Validate(line); err != nil {
+				t.Fatalf("Validate: unexpected error: %v", err)
+			}
+			got, quoted, ok := GetQuoted(line, "msg")
+			if !ok || !quoted {
+				t.Fatalf("GetQuoted: got ok=%v quoted=%v, want both true", ok, quoted)
+			}
+			if string(got) != tt.raw {
+				t.Errorf("raw value:\n got  %q\n want %q", got, tt.raw)
+			}
+			if dec, _ := AppendValue(nil, line, "msg"); string(dec) != tt.decoded {
+				t.Errorf("decoded value:\n got  %q\n want %q", dec, tt.decoded)
+			}
+			// The pair after it must still be found, which is the check that
+			// the scan stopped on the right quote rather than one further on.
+			if v, _ := Get(line, "next"); string(v) != "ok" {
+				t.Errorf("next: got %q, want \"ok\"", v)
+			}
+		})
+	}
+
+	// Malformed shapes only reachable through the walk.
+	for _, tt := range []struct{ name, line string }{{
+		name: "unterminated after handing back",
+		line: `msg="\"` + long + `\"yy`,
+	}, {
+		// The escape runs off the end while the walk is still running, and it
+		// steps two bytes at a time, so it lands PAST the end rather than on
+		// it. Handing that position back to the IndexByte scan used to panic;
+		// testdata/fuzz/FuzzIterateAgainstRef/ee6d5b3abecfadf7 is the input
+		// that found it.
+		name: "trailing lone backslash mid-walk",
+		line: `msg="\"` + strings.Repeat("0", escClean*8-8) + `\`,
+	}} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := Validate([]byte(tt.line))
+			if !errors.Is(err, ErrBadFormat) {
+				t.Fatalf("Validate: got %v, want ErrBadFormat", err)
+			}
+		})
+	}
+}
+
 func Test_Unit_Validate_SyntaxError(t *testing.T) {
 	if err := Validate([]byte(`a=1 b="ok" c=3`)); err != nil {
 		t.Errorf("Validate(well-formed) = %v, want nil", err)

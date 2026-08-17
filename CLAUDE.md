@@ -54,6 +54,12 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   `AppendUnescape` as its own oracle for `AppendValue`, so a bug inside
   `AppendUnescape` cancels on both sides there — which is what the next file
   is for.
+- `testdata/fuzz/FuzzIterateAgainstRef/ee6d5b3abecfadf7` — a committed corpus
+  entry, not a seed in code: the input that found a real panic in the
+  escape-dense scan (the hand-back to `bytes.IndexByte` could leave the position
+  at `n+1`, where `data[i:]` does not merely fail to match but crashes). It came
+  from the maintainer's `perf/escape-dense-quoted-scan` branch (PR #2) and is
+  kept because CI runs corpus files as well as seeds.
 - `unescape_fuzz_test.go` — `FuzzAppendUnescapeAgainstRef` (added 2026-08-17,
   when `AppendUnescape` gained its SWAR follow-up scan): a byte-at-a-time
   reference decoder spelled out independently, checked three ways — append to
@@ -71,10 +77,17 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   the line" is satisfied by a heap copy, so the old form passed with `Get`
   copying. `Test_Unit_Unquoted_Backslashes_Are_Literal` pins the quoted/unquoted
   decode split. `Benchmark_IterateEscaped` sweeps escape density at fixed
-  length; `Benchmark_IterateJSONMsg` / `Benchmark_UnescapeJSONMsg` (2026-08-17)
-  are the realistic point on that axis — a structured event serialised into a
-  `msg=` field, one escape per ~7 bytes — for the parser and the decoder
-  respectively.
+  length and `Benchmark_UnescapeEscaped` sweeps it for the decoder (from PR #2),
+  which is the slower half once escapes are dense; `Benchmark_IterateJSONMsg` /
+  `Benchmark_UnescapeJSONMsg` (2026-08-17) are the realistic point on that axis —
+  a structured event serialised into a `msg=` field, one escape per ~7 bytes —
+  for the parser and the decoder respectively. Tune the escape constants against
+  those two and the 1.4 KB sample, NOT against the synthetic sweep alone: the
+  sweep jumps straight from 32-byte gaps to 8-byte gaps, and real logfmt sits in
+  between (the sample's own escapes are 38 bytes apart).
+  `Test_Unit_Quoted_EscapeDense_Scan` (from PR #2, adapted to `escGap`/
+  `escClean`) pins both scans and every transition between them, including the
+  two malformed shapes only the walk can reach.
 - `bench/` — separate module, **declares go 1.23** (above the library floor) so
   it can host `TestAllRangeOverFunc`, the consumer-side proof that `All` works
   with `for … range`. CI skips this module on the 1.21 floor job.
@@ -156,9 +169,13 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   `IndexByte('\\')` so callers skip the decode when unnecessary — keep it a
   single expression so it stays inlinable (a SWAR helper here measurably
   regressed). Inside `AppendUnescape` the *first* backslash is still found by
-  `IndexByte`; after each decoded escape it probes the next `escWindow` words
-  inline with `hasBackslash` before calling `IndexByte` again (2026-08-17:
+  `IndexByte`; after each decoded escape it probes the next `unescWindow` (4)
+  words inline with `hasBackslash` before calling `IndexByte` again (2026-08-17:
   `Unescape` −8.5%, the JSON `msg=` value −40%; see "Escape-dense values").
+  `unescWindow` is its own constant, deliberately not the parser's `escClean`:
+  re-measured on `Benchmark_UnescapeEscaped`, eight words costs the 128-byte-gap
+  row 18.5% and gains nothing anywhere (geomean +2.0%), because this scan only
+  looks for the next escape where the parser's consumes them as it goes.
 - `ParseTime(ts []byte)` — `[]byte` like everything else. A caller holding a
   `[]byte` pays the same allocs on the named-zone layout either way (measured
   both sides); the old `string` benchmark only looked cheaper because it fed a
@@ -285,14 +302,30 @@ Don't reintroduce that pattern; if the numbers must appear in two places, have
 the renderers splice into marker-delimited blocks so the claim is true.
 
 Table currency, as of 2026-08-17: the committed tables are **current through
-`b83eade`** (`90c6c75`, stamped 2026-08-08T16:36Z, is its direct child) and
-**stale for the 2026-08-17 pass**. The CI arm64 table's `IterateOur 391.3 ns` /
-`GetMany 81.4 ns` are byte-for-byte what the Neoverse N2 VM used for that pass
-measures for the same commit, so the arm64 CI runner is that machine class and
-the pass's ratios should reproduce there. Note `bench.yml` is
-`workflow_dispatch` only, so nothing refreshes them automatically; run
-`make bench-md` deliberately (dispatch the workflow). Don't hand-edit them with
-laptop figures.
+`b28092c`** (`f79d17a`, stamped 2026-08-17T13:16Z) and **stale for the
+escape-scan correction after it**. The CI arm64 numbers reproduce this
+machine's to within 0.1% at both commits (`391.3 / 81.4 / 72.1` at `90c6c75`,
+`381.9 / 80.5 / 69.8` at `b28092c`, against local `391.4 / 81.3 / 72.0` and
+`382.3 / 80.4 / 69.8`), so the arm64 runner is this machine class and ratios
+measured here travel to it.
+
+**The amd64 half of `f79d17a` is the only x86 data this repo has for the pass,
+and it caught the same regression independently.** EPYC 7763, `90c6c75` →
+`b28092c`: `Iterate` 414.2 → 394.0 (−4.9%), `LevelTS` 75.5 → 72.6 (−3.8%),
+`DecodeKeyval` 691.9 → 681.5 µs (−1.5%), `esc=128` 1129 → 671 ns (−40.5%),
+`esc=500` 4410 → 2549 ns (−42.2%) — but **`GetMany` 89.2 → 95.3 (+6.8%)** and
+**`esc=8` 92.0 → 154.8 (+68.3%)**, the 32-byte-window failure the correction
+fixes, and worse there than the +7.3% / +27% it cost on arm64. Nobody has
+measured the correction on x86; the mechanism is identical, so it should
+recover both rows, but say "should" until `bench.yml` is dispatched again.
+
+Treat these tables as indicative, never as A/B results: they are `-count=1`
+single runs with no interleaving and no control, and the same diff moves
+`ParseTime_Unix` 75.7 → 91.0 (+20%) on code that this pass never touched. A row
+only means something here when it is large and has a mechanism, as the two
+above do. Note `bench.yml` is `workflow_dispatch` only, so nothing refreshes
+them automatically; run `make bench-md` deliberately (dispatch the workflow).
+Don't hand-edit them with laptop figures.
 
 2026-07-27 **evening** pass (same machine, faster power state — do not compare
 absolutes across the two tables), n=8 interleaved pinned 1 s rounds, control
@@ -313,42 +346,54 @@ and an A/A control of two identical trees came back `~` on every row at
 `ubuntu-24.04-arm` runners, so the committed `*_arm64.md` tables should track
 these ratios once `bench.yml` is dispatched.
 
-Before = `90c6c75` (HEAD), after = this pass; n=8 pinned (`taskset -c 1`)
+Before = `90c6c75`, after = the pass as it finally stands (two commits:
+`b28092c`, then the escape-scan correction below); n=8 pinned (`taskset -c 1`)
 interleaved 1 s rounds, order rotated per round; benchstat p=0.000 on every
-non-`~` row:
+non-`~` row. The middle column is `b28092c`, kept because the difference
+between the two is the lesson:
 
-| Benchmark | before | after | Δ | allocs |
-|---|---:|---:|---:|---:|
-| `Iterate` (sample2, 1.4 KB, 29 fields) | 391.4 ns | 382.3 ns | −2.3% | 0 |
-| `ParseAll_Big_Mine` (bench/) | 391.6 ns | 383.4 ns | −2.1% | 0 |
-| `ParseAll_Typical_Mine` (130 B) | 85.1 ns | 83.4 ns | −1.9% | 0 |
-| `LevelTS` logfmt | 72.0 ns | 69.9 ns | −3.0% | 0 |
-| `GetMany` / `Extract_Mine` | 81.3 / 81.5 ns | 80.4 / 80.2 ns | −1.0% / −1.6% | 0 |
-| `DecodeKeyval` (10k short rows) | 726.1 µs | 720.1 µs | −0.8% | 0 |
-| `ParseEscaped_Mine` (bench/) | 214.1 ns | 193.3 ns | **−9.7%** | 0 |
-| `Unescape` | 28.3 ns | 26.0 ns | −8.5% | 0 |
-| `IterateJSONMsg` (JSON in `msg=`, 28 escapes) | 301.5 ns | 171.0 ns | **−43.3%** | 0 |
-| `UnescapeJSONMsg` (that value, decoded) | 318.3 ns | 191.8 ns | **−39.7%** | 0 |
-| `IterateEscaped/esc=0` (1 KB clean) | 36.2 ns | 35.1 ns | −3.2% | 0 |
-| `IterateEscaped/esc=8` | 107.8 ns | 137.7 ns | **+27.7%** (accepted, see below) | 0 |
-| `IterateEscaped/esc=32` | 333.6 ns | 250.3 ns | −25.0% | 0 |
-| `IterateEscaped/esc=128` | 1194 ns | 570 ns | −52.3% | 0 |
-| `IterateEscaped/esc=500` | 4.72 µs | 2.17 µs | −54.0% | 0 |
+| Benchmark | `90c6c75` | `b28092c` | final | Δ overall | allocs |
+|---|---:|---:|---:|---:|---:|
+| `Iterate` (sample2, 1.4 KB, 29 fields) | 391.4 ns | 382.3 ns | 377.0 ns | −3.7% | 0 |
+| `ParseAll_Big_Mine` (bench/) | 391.6 ns | 383.1 ns | 377.8 ns | −3.5% | 0 |
+| `ParseAll_Typical_Mine` (130 B) | 85.1 ns | 83.4 ns | 82.9 ns | −2.6% | 0 |
+| `LevelTS` logfmt | 72.0 ns | 69.8 ns | 64.8 ns | **−10.0%** | 0 |
+| `GetMany` | 81.3 ns | 80.4 ns | 74.5 ns | **−8.4%** | 0 |
+| `Extract_Mine` (bench/) | 81.5 ns | 80.2 ns | 75.7 ns | **−7.1%** | 0 |
+| `DecodeKeyval` (10k short rows) | 726.1 µs | 719.7 µs | 725.2 µs | `~` | 0 |
+| `ParseEscaped_Mine` (bench/) | 214.1 ns | 193.3 ns | 192.8 ns | **−9.9%** | 0 |
+| `Unescape` | 28.3 ns | 26.0 ns | 25.6 ns | −9.5% | 0 |
+| `IterateJSONMsg` (JSON in `msg=`, 28 escapes) | 301.5 ns | 171.0 ns | 168.2 ns | **−44.2%** | 0 |
+| `UnescapeJSONMsg` (that value, decoded) | 318.3 ns | 191.6 ns | 189.7 ns | **−40.4%** | 0 |
+| `IterateEscaped/esc=0` (1 KB clean) | 36.2 ns | 35.0 ns | 35.6 ns | −1.7% | 0 |
+| `IterateEscaped/esc=8` (128 B gaps) | 107.8 ns | 137.7 ns | 108.7 ns | `~` | 0 |
+| `IterateEscaped/esc=32` (32 B gaps) | 333.6 ns | 250.2 ns | 220.5 ns | **−33.9%** | 0 |
+| `IterateEscaped/esc=128` (8 B gaps) | 1194 ns | 569.7 ns | 557.3 ns | **−53.3%** | 0 |
+| `IterateEscaped/esc=500` (2 B gaps) | 4.72 µs | 2.17 µs | 2.11 µs | **−55.3%** | 0 |
+| `UnescapeEscaped/esc=500` (decode) | — | — | 2.98 µs | new | 0 |
 
-Root geomean −21.0% (dominated by the escape rows); bench/ `Mine` geomean
-−3.9%; the four layout-stable core rows (Iterate, GetMany, DecodeKeyval,
-LevelTS) −0.8% to −3.0%, none regressed. Three changes landed: the quoted-bit
-protocol (above), the escape-dense follow-up scan in the quoted branch and in
-`AppendUnescape` (next section), and the `if m := hasKeyStop(w); m != 0`
-spelling (drops a real `NOOP` per SWAR iteration on both arches; measured
-neutral, kept for the cleaner loop). The `esc=8` row is the one accepted
-regression: one escaped quote per 128 bytes pays a wasted four-word probe
-(~3.7 ns) per escape; gating the probe on the previous gap being short fixed
-that row (+7%) but cost `Unescape` +11% and the realistic prose shape
-(`\"word\"` pairs are close together even when the pairs are far apart), so the
-ungated form stayed. Both differential fuzzers plus the new unescape one pass
-90 s / 60 s / 60 s clean; coverage 99.6% (the one uncovered statement is still
-`parseUnixTS`'s unreachable guard).
+Four changes landed: the quoted-bit protocol (above), the two-scan split for
+escape-dense quoted values and the probe in `AppendUnescape` (see the
+optimization notes), and the `if m := hasKeyStop(w); m != 0` spelling (drops a
+real `NOOP` per SWAR iteration on both arches; measured neutral, kept for the
+cleaner loop). **No row regressed overall, and `esc=8` is back to parity.**
+
+The two-commit story is the point. `b28092c` shipped the escape scan as one
+always-entered 32-byte probe, tuned on the synthetic sweep, and it cost
+`GetMany` 7.3% and `LevelTS` 7.2% against what was available — masked in that
+commit's own A/B because the quoted-bit protocol landed alongside and more than
+covered it. The correction (a `escGap`/`escClean` split, ported from the
+maintainer's open branch `perf/escape-scan-and-adapter`, PR #1) recovered it:
+vs `b28092c`, GetMany −7.3%, LevelTS −7.2%, `esc=8` −21.1%, `esc=32` −11.9%,
+`esc=128` −2.2%, `esc=500` −2.8%, Iterate −1.4%, `DecodeKeyval` +0.8%,
+`esc=0` +1.5%, root geomean −4.8% / bench geomean −2.0%. The finished tree also
+beats that branch itself (Unescape −10.4%, GetMany −1.7%, Iterate −0.5%,
+DecodeKeyval −0.7%, escape rows at parity), because it keeps this pass's
+`AppendUnescape` probe and set-only protocol on top of the branch's gating.
+
+All three differential fuzzers pass clean (90 s / 60 s / 60 s); coverage 99.6%
+(the one uncovered statement is still `parseUnixTS`'s unreachable guard), and
+both new scan helpers are at 100%.
 
 What `perf stat` says about this core, for whoever optimizes next (the
 hypervisor exposes only the generic events; the N2 IMPDEF ones read 0):
@@ -389,15 +434,21 @@ preceding backslash run: ~9.4 ns each on the N2 (Ryzen: ~10). Since 2026-08-17
 that price is paid only for the *first* escaped quote of a cluster: from there
 the parser scans forward a word at a time for `"` or `\` (`hasQuoteOrBackslash`),
 consuming each backslash with the byte it escapes, at ~4.3 ns per escape in the
-densest case and no per-escape call at all; after `escWindow` (4) quiet words
-it hands back to `IndexByte`. Embedded JSON in a `msg=` field — every JSON
-quote becomes `\"`, one escape per ~2–8 bytes — is the realistic shape this
-serves: `Benchmark_IterateJSONMsg` −43%, `Benchmark_UnescapeJSONMsg` −40%. At a
-**fixed** 1 KB value the sweep now runs 35 ns (0 escapes) → 2.17 µs (500), about
-60× (it was 36 → 4.72 µs, 130×, on this machine; 65 → 6100 ns, 90×, on the
-Ryzen). `Benchmark_IterateEscaped` pins that axis; it exists because
-`sample_big.txt` has 2 escaped quotes in 1.4 KB (~4%) and so makes the quoted
-scan look like pure `IndexByte` throughput.
+densest case and no per-escape call at all; it hands back to `IndexByte` when
+the escapes turn out to be sparse (`escGap`/`escClean`, see the optimization
+notes). Embedded JSON in a `msg=` field — every JSON quote becomes `\"`, one
+escape per ~2–8 bytes — is the realistic shape this serves:
+`Benchmark_IterateJSONMsg` −44%, `Benchmark_UnescapeJSONMsg` −40%. At a
+**fixed** 1 KB value the parse sweep now runs 35.6 ns (0 escapes) → 2.11 µs
+(500), about 59× (it was 36 → 4.72 µs, 130×, on this machine; 65 → 6100 ns, 90×,
+on the Ryzen). `Benchmark_IterateEscaped` pins that axis and
+`Benchmark_UnescapeEscaped` pins the same axis for the decoder, which is the
+slower half once escapes are dense (2.98 µs against the parser's 2.11 µs at
+esc=500). Both exist because `sample_big.txt` has 2 escaped quotes in 1.4 KB
+(~4%) and so makes the quoted scan look like pure `IndexByte` throughput — but
+note the sweep's own blind spot, between its 32-byte and 8-byte gap points,
+which is where that sample's 38-byte gap sits and where the first version of
+this scan lost 7% on GetMany.
 
 This is **not** the rejected "inline first-word `hasByte` before `IndexByte`"
 item, which was about sparing short *clean* values a call — clean values still
@@ -549,24 +600,38 @@ happening implicitly and bought nothing.
   found-values are never nil, so `nil` == absent unambiguously.
 - **Closing-quote verify tests `' '` first** (`c != ' ' && !isSpace(c)`) — same
   short-circuit trick as the SWAR verifies; ~1% on quoted-heavy lines.
-- **Escape-dense values: SWAR follow-up scan after the first escaped quote**
-  (2026-08-17). The quoted branch still opens with `bytes.IndexByte('"')` plus
-  the backslash-run parity walk — clean values never see anything else. When
-  the walk says *escaped*, the loop steps past the quote and probes forward a
-  word at a time with `hasQuoteOrBackslash` (two has-zero-byte tests OR-ed; the
-  borrow caveat applies and is harmless as always): a `\` found means "skip it
-  and the byte it escapes" (`i += 2`), a `"` found is the closing quote by
-  construction (every backslash before it was consumed pairwise, so no walk is
-  needed) and jumps to the shared `closingQuote:` label; a word with neither
-  bumps `quiet`, and after `escWindow` = 4 quiet words the loop `continue`s to
-  `IndexByte` from wherever it stopped — sound because the parity walk is
-  context-free, so nothing needs carrying across. `i = min(i, n)` before that
-  hand-back covers the one way `i` reaches `n+1`: an escaping backslash as the
-  last byte of the input (pinned by unit case and seed). Window size was
-  measured at 2/4/8: 4 wins — 2 loses the `esc=32` row (+17%) because a JSON
-  string value longer than 16 bytes drops back to `IndexByte` every time, 8
-  costs the sparse row +59% for no dense gain. `AppendUnescape` applies the same
-  idea with `hasBackslash` after every decoded escape.
+- **Escape-dense values: two scans, chosen by how far apart the escapes are**
+  (2026-08-17, revised the same day — see the correction note below). The quoted
+  branch still opens with `bytes.IndexByte('"')` plus the backslash-run parity
+  walk, and a value with no escaped quote never leaves that path. When the walk
+  says *escaped*, `scanQuotedEscapeDense` takes over: it walks forward a word at
+  a time with `hasQuoteOrBackslash`, consuming each `\` together with the byte
+  it escapes — stepping over the pair IS the parity rule, so no walk is needed
+  inside it — and a `"` it reaches is the closing quote by construction. It
+  declines the job two ways, both handing back to `scanQuotedSparse` (the
+  `IndexByte`+parity loop, out of line): **`escGap` = 48**, the first escape sat
+  more than 48 bytes into the value, so the escapes are sparse and `IndexByte`'s
+  stride wins; and **`escClean` = 8**, eight consecutive words went by with
+  neither byte in them. Handing back carries nothing, because the parity rule is
+  context-free. Both constants sit on one measured crossover: `IndexByte` scans
+  clean bytes ~4.5× faster than the walk (26.5 vs 5.9 GB/s here) but costs a
+  call per escape, so the walk wins while escapes stay within ~70 bytes of each
+  other. `scanQuotedSparse` returning −1, and its unsigned loop head, are what
+  make the `i == n+1` hand-back (a trailing backslash stepped over) report an
+  unterminated value instead of panicking — pinned by
+  `testdata/fuzz/FuzzIterateAgainstRef/ee6d5b3abecfadf7` and by
+  `Test_Unit_Quoted_EscapeDense_Scan`.
+  **The correction:** this landed first (`b28092c`) as a single always-entered
+  probe with a 32-byte window and no `escGap`, tuned on `Benchmark_IterateEscaped`
+  and an embedded-JSON line alone. `sample_big.txt`'s two escaped quotes are
+  **38 bytes** apart, just outside that window, so every parse of the shared
+  sample paid a failed probe *and* a restarted `IndexByte`: **GetMany 7.3% and
+  LevelTS 7.2% slower than it had to be**, invisible in that pass because the
+  quoted-bit protocol landing beside it more than covered the loss. Tune this
+  axis on the realistic line, not only on the synthetic sweep — the sweep has no
+  point between 32-byte and 8-byte gaps, which is exactly where real logfmt sits.
+  `AppendUnescape` keeps the same shape with its own, smaller window
+  (`unescWindow`, above).
 - **`if m := hasKeyStop(w); m != 0 {`, not `m := …` on its own line** (2026-08-17).
   A call to an inlined function that is alone on its source line leaves the
   compiler's inline mark with no real instruction to attach to, and it becomes a
@@ -580,6 +645,35 @@ happening implicitly and bought nothing.
   A/B: Iterate 275.2 → 266.9 ns = 3.0%; GetMany 54.9 → 53.4 ns = 2.7%) —
   BMI's TZCNT helps the SWAR `TrailingZeros64`. A user build flag, not
   something the module can set; noted in the README.
+
+## The two superseded branches (read before re-deriving their findings)
+
+`perf/escape-scan-and-adapter` (PR #1) and `perf/escape-dense-quoted-scan`
+(PR #2) attacked exactly this pass's two ideas, a few days earlier, and were
+open while `b28092c` was pushed. Neither merges any more (both branch off
+`90c6c75` and conflict in `logfmt.go`, `CLAUDE.md`, `README.md` and the tests),
+and everything measurably better in them is now in main — but their **x86
+measurements are the only ones this repo has for these changes**, since the
+current machine is arm64 only. Keep the branches or their PR bodies reachable
+rather than re-deriving:
+
+- PR #1 is where `escGap`/`escClean` and the `scanQuotedEscapeDense` /
+  `scanQuotedSparse` split come from; main's version is that design with this
+  pass's `AppendUnescape` probe and set-only quoted protocol on top, and it
+  beats the branch on every row it differs on.
+- PR #2's rejected alternatives, measured on an Intel Core Ultra 9 185H:
+  an always-dense scan is −32% at 8-byte gaps but **+48% at 128-byte gaps** and
+  +6.4% on GetMany; a 32-byte entry gate costs the realistic escaped line
+  **+7.3%**; and **inlining the dense scan into `iterate` costs GetMany 5.1%
+  and Extract 3.1%** on that machine, where hoisting it out costs 2.7% on this
+  one. Treat the placement of that scan as machine-dependent.
+- PR #1's body reports the 2026-08-08 adapter hop as **invisible on x86**,
+  where it measured +2.3% Iterate / +4.4% LevelTS here. Both can be true; it
+  means the set-only protocol's win is an arm64 result until someone re-runs it
+  on x86, and neither result should be quoted as universal. (The one x86 data
+  point since — the CI amd64 table at `b28092c` — has `Iterate` −4.9% and
+  `LevelTS` −3.8% for the protocol and scan together, so nothing there
+  contradicts it either way.)
 
 ## Rejected / parked (do NOT re-attempt without new evidence)
 
@@ -788,14 +882,26 @@ noisy). Each was **neutral or worse**:
   - *`*quoted = q` stored before every callback* (the obvious out-parameter):
     Iterate −1.7% but GetMany +1.8%, Get/GetQuoted worse — a wash (geomean
     −0.1%). Superseded by the set-only protocol.
-  - *Gating the escape probe on the previous gap being short* (`dense :=
-    i-esc <= escWindow*8` in the parser, `dense = j-i < escWindow*8` in
+  - *Gating the escape probe on the PREVIOUS gap being short* (`dense :=
+    i-esc <= 32` in the parser (`escWindow` as it was then), `dense = j-i < 32` in
     `AppendUnescape`): fixes the sparse synthetic row (`esc=8` +28% → +7%) but
     `Unescape` +11% (its two escapes are close together after 118 bytes of
     prose, and the gate says "sparse" from the first gap) and the realistic
     prose shape — `\"word\"` pairs, close together even when the pairs are far
-    apart — loses the probe on exactly the quote it would have found. The
-    ungated form is also simpler. Rejected.
+    apart — loses the probe on exactly the quote it would have found. Rejected,
+    and note what replaced it: gating on the distance to the value's *first*
+    escape (`escGap`) is a different question with a different answer, because
+    it is asked once per value rather than once per escape.
+  - *Hoisting the probe out of `iterate` into a helper*, on the theory that the
+    GetMany/LevelTS gap against the branch in PR #1 came from the hot loop
+    growing: GetMany +2.7%, LevelTS +2.2%, `esc=8` +4.5%, geomean +1.25%. It
+    does not, and the gap was the gating (`escGap`) instead. Worth knowing that
+    out-of-lining this path costs rather than saves here, since PR #2's notes
+    report the opposite on x86 (inlining its dense scan cost GetMany 5.1%
+    there) — the two machines disagree, so re-measure before moving it again.
+  - *Decoder window of 8 words* (`unescWindow`, matching the parser's
+    `escClean`): `UnescapeEscaped/esc=8` +18.5%, geomean +2.0% across the
+    decode benchmarks, no row gained; reproduced on a rerun. Four stays.
   - *Byte-loop copy of literal runs ≤ 16 B in `AppendUnescape`* instead of
     `append(dst, raw[i:j]...)` (a `memmove` call): JSON −3%, `Unescape` +11%.
     Rejected. (The 2026-07-27 word-copy variant remains killed on correctness:

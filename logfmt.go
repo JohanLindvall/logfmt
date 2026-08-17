@@ -78,26 +78,59 @@ func hasBackslash(w uint64) uint64 {
 	return (b - swarLo) &^ b & swarHi
 }
 
-// hasQuoteOrBackslash flags every byte of w that is '"' or '\\', for the
-// escape-dense quoted-value scan. Two has-zero-byte tests OR-ed together; the
-// OR keeps the borrow caveat above harmless, so the lowest set bit is always a
-// genuine match.
+// hasQuoteOrBackslash flags every byte of w that is '"' or '\\' — the two bytes
+// that matter once a quoted value is known to carry an escaped quote, since
+// from there the value has to be walked escape by escape.
+//
+// Each half is the classic hasZero(w ^ broadcast(c)) equality test. The shared
+// "&^ w" factors out for the same reason it does in hasKeyStop: both '"' (0x22)
+// and '\\' (0x5c) have bit 7 clear, so bit 7 of w^c equals bit 7 of w, and bit 7
+// is the only position the result is ever read at. That saves one instruction
+// over masking each half with its own XOR-ed word.
+//
+// The borrow caveat is the usual one and is why the halves are OR-ed rather
+// than subtracted: a byte of 0x01 immediately above a true match (a '#' above a
+// '"', or a ']' above a '\\') is flagged spuriously, but only ever ABOVE a real
+// one, so the lowest set bit of either half — and of their union — is genuine.
 func hasQuoteOrBackslash(w uint64) uint64 {
 	q := w ^ (swarLo * '"')
 	b := w ^ (swarLo * '\\')
-	return (((q - swarLo) &^ q) | ((b - swarLo) &^ b)) & swarHi
+	return ((q - swarLo) | (b - swarLo)) &^ w & swarHi
 }
 
-// escWindow is how many quiet 8-byte words the escape-dense scans (the quoted
-// branch of iterate, and AppendUnescape) tolerate before handing back to
-// bytes.IndexByte. Escapes in real input come in clusters — every '"' of a JSON
-// document embedded in a msg= field is one — and within a cluster the next
-// event is nearly always inside the next couple of words, where an inlined SWAR
-// step beats a fresh IndexByte call by an order of magnitude; past the cluster
-// IndexByte's wider stride wins again. Measured at 2, 4 and 8: 2 drops JSON
-// string values longer than 16 bytes back to IndexByte every time, 8 makes
-// sparse values pay for nothing.
-const escWindow = 4
+// Thresholds for the two scans a quoted value with escapes is split between.
+// Both are distances between escaped quotes, and both sit on the same measured
+// crossover: bytes.IndexByte scans clean bytes about 4.5x faster than the SWAR
+// walk (26.5 vs 5.9 GB/s on the arm64 machine these were tuned on) but costs
+// roughly a call per escaped quote, so the walk wins while escapes stay within
+// about 70 bytes of each other and loses beyond that. The ratio, not the
+// machine, is what sets these; Benchmark_IterateEscaped sweeps the axis that
+// re-measures them.
+//
+// The floor under escGap is the real sample line in testdata, whose two escaped
+// quotes are 38 bytes apart with level= immediately after them: classify that
+// one sparse and most of the GetMany and LevelTS win goes with it (-6.4% and
+// -8.0% became -0.8% and ~). A window of 32 bytes — four words, tuned on the
+// synthetic sweep alone — does exactly that, which is how the first version of
+// this scan shipped 6% slower than it had to on GetMany and 7% on LevelTS.
+const (
+	escClean = 8  // consecutive clean words after which the walk gives up
+	escGap   = 48 // bytes to the first escape at or below which the walk wins
+)
+
+// unescWindow is the decoder's equivalent of escClean: how many quiet words
+// AppendUnescape probes for the next backslash before handing back to
+// bytes.IndexByte. It is deliberately its own constant, and smaller — the
+// decoder has no equivalent of escGap, since it is handed a value already known
+// to hold an escape, so its only choice is how long to keep looking.
+//
+// Four words, not eight, and re-measured on Benchmark_UnescapeEscaped rather
+// than guessed from the parser's setting: at eight the 128-byte-gap row costs
+// 18.5% (the wasted probe is twice as long and still finds nothing) while no
+// row gains, geomean +2.0% across the decode benchmarks. The asymmetry with
+// escClean is real — the parser's walk consumes escapes as it goes and so keeps
+// paying off, where this one only looks.
+const unescWindow = 4
 
 // hasKeyStop flags every byte of w that can end a key: '=' or <= 0x20. It is
 // two "<= 0x20" tests OR-ed together, with everything they share factored out.
@@ -121,6 +154,88 @@ const escWindow = 4
 func hasKeyStop(w uint64) uint64 {
 	x := w ^ (swarLo * 0x1d)
 	return ((w - swarLo*0x21) | (x - swarLo*0x21)) &^ w & swarHi
+}
+
+// scanQuotedEscapeDense walks a quoted value from just past an escaped quote,
+// a word at a time, consuming each backslash together with the byte it escapes
+// — stepping over the pair IS the run-parity rule, so no backslash walk is
+// needed here. It returns the position it stopped at and whether that position
+// is the value's unescaped closing quote.
+//
+// It declines the job in two ways, both handing back to scanQuotedSparse: the
+// first escape sat more than escGap bytes into the value (so the escapes are
+// sparse and IndexByte's wider stride wins), or escClean consecutive words went
+// by with neither byte in them (so they have become sparse part way through).
+// Handing back needs nothing carried across, because the parity rule is
+// context-free — the caller resumes with a plain IndexByte from wherever this
+// stopped.
+//
+// n is derived here rather than passed: the caller's n IS len(data), and
+// spelling it that way inside this function is what lets the prove pass relate
+// i to the slice at all. The loop head is unsigned for the reason iterate's is
+// — it means i < n while also supplying the i >= 0 fact — which matters because
+// the i += 2 step below can leave i at n+1, and that value must reach the head
+// as "stop", not as a negative-looking index that costs every bounds check in
+// the loop.
+func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
+	if i-1-vStart > escGap {
+		return i, false // already sparse on arrival; never mind the walk
+	}
+	n := len(data)
+	clean := 0
+	for uint(i) < uint(n) {
+		for i <= n-8 && clean < escClean {
+			w := binary.LittleEndian.Uint64(data[i : i+8])
+			if m := hasQuoteOrBackslash(w); m != 0 {
+				clean = 0
+				i += bits.TrailingZeros64(m) >> 3
+				goto stop
+			}
+			i += 8
+			clean++
+		}
+		if clean >= escClean {
+			return i, false // a long clean run: IndexByte covers it faster
+		}
+		for i < n && data[i] != '"' && data[i] != '\\' {
+			i++
+		}
+		if i >= n {
+			break
+		}
+	stop:
+		if data[i] == '"' {
+			return i, true
+		}
+		i += 2 // a backslash escapes whatever follows it, so step over both
+	}
+	return i, false
+}
+
+// scanQuotedSparse finds the unescaped closing quote of a value whose escapes
+// are far enough apart that one bytes.IndexByte call per escape beats walking
+// the bytes between them. It returns the closing quote's index, or -1 if the
+// value is never closed. i may arrive at n+1 from the dense scan's last step;
+// the unsigned head treats that as "nothing left", which is what stops the
+// data[i:] below from panicking rather than merely failing to match.
+func scanQuotedSparse(data []byte, i int) int {
+	n := len(data)
+	for uint(i) < uint(n) {
+		q := bytes.IndexByte(data[i:], '"')
+		if q < 0 {
+			break
+		}
+		i += q
+		bs := 0
+		for j := i - 1; data[j] == '\\'; j-- {
+			bs++
+		}
+		if bs&1 == 0 {
+			return i
+		}
+		i++
+	}
+	return -1
 }
 
 // Iterate parses data as a logfmt record and calls fn once for each key/value
@@ -285,64 +400,44 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 			*quoted = true
 			i++
 			vStart = i
-			for {
-				q := bytes.IndexByte(data[i:], '"')
-				if q == -1 {
-					// vStart is just past the opening quote, which is the
-					// position worth reporting.
-					return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
-				}
-				i += q
-
-				// Determine whether this quote is escaped by counting the
-				// run of backslashes immediately preceding it: an odd count
-				// means the quote is escaped and we keep scanning. The walk
-				// needs no lower-bound guard: data[vStart-1] is the opening
-				// quote (this path is entered only via '=' then '"'), any
-				// earlier escaped quote inside the value is also '"', and
-				// neither is a backslash, so the run always stops on its own.
-				// bs&1 rather than bs%2 spares the signed-modulo dance the
-				// compiler emits when it cannot prove bs >= 0 across the loop.
-				bs := 0
-				for j := i - 1; data[j] == '\\'; j-- {
-					bs++
-				}
-				if bs&1 == 0 {
-					break // an unescaped quote: the value ends here
-				}
-
-				// An escaped quote. Each one costs a fresh, non-inlinable
-				// IndexByte call plus the walk above, so a value dense with
-				// them — JSON in a msg= field turns every '"' into \" —
-				// used to run at roughly one call per two bytes. Instead
-				// scan forward a word at a time for the next '"' or '\\',
-				// consuming every backslash together with the byte it
-				// escapes; a '"' reached this way is unescaped by
-				// construction and needs no walk. After escWindow quiet
-				// words the value has gone sparse again and IndexByte takes
-				// over from a fresh position (the walk is context-free, so
-				// nothing needs to be carried across).
-				i++
-				for quiet := 0; quiet < escWindow && i <= n-8; {
-					w := binary.LittleEndian.Uint64(data[i : i+8])
-					m := hasQuoteOrBackslash(w)
-					if m == 0 {
-						i += 8
-						quiet++
-						continue
-					}
-					i += bits.TrailingZeros64(m) >> 3
-					if data[i] == '"' {
-						goto closingQuote
-					}
-					i += 2 // the backslash and whatever it escapes
-					quiet = 0
-				}
-				// A trailing backslash may have stepped one past the end;
-				// IndexByte then reports the value unterminated, as it is.
-				i = min(i, n)
+			// One IndexByte call settles a value with no escaped quote, which
+			// is nearly every value: it finds the terminator at SIMD speed and
+			// the walk below confirms it in a byte or two.
+			q := bytes.IndexByte(data[i:], '"')
+			if q < 0 {
+				// vStart is just past the opening quote, which is the
+				// position worth reporting.
+				return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
 			}
-		closingQuote:
+			i += q
+
+			// Determine whether this quote is escaped by counting the run of
+			// backslashes immediately preceding it: an odd count means the
+			// quote is escaped and the value continues. The walk needs no
+			// lower-bound guard: data[vStart-1] is the opening quote (this path
+			// is entered only via '=' then '"'), any earlier escaped quote
+			// inside the value is also '"', and neither is a backslash, so the
+			// run always stops on its own. bs&1 rather than bs%2 spares the
+			// signed-modulo dance the compiler emits when it cannot prove
+			// bs >= 0 across the loop.
+			bs := 0
+			for j := i - 1; data[j] == '\\'; j-- {
+				bs++
+			}
+			if bs&1 == 1 {
+				// Escaped, so the value continues and has to be scanned
+				// escape-aware from here. Which scan is right depends on how
+				// far apart this value's escapes turn out to be, so the walk
+				// goes first and hands over when they are too sparse for it.
+				pos, done := scanQuotedEscapeDense(data, i+1, vStart)
+				if !done {
+					if pos = scanQuotedSparse(data, pos); pos < 0 {
+						return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
+					}
+				}
+				i = pos
+			}
+
 			vEnd = i
 			i++
 			if i < n {
@@ -415,13 +510,14 @@ func AppendUnescape(dst []byte, raw []byte) []byte {
 	// dense is set once an escape has been decoded: the next one is then
 	// probably close (every '"' of embedded JSON is one), and a few inlined
 	// SWAR steps find it for less than a fresh bytes.IndexByte call costs. Past
-	// escWindow quiet words IndexByte takes over, exactly as in the parser.
+	// unescWindow quiet words IndexByte takes over — the same hand-back
+	// scanQuotedEscapeDense makes in the parser, for the same reason.
 	dense := false
 	for i < n {
 		j := -1 // index of the next backslash, once found
 		s := i  // scan position; raw[i:s] is known to hold none
 		if dense {
-			for quiet := 0; quiet < escWindow && s <= n-8; quiet++ {
+			for quiet := 0; quiet < unescWindow && s <= n-8; quiet++ {
 				w := binary.LittleEndian.Uint64(raw[s : s+8])
 				if m := hasBackslash(w); m != 0 {
 					j = s + bits.TrailingZeros64(m)>>3
