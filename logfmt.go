@@ -99,24 +99,56 @@ func hasQuoteOrBackslash(w uint64) uint64 {
 }
 
 // Thresholds for the two scans a quoted value with escapes is split between.
-// Both are distances between escaped quotes, and both sit on the same measured
-// crossover: bytes.IndexByte scans clean bytes about 4.5x faster than the SWAR
-// walk (26.5 vs 5.9 GB/s on the arm64 machine these were tuned on) but costs
-// roughly a call per escaped quote, so the walk wins while escapes stay within
-// about 70 bytes of each other and loses beyond that. The ratio, not the
-// machine, is what sets these; Benchmark_IterateEscaped sweeps the axis that
-// re-measures them.
+// Both are distances between escaped quotes: bytes.IndexByte scans clean bytes
+// about 4.5x faster than the SWAR walk but costs roughly a call per escaped
+// quote, so the walk wins while escapes stay close together and loses once they
+// spread out. Benchmark_IterateEscaped sweeps the axis that re-measures them.
 //
-// The floor under escGap is the real sample line in testdata, whose two escaped
-// quotes are 38 bytes apart with level= immediately after them: classify that
-// one sparse and most of the GetMany and LevelTS win goes with it (-6.4% and
-// -8.0% became -0.8% and ~). A window of 32 bytes — four words, tuned on the
-// synthetic sweep alone — does exactly that, which is how the first version of
-// this scan shipped 6% slower than it had to on GetMany and 7% on LevelTS.
+// The RATIO travels between machines; the CROSSOVER does not, because that also
+// depends on the per-escape call cost, which moves relative to IndexByte's
+// throughput. The 4.5x holds on both arm64 (26.5 vs 5.9 GB/s, where these were
+// first tuned) and amd64 (about 60 vs 13 GB/s on a Ryzen 8840HS) — yet the
+// crossover sits near 70 bytes on the first and 32-40 on the second. An earlier
+// version of this comment said the ratio alone set these; that was wrong about
+// escClean, as below.
+//
+// The floor under escGap is the real sample line in testdata, whose first
+// escaped quote is 33 bytes into its value and whose two escaped quotes are 38
+// bytes apart, with level= immediately after them: classify that one sparse and
+// most of the GetMany and LevelTS win goes with it (-6.4% and -8.0% became
+// -0.8% and ~). A window of 32 bytes — four words, tuned on the synthetic sweep
+// alone — does exactly that, which is how the first version of this scan
+// shipped 6% slower than it had to on GetMany and 7% on LevelTS.
+//
+// escClean was 8 (a 64-byte clean run) until it was re-measured on amd64, where
+// that is nearly twice the crossover: a value with escapes 48 bytes apart was
+// walked end to end where IndexByte would have been 17% faster. Five is forced
+// from both sides rather than fitted — the largest value that gives up at the
+// amd64 crossover, and the smallest that keeps the testdata sample on the walk
+// (that value's clean run is exactly four words, and escClean=4 drops it off the
+// dense path for GetMany +11.9% and LevelTS +14.8%). At 5 the 48-byte-gap shape
+// is 8.6% faster and no other row moves. NOTE this is an amd64 result in a band
+// neither machine's committed sweep samples — the synthetic sweep jumps straight
+// from 32-byte to 128-byte gaps — so it wants a confirming arm64 run.
 const (
-	escClean = 8  // consecutive clean words after which the walk gives up
+	escClean = 5  // consecutive clean words after which the walk gives up
 	escGap   = 48 // bytes to the first escape at or below which the walk wins
 )
+
+// KNOWN GAP, priced but not closed: escGap is asked once, at the value's first
+// escaped quote, and nothing asks again. escClean can take a value OFF the walk
+// when its escapes thin out, but scanQuotedSparse has no way back ON to it, so a
+// value that starts sparse and turns dense is scanned by one IndexByte call per
+// escape all the way to the closing quote. The shape that hits this is ordinary
+// — a prose prefix longer than escGap followed by embedded JSON, as in
+// msg="failed to process request: {\"id\":...}" — and it costs 60%, as a hard
+// cliff exactly at escGap rather than a gradient. Closing it means letting
+// scanQuotedSparse report "these escapes turned dense, resume the walk here":
+// measured -32% on the shape above and +3-4% on values whose escapes really are
+// 64-256 bytes apart, so it is a trade rather than a free win. If it is ever
+// attempted, the upgrade threshold must sit STRICTLY BELOW the distance escClean
+// gives up at, or the two scans oscillate handing back to each other — setting
+// it equal to escGap measured +26% at a 48-byte gap.
 
 // unescWindow is the decoder's equivalent of escClean: how many quiet words
 // AppendUnescape probes for the next backslash before handing back to
