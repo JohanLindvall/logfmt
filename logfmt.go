@@ -351,14 +351,79 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// Declared up here so the gotos, which jump forward, skip no declaration.
 		var kEnd, vStart, vEnd int
 
-		for i <= n-8 {
+		// The key scan runs two SWAR loops. The wide one holds a sixteen-byte
+		// view so that an '=' hit can settle a short unquoted value from bytes
+		// already at hand instead of entering the value loop — taking that
+		// loop's whole load->mask->find chain off the field's critical path.
+		// The narrow loop is the plain scan for the record's last 8..15 bytes,
+		// where there is no sixteenth byte to view.
+		for i <= n-16 {
+			// One 16-byte slice, then constant-index halves: spelled as
+			// data[i+8:i+16] the view's second load pays an IsSliceInBounds
+			// the prove pass cannot discharge (the i+8 lower bound is one
+			// derivation too far), where pair's own check folds exactly as
+			// data[i:i+8]'s does and constant offsets into a constant-length
+			// slice cost nothing.
+			pair := data[i : i+16]
+			w := binary.LittleEndian.Uint64(pair[0:8])
+			if m := hasKeyStop(w); m != 0 {
+				base := i
+				i += bits.TrailingZeros64(m) >> 3
+				// '=' first: keys overwhelmingly end there. Each stop byte
+				// jumps straight to code that already knows both what was
+				// found and that i < n, so nothing reloads data[i] nor
+				// re-tests a bound this hit has already established.
+				c := data[i]
+				if c == '=' {
+					kEnd = i
+					i++
+					if data[i] == '"' {
+						goto quotedVal
+					}
+					vStart = i
+					// hasCtrlOrSpace needs no lane masking here: every lane
+					// below the '=' is a non-stop byte (ctrl-or-space is a
+					// subset of the key-stop set), the '=' itself is not
+					// flagged, and a borrow can only set spurious bits ABOVE
+					// a true match — so the lowest set bit of either mask is
+					// the value's genuine first stop. The (w - 0x21…) term is
+					// shared with hasKeyStop above and CSEs away.
+					if mv := hasCtrlOrSpace(w); mv != 0 {
+						i = base + bits.TrailingZeros64(mv)>>3
+						goto valStop
+					}
+					// The view's second word is loaded HERE, not beside w:
+					// loaded every iteration it cost the early-stop lookups
+					// (GetMany +2.5%, Extract +2.0%), which pay per key word
+					// and collect nothing per value; loaded only once the
+					// first word's mask comes back empty, it beat that eager
+					// form on every row (Iterate a further -3.5%, GetMany
+					// -2.8%) — the out-of-order window hides an L1 load
+					// issued this late just fine.
+					if mv := hasCtrlOrSpace(binary.LittleEndian.Uint64(pair[8:16])); mv != 0 {
+						i = base + 8 + bits.TrailingZeros64(mv)>>3
+						goto valStop
+					}
+					// Fifteen-minus-t clean value bytes seen; resume the
+					// ordinary scan where the preload ran out.
+					i = base + 16
+					goto valLoop
+				}
+				if isSpace(c) {
+					goto keyBare
+				}
+				break // rare non-whitespace control byte; finish scalar
+			}
+			i += 8
+		}
+		// The "i >= 0" is the AppendUnescape trick: i arrives here through a
+		// phi of the wide loop's exits, which is one merge more than the prove
+		// pass follows, so without the test the load below pays the bounds
+		// check the wide loop's does not.
+		for i >= 0 && i <= n-8 {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
 			if m := hasKeyStop(w); m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
-				// '=' first: keys overwhelmingly end there. Each stop byte
-				// jumps straight to the label that already knows both what was
-				// found and that i < n, so neither label reloads data[i] nor
-				// re-tests a bound this hit has already established.
 				c := data[i]
 				if c == '=' {
 					goto keyEq
@@ -428,6 +493,7 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// falls into the unquoted scan, which stops on the very first byte and
 		// leaves vEnd == vStart — the same empty value, one branch and one
 		// isSpace cheaper on every field.
+	quotedVal:
 		if data[i] == '"' {
 			*quoted = true
 			i++
@@ -480,34 +546,48 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 				}
 				i++
 			}
-		} else {
-			vStart = i
-			for i <= n-8 {
-				w := binary.LittleEndian.Uint64(data[i : i+8])
-				if m := hasCtrlOrSpace(w); m != 0 {
-					i += bits.TrailingZeros64(m) >> 3
-					// ' ' first: it is the usual value delimiter, so the cheap
-					// compare short-circuits past the isSpace test.
-					if c := data[i]; c == ' ' || isSpace(c) {
-						goto valEnd
-					}
-					break // rare non-whitespace control byte; finish scalar
-				}
-				i += 8
+			goto deliver
+		}
+		vStart = i
+	valLoop:
+		// The "i >= 0" is the AppendUnescape trick, needed since this label
+		// became a goto target: i is a phi of the straight-line entry and the
+		// seeded scan's base+16, and the prove pass cannot carry i >= 0 across
+		// that merge, so without the test the load below pays a bounds check
+		// on every value word.
+		for i >= 0 && i <= n-8 {
+			w := binary.LittleEndian.Uint64(data[i : i+8])
+			if m := hasCtrlOrSpace(w); m != 0 {
+				i += bits.TrailingZeros64(m) >> 3
+				goto valStop
 			}
-			for i < n && !isSpace(data[i]) {
-				i++
-			}
-		valEnd:
-			vEnd = i
-			// The scan stopped on whitespace or ran out of input, so stepping
-			// past the separator needs no guard: i == n+1 fails every bound
-			// exactly as i == n does. Unlike "if i < n { i++ }" this costs no
-			// branch, and it is what removes the whitespace-skip loop that
-			// used to open every field.
+			i += 8
+		}
+	valTail:
+		for i < n && !isSpace(data[i]) {
 			i++
 		}
+		goto valEnd
+	valStop:
+		// ' ' first: it is the usual value delimiter, so the cheap compare
+		// short-circuits past the isSpace test. A non-whitespace control byte
+		// — the only other thing hasCtrlOrSpace stops on — is value content:
+		// resume in the scalar loop, which steps over it and finishes the
+		// value a byte at a time.
+		if c := data[i]; c == ' ' || isSpace(c) {
+			goto valEnd
+		}
+		goto valTail
+	valEnd:
+		vEnd = i
+		// The scan stopped on whitespace or ran out of input, so stepping
+		// past the separator needs no guard: i == n+1 fails every bound
+		// exactly as i == n does. Unlike "if i < n { i++ }" this costs no
+		// branch, and it is what removes the whitespace-skip loop that
+		// used to open every field.
+		i++
 
+	deliver:
 		if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
 			return nil
 		}

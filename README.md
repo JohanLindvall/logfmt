@@ -297,9 +297,11 @@ have to walk past the fault to settle their keys.
 
 Cost splits into a fixed per-field overhead of ~5 ns plus scanning: ~11.7 GB/s
 through unquoted values (word-at-a-time SWAR) and ~27 GB/s through quoted ones
-(`bytes.IndexByte`, SIMD in the stdlib). Short fields are therefore
-overhead-bound, long values scan-bound. Lookups are linear in how deep the key
-sits: ~8 ns per field skipped.
+(`bytes.IndexByte`, SIMD in the stdlib). A short unquoted value that ends
+within a few bytes of its `=` is cheaper still: the key scan has already seen
+those bytes and settles the value without a second scan. Short fields are
+therefore overhead-bound, long values scan-bound. Lookups are linear in how
+deep the key sits: ~7 ns per field skipped.
 
 That 27 GB/s is for quoted values with **no escaped quotes in them**. Escaped
 quotes cost extra, but boundedly: the first `\"` in a value restarts

@@ -184,6 +184,28 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		`a="x\"y\`,
 		`a="\"\`,
 		`a="\"xxxxxxx\`,
+		// The seeded value dispatch (the key scan's 16-byte view): short pairs
+		// whose values end inside the first word; a 13-byte value whose
+		// separator is the view's last lane (base+15); a 14-byte value whose
+		// first stop sits one past the view (base+16), the miss-miss resume
+		// into the value loop; '=' as the first word's last lane (t=7), the
+		// value entirely in the second word; an 8-byte key, so the '=' is
+		// lane 0 of a LATER iteration's view; a control byte inside the view
+		// (the seeded hit that is not a separator); and a middle field whose
+		// key scan starts in the record's last 15 bytes, the narrow key
+		// loop's territory.
+		"k=v a=b c=d e=f g=h i=j",
+		"k=aaaaaaaaaaaaa b=2",
+		"k=aaaaaaaaaaaaaa b=2",
+		"abcdefg=hijklmn opq=r",
+		"duration=12.4ms x=y zzz=w",
+		"k=a\x01bcdefghij m=n",
+		"aaaa=bbbb cc=ddd x=y",
+		// A bare key seen by the WIDE key loop (16+ bytes of record left, so
+		// its isSpace dispatch is the one taken): every earlier bare-key seed
+		// sat inside the record's last 15 bytes and reached keyBare through
+		// the narrow loop instead.
+		"verbose a=b c=d e=f g=h ii=jj",
 	}
 	for _, s := range seeds {
 		f.Add([]byte(s))
