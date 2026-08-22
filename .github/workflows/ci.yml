@@ -56,7 +56,11 @@ jobs:
           go-version: stable # lint on current Go, not the go.mod floor
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.12.2
+          # Must be a release built with (at least) the Go that "stable" above
+          # resolves to, or its typechecker fails on the NEW stdlib itself:
+          # v2.12.2 broke the day go1.27.0 reached the runners, in
+          # internal/poll, on a push that touched nothing near it.
+          version: v2.13.1
 
   # On a green main build, bump the patch of the latest vX.Y.Z tag (the Go module
   # version convention). Patch only: a major bump would require a /vN module path,
