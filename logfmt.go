@@ -70,6 +70,37 @@ func hasCtrlOrSpace(w uint64) uint64 {
 	return (w - swarLo*0x21) &^ w & swarHi
 }
 
+// swarRegs holds the broadcast constants the scans use, as a package VARIABLE
+// rather than constants, purely for code generation: a function loads them
+// into registers once and keeps them there, where a constant is
+// rematerialised with a 10-byte MOVQ at every use — one per constant per word
+// scanned, and each of those is an integer-ALU op on amd64, which is the unit
+// the scan loop is bound by (four of them; see CLAUDE.md, 2026-09-01). The
+// reloads after each callback go through the otherwise idle load ports. It is
+// never written; the *R helpers below are the constant ones with the values
+// passed in, and Test_Unit_SWARMasks pins them equal for every byte value.
+var swarRegs = struct{ xor, sub, hi, quote, bslash, lo uint64 }{
+	swarLo * 0x1d, swarLo * 0x21, swarHi, swarLo * '"', swarLo * '\\', swarLo,
+}
+
+// hasQuoteOrBackslashR is hasQuoteOrBackslash with the constants supplied.
+func hasQuoteOrBackslashR(w, quote, bslash, lo, hi uint64) uint64 {
+	q := w ^ quote
+	b := w ^ bslash
+	return ((q - lo) | (b - lo)) & (hi &^ w)
+}
+
+// hasCtrlOrSpaceR is hasCtrlOrSpace with the constants supplied.
+func hasCtrlOrSpaceR(w, sub, hi uint64) uint64 {
+	return (w - sub) & (hi &^ w)
+}
+
+// hasKeyStopR is hasKeyStop with the constants supplied.
+func hasKeyStopR(w, xor, sub, hi uint64) uint64 {
+	x := w ^ xor
+	return ((w - sub) | (x - sub)) & (hi &^ w)
+}
+
 // hasBackslash flags every byte of w that is '\\': the classic has-zero-byte
 // test applied to w XOR-ed with the broadcast byte. AppendUnescape uses it to
 // find the next escape of an escape-dense value without another IndexByte call.
@@ -215,10 +246,11 @@ func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
 	}
 	n := len(data)
 	clean := 0
+	kq, kb, klo, khi := swarRegs.quote, swarRegs.bslash, swarRegs.lo, swarRegs.hi
 	for uint(i) < uint(n) {
 		for i <= n-8 && clean < escClean {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
-			if m := hasQuoteOrBackslash(w); m != 0 {
+			if m := hasQuoteOrBackslashR(w, kq, kb, klo, khi); m != 0 {
 				clean = 0
 				i += bits.TrailingZeros64(m) >> 3
 				goto stop
@@ -323,6 +355,7 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 	// by the loop spellings below; see the loop-invariant comment.)
 	data = data[:len(data):len(data)]
 	n := len(data)
+	lim16 := n - 16
 	// Loop invariant worth stating because two steps below rely on it: a field
 	// consumes its own trailing separator, so i can finish a step at n+1 rather
 	// than n. Only one step actually leaves i at n+1 (the unconditional i++ at
@@ -341,7 +374,13 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 	// bounds check on the SWAR loads and in the separator-drain loop; neither
 	// half does it alone (the half-applied form measures WORSE — see
 	// CLAUDE.md on the previously rejected bare "lim := n-8" attempt).
-	for i := 0; uint(i) < uint(n); {
+	//
+	// The second half of the condition is implied by the first and the prove
+	// pass can see that, so it compiles to nothing — but it restates the
+	// fact as "i <= n-1", which is the shape that pass needs (a bound of the
+	// form len-K) to fold the cap-zero mask, four ALU ops, on every
+	// data[kStart:...] slice below.
+	for i := 0; uint(i) < uint(n) && i <= n-1; {
 		// There is no whitespace-skip loop here, on purpose. The previous field
 		// already stepped past its separator, so i points at the key. Leading
 		// whitespace, a run of separators, or a '\t'/'\n' delimiter instead
@@ -350,6 +389,12 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		kStart := i
 		// Declared up here so the gotos, which jump forward, skip no declaration.
 		var kEnd, vStart, vEnd int
+		// The scan constants, read afresh for every field rather than once
+		// per call: they die at the callback either way, and a value that
+		// has to survive a call is spilled at entry and reloaded through the
+		// store buffer, which put a store-forwarding stall on the first
+		// field of every call (worth 5% on a one-field record).
+		kxor, ksub, khi := swarRegs.xor, swarRegs.sub, swarRegs.hi
 
 		// The key scan runs two SWAR loops. The wide one holds a sixteen-byte
 		// view so that an '=' hit can settle a short unquoted value from bytes
@@ -357,16 +402,14 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// loop's whole load->mask->find chain off the field's critical path.
 		// The narrow loop is the plain scan for the record's last 8..15 bytes,
 		// where there is no sixteenth byte to view.
-		for i <= n-16 {
-			// One 16-byte slice, then constant-index halves: spelled as
-			// data[i+8:i+16] the view's second load pays an IsSliceInBounds
-			// the prove pass cannot discharge (the i+8 lower bound is one
-			// derivation too far), where pair's own check folds exactly as
-			// data[i:i+8]'s does and constant offsets into a constant-length
-			// slice cost nothing.
-			pair := data[i : i+16]
-			w := binary.LittleEndian.Uint64(pair[0:8])
-			if m := hasKeyStop(w); m != 0 {
+		for i <= lim16 {
+			// The i+8 here is the same value the loop's own increment
+			// computes, and the compiler attributes the shared instruction
+			// to this line: that gives the inlined Uint64 call's mark an
+			// instruction to attach to, where "pair[0:8]" left it a NOP in
+			// the loop body.
+			w := binary.LittleEndian.Uint64(data[i : i+8])
+			if m := hasKeyStopR(w, kxor, ksub, khi); m != 0 {
 				base := i
 				i += bits.TrailingZeros64(m) >> 3
 				// '=' first: keys overwhelmingly end there. Each stop byte
@@ -388,9 +431,18 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 					// a true match — so the lowest set bit of either mask is
 					// the value's genuine first stop. The (w - 0x21…) term is
 					// shared with hasKeyStop above and CSEs away.
-					if mv := hasCtrlOrSpace(w); mv != 0 {
-						i = base + bits.TrailingZeros64(mv)>>3
-						goto valStop
+					if mv := hasCtrlOrSpaceR(w, ksub, khi); mv != 0 {
+						t := bits.TrailingZeros64(mv) >> 3
+						vEnd = base + t
+						if c := data[vEnd]; c == ' ' || isSpace(c) {
+							// Both indexes from base and t, not i from vEnd:
+							// two independent adds where a chained pair put
+							// one more cycle on the path to the next field.
+							i = base + 1 + t
+							goto deliver
+						}
+						i = vEnd
+						goto valTail
 					}
 					// The view's second word is loaded HERE, not beside w:
 					// loaded every iteration it cost the early-stop lookups
@@ -400,9 +452,15 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 					// form on every row (Iterate a further -3.5%, GetMany
 					// -2.8%) — the out-of-order window hides an L1 load
 					// issued this late just fine.
-					if mv := hasCtrlOrSpace(binary.LittleEndian.Uint64(pair[8:16])); mv != 0 {
-						i = base + 8 + bits.TrailingZeros64(mv)>>3
-						goto valStop
+					if mv := hasCtrlOrSpaceR(binary.LittleEndian.Uint64(data[base : base+16][8:16]), ksub, khi); mv != 0 {
+						t := bits.TrailingZeros64(mv) >> 3
+						vEnd = base + 8 + t
+						if c := data[vEnd]; c == ' ' || isSpace(c) {
+							i = base + 9 + t
+							goto deliver
+						}
+						i = vEnd
+						goto valTail
 					}
 					// Fifteen-minus-t clean value bytes seen; resume the
 					// ordinary scan where the preload ran out.
@@ -422,7 +480,7 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// check the wide loop's does not.
 		for i >= 0 && i <= n-8 {
 			w := binary.LittleEndian.Uint64(data[i : i+8])
-			if m := hasKeyStop(w); m != 0 {
+			if m := hasKeyStopR(w, kxor, ksub, khi); m != 0 {
 				i += bits.TrailingZeros64(m) >> 3
 				c := data[i]
 				if c == '=' {
@@ -493,8 +551,12 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// falls into the unquoted scan, which stops on the very first byte and
 		// leaves vEnd == vStart — the same empty value, one branch and one
 		// isSpace cheaper on every field.
+		if data[i] != '"' {
+			vStart = i
+			goto valLoop
+		}
 	quotedVal:
-		if data[i] == '"' {
+		{
 			*quoted = true
 			i++
 			vStart = i
@@ -548,20 +610,19 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 			}
 			goto deliver
 		}
-		vStart = i
 	valLoop:
-		// The "i >= 0" is the AppendUnescape trick, needed since this label
-		// became a goto target: i is a phi of the straight-line entry and the
-		// seeded scan's base+16, and the prove pass cannot carry i >= 0 across
-		// that merge, so without the test the load below pays a bounds check
-		// on every value word.
-		for i >= 0 && i <= n-8 {
-			w := binary.LittleEndian.Uint64(data[i : i+8])
-			if m := hasCtrlOrSpace(w); m != 0 {
-				i += bits.TrailingZeros64(m) >> 3
-				goto valStop
+		// The prove pass cannot carry i >= 0 into this loop (i is a phi of
+		// the straight-line entry and the seeded scan's base+16), so it is
+		// told once, by the enclosing if, rather than tested on every word.
+		if i >= 0 {
+			for i <= n-8 {
+				w := binary.LittleEndian.Uint64(data[i : i+8])
+				if m := hasCtrlOrSpaceR(w, ksub, khi); m != 0 {
+					i += bits.TrailingZeros64(m) >> 3
+					goto valStop
+				}
+				i += 8
 			}
-			i += 8
 		}
 	valTail:
 		for i < n && !isSpace(data[i]) {
@@ -588,7 +649,12 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		i++
 
 	deliver:
-		if !fn(data[kStart:kEnd], data[vStart:vEnd]) {
+		// vStart > n-1 never holds here, and this compare is a real one
+		// (vStart is a merge of three paths, which is more than the prove
+		// pass follows). It is kept deliberately: it is what lets that pass
+		// fold the cap-zero mask on the value slice, four ALU ops, into this
+		// one fused compare-and-branch.
+		if vStart > n-1 || !fn(data[kStart:kEnd], data[vStart:vEnd]) {
 			return nil
 		}
 	}
@@ -961,8 +1027,20 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	clear(buf)
 
 	remaining := n
+	// lenMask has bit L set for every key of length L below 64: a field
+	// whose key has some other length can match nothing, and most fields
+	// are settled by that one shift instead of by the compare loop.
+	var lenMask uint64
+	for _, key := range keys {
+		if len(key) < 64 {
+			lenMask |= 1 << uint(len(key))
+		}
+	}
 	var quoted bool // throwaway: GetMany hands out raw values without the bit
 	_ = iterate(data, &quoted, func(k, v []byte) bool {
+		if uint(len(k)) < 64 && lenMask>>uint(len(k))&1 == 0 {
+			return true
+		}
 		for j := range keys {
 			// Length check first: a key already settled with a non-empty value
 			// short-circuits cheaply on every later field, skipping the key

@@ -200,6 +200,12 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		"abcdefg=hijklmn opq=r",
 		"duration=12.4ms x=y zzz=w",
 		"k=a\x01bcdefghij m=n",
+		// The same control byte in the view's SECOND word (lanes 8..15), and
+		// one past the view altogether, so that the value loop's own SWAR
+		// hit finds it: since 2026-09-01 each of the three positions has its
+		// own verify, and the seed above reaches only the first.
+		"k=aaaaaaaaaa\x01bcd m=n",
+		"k=aaaaaaaaaaaaaaaaaaaa\x06bbbbbbbb next=ok",
 		"aaaa=bbbb cc=ddd x=y",
 		// A bare key seen by the WIDE key loop (16+ bytes of record left, so
 		// its isSpace dispatch is the one taken): every earlier bare-key seed
@@ -293,6 +299,21 @@ func Test_Unit_SWARMasks(t *testing.T) {
 			}
 			if got := firstStop(hasBackslash(w)); got != want {
 				t.Fatalf("hasBackslash: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
+			}
+
+			// The register-fed variants iterate actually runs must be the
+			// constant ones bit for bit, spurious high bits included: they
+			// are spelled separately, and their tail is associated
+			// differently on purpose.
+			r := swarRegs
+			if a, b := hasKeyStopR(w, r.xor, r.sub, r.hi), hasKeyStop(w); a != b {
+				t.Fatalf("hasKeyStopR: byte %#02x at %d: %#x, want %#x", v, pos, a, b)
+			}
+			if a, b := hasCtrlOrSpaceR(w, r.sub, r.hi), hasCtrlOrSpace(w); a != b {
+				t.Fatalf("hasCtrlOrSpaceR: byte %#02x at %d: %#x, want %#x", v, pos, a, b)
+			}
+			if a, b := hasQuoteOrBackslashR(w, r.quote, r.bslash, r.lo, r.hi), hasQuoteOrBackslash(w); a != b {
+				t.Fatalf("hasQuoteOrBackslashR: byte %#02x at %d: %#x, want %#x", v, pos, a, b)
 			}
 		}
 	}
