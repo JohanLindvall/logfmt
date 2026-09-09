@@ -1,51 +1,51 @@
 # logfmt microbenchmarks
 
-- generated 2026-09-01T21:44:20Z
-- go version go1.27.0 linux/amd64
-- cpu: INTEL(R) XEON(R) PLATINUM 8573C (4 cores)
+- generated 2026-09-09T07:31:58Z
+- go version go1.27.1 linux/amd64
+- cpu: AMD EPYC 7763 64-Core Processor (4 cores)
 
 The Benchmark* functions in the root logfmt module (parser, lookups, unescape, ParseTime), as opposed to the cross-library comparison suite in this `bench/` module (see `results_<arch>.md`). Lower ns/op is better; throughput (MB/s) and allocations are reported by `-benchmem`.
 
 | Benchmark | ns/op | Throughput | B/op | allocs/op |
 |---|--:|--:|--:|--:|
-| IterateOur | 249.1 | — | 0 | 0 |
-| GetMany_TimestampLevel | 60.5 | — | 0 | 0 |
-| Unescape | 22.6 | — | 0 | 0 |
-| IterateEscaped/esc=0 | 21.5 | 48003.22 MB/s | 0 | 0 |
-| IterateEscaped/esc=8 | 79.6 | 12932.80 MB/s | 0 | 0 |
-| IterateEscaped/esc=32 | 204.7 | 5031.90 MB/s | 0 | 0 |
-| IterateEscaped/esc=128 | 581.0 | 1772.66 MB/s | 0 | 0 |
-| IterateEscaped/esc=500 | 2213.0 | 465.37 MB/s | 0 | 0 |
-| UnescapeEscaped/esc=0 | 24.5 | 41746.58 MB/s | 0 | 0 |
-| UnescapeEscaped/esc=8 | 96.5 | 10610.40 MB/s | 0 | 0 |
-| UnescapeEscaped/esc=32 | 283.1 | 3616.59 MB/s | 0 | 0 |
-| UnescapeEscaped/esc=128 | 664.5 | 1541.04 MB/s | 0 | 0 |
-| UnescapeEscaped/esc=500 | 2685.0 | 381.36 MB/s | 0 | 0 |
-| IterateJSONMsg | 158.2 | 1636.87 MB/s | 0 | 0 |
-| UnescapeJSONMsg | 168.5 | 1175.23 MB/s | 0 | 0 |
-| DecodeKeyval_Custom | 480879.0 | 1039.76 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=016 | 353.4 | 2914.23 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=032 | 203.3 | 5066.70 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=040 | 180.3 | 5714.10 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=048 | 168.1 | 6128.15 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=064 | 142.3 | 7235.90 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=128 | 79.3 | 12995.70 MB/s | 0 | 0 |
-| IterateEscapedGap/gap=256 | 45.9 | 22438.48 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=016 | 432.1 | 2369.93 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=032 | 290.0 | 3530.83 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=040 | 323.4 | 3166.16 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=048 | 278.4 | 3678.08 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=064 | 194.7 | 5259.34 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=128 | 96.3 | 10635.34 MB/s | 0 | 0 |
-| UnescapeEscapedGap/gap=256 | 55.1 | 18577.03 MB/s | 0 | 0 |
-| IteratePrefixJSON/prefix=008 | 84.9 | 1566.11 MB/s | 0 | 0 |
-| IteratePrefixJSON/prefix=032 | 88.8 | 1768.19 MB/s | 0 | 0 |
-| IteratePrefixJSON/prefix=064 | 129.5 | 1459.41 MB/s | 0 | 0 |
-| IteratePrefixJSON/prefix=160 | 142.7 | 1997.59 MB/s | 0 | 0 |
-| UnescapeUnicode | 79.9 | 1527.55 MB/s | 0 | 0 |
-| AppendValueUnicode | 105.2 | 1416.46 MB/s | 0 | 0 |
-| LevelTS_LogFmt | 49.9 | — | 0 | 0 |
-| LevelTS_Regex | 12869.0 | — | 1076 | 4 |
-| ParseTime_RFC3339 | 72.5 | — | 0 | 0 |
-| ParseTime_Custom | 307.2 | — | 164 | 4 |
-| ParseTime_Unix | 77.6 | — | 0 | 0 |
+| IterateOur | 323.7 | — | 0 | 0 |
+| GetMany_TimestampLevel | 77.2 | — | 0 | 0 |
+| Unescape | 28.1 | — | 0 | 0 |
+| IterateEscaped/esc=0 | 27.0 | 38180.98 MB/s | 0 | 0 |
+| IterateEscaped/esc=8 | 83.7 | 12299.46 MB/s | 0 | 0 |
+| IterateEscaped/esc=32 | 279.6 | 3683.31 MB/s | 0 | 0 |
+| IterateEscaped/esc=128 | 503.2 | 2046.73 MB/s | 0 | 0 |
+| IterateEscaped/esc=500 | 1339.0 | 769.28 MB/s | 0 | 0 |
+| UnescapeEscaped/esc=0 | 32.9 | 31163.77 MB/s | 0 | 0 |
+| UnescapeEscaped/esc=8 | 139.7 | 7332.18 MB/s | 0 | 0 |
+| UnescapeEscaped/esc=32 | 342.4 | 2990.27 MB/s | 0 | 0 |
+| UnescapeEscaped/esc=128 | 817.5 | 1252.54 MB/s | 0 | 0 |
+| UnescapeEscaped/esc=500 | 3257.0 | 314.35 MB/s | 0 | 0 |
+| IterateJSONMsg | 144.1 | 1796.93 MB/s | 0 | 0 |
+| UnescapeJSONMsg | 199.6 | 992.13 MB/s | 0 | 0 |
+| DecodeKeyval_Custom | 575635.0 | 868.61 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=016 | 365.6 | 2817.00 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=032 | 278.1 | 3703.88 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=040 | 257.0 | 4008.19 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=048 | 194.6 | 5292.91 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=064 | 133.8 | 7700.27 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=128 | 86.1 | 11957.59 MB/s | 0 | 0 |
+| IterateEscapedGap/gap=256 | 55.4 | 18591.43 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=016 | 530.3 | 1931.13 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=032 | 340.8 | 3004.87 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=040 | 396.5 | 2582.37 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=048 | 336.6 | 3042.36 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=064 | 250.9 | 4081.75 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=128 | 134.1 | 7633.69 MB/s | 0 | 0 |
+| UnescapeEscapedGap/gap=256 | 78.9 | 12980.04 MB/s | 0 | 0 |
+| IteratePrefixJSON/prefix=008 | 79.0 | 1682.95 MB/s | 0 | 0 |
+| IteratePrefixJSON/prefix=032 | 79.3 | 1979.96 MB/s | 0 | 0 |
+| IteratePrefixJSON/prefix=064 | 145.3 | 1301.07 MB/s | 0 | 0 |
+| IteratePrefixJSON/prefix=160 | 147.3 | 1935.40 MB/s | 0 | 0 |
+| UnescapeUnicode | 95.6 | 1276.36 MB/s | 0 | 0 |
+| AppendValueUnicode | 130.4 | 1142.72 MB/s | 0 | 0 |
+| LevelTS_LogFmt | 64.8 | — | 0 | 0 |
+| LevelTS_Regex | 15395.0 | — | 1076 | 4 |
+| ParseTime_RFC3339 | 90.3 | — | 0 | 0 |
+| ParseTime_Custom | 389.9 | — | 164 | 4 |
+| ParseTime_Unix | 84.9 | — | 0 | 0 |
