@@ -212,6 +212,18 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		// sat inside the record's last 15 bytes and reached keyBare through
 		// the narrow loop instead.
 		"verbose a=b c=d e=f g=h ii=jj",
+		// SPURIOUS LANES in the escape-dense walk. Since that walk drains
+		// every flagged lane of a word instead of re-anchoring on the lowest
+		// one, it is the only code in the package that reads a mask bit above
+		// a true match — where hasQuoteOrBackslash's borrow puts an impostor
+		// whenever the byte just past a '"' or a '\\' is one greater than it
+		// ('#' after a quote, ']' after a backslash). Both shapes below put
+		// one directly after a real escape, and the third puts a run of them
+		// so the borrow cascades; a walk that trusted such a lane would read
+		// a '#' as a closing quote or step two bytes over a ']'.
+		`msg="a\"#b\"#c" d=1`,
+		`msg="a\\]b\\]c" d=1`,
+		`msg="\"###\"###" d=1`,
 	}
 	for _, s := range seeds {
 		f.Add([]byte(s))

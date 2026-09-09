@@ -247,31 +247,74 @@ func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
 	n := len(data)
 	clean := 0
 	kq, kb, klo, khi := swarRegs.quote, swarRegs.bslash, swarRegs.lo, swarRegs.hi
-	for uint(i) < uint(n) {
-		for i <= n-8 && clean < escClean {
-			w := binary.LittleEndian.Uint64(data[i : i+8])
-			if m := hasQuoteOrBackslashR(w, kq, kb, klo, khi); m != 0 {
-				clean = 0
-				i += bits.TrailingZeros64(m) >> 3
-				goto stop
-			}
+	// One word is loaded, masked and then DRAINED of every escape it holds
+	// before the next is loaded. The reload was this walk's whole dependency
+	// chain — load, mask, find, verify, step, load again, about fourteen
+	// cycles per escape with nothing else to overlap — and at the densities
+	// this scan exists for (embedded JSON escapes every two to eight bytes)
+	// a word holds several. Draining costs a few bit operations per escape
+	// instead, and the word loads become independent of each other.
+	//
+	// Two things the outer walk got for free have to be paid for here. A
+	// spurious lane — the borrow above a true match described on
+	// hasQuoteOrBackslash — used to be impossible because every mask was
+	// taken from a freshly anchored word, where only the LOWEST bit is read
+	// and that one is genuine; draining reads the ones above it too, so the
+	// byte is checked for '\\' as well as '"' and an impostor is simply
+	// cleared. And a backslash in the last lane escapes a byte the word does
+	// not contain, so that case leaves the word and resumes past the pair.
+	for i >= 0 && i <= n-8 && clean < escClean {
+		w := binary.LittleEndian.Uint64(data[i : i+8])
+		m := hasQuoteOrBackslashR(w, kq, kb, klo, khi)
+		if m == 0 {
 			i += 8
 			clean++
+			continue
 		}
-		if clean >= escClean {
-			return i, false // a long clean run: IndexByte covers it faster
+		clean = 0
+		base := i
+		// The sub-slice and the "& 7" are both load-bearing, and only
+		// together: the byte re-check below runs once per escape rather than
+		// once per word, and spelled data[base+t] it pays a bounds check
+		// every time, because the prove pass will not combine i <= n-8 with
+		// t's range. Against a slice whose length it knows is 8 the masked
+		// index needs no check at all. (-d=ssa/check_bce/debug=1 reports
+		// nothing in this function.)
+		word := data[i : i+8]
+		i += 8 // the whole word is consumed unless a lane-7 pair says otherwise
+		for m != 0 {
+			low := m & -m
+			t := bits.TrailingZeros64(low) >> 3 & 7
+			c := word[t]
+			if c == '"' {
+				return base + t, true
+			}
+			if c != '\\' {
+				m &= m - 1 // spurious lane: not a real escape, take the next
+				continue
+			}
+			if t == 7 {
+				i = base + 9 // the escaped byte is the next word's first
+				break
+			}
+			m &^= low | low<<8 // step over the backslash AND what it escapes
 		}
-		for i < n && data[i] != '"' && data[i] != '\\' {
+	}
+	if clean >= escClean {
+		return i, false // a long clean run: IndexByte covers it faster
+	}
+	// Fewer than eight bytes left: finish a byte at a time. i can end at n+1
+	// here, one past the end, when a trailing backslash escapes the byte after
+	// the input; the caller's unsigned loop head is what makes that safe.
+	for i < n {
+		switch data[i] {
+		case '"':
+			return i, true
+		case '\\':
+			i += 2
+		default:
 			i++
 		}
-		if i >= n {
-			break
-		}
-	stop:
-		if data[i] == '"' {
-			return i, true
-		}
-		i += 2 // a backslash escapes whatever follows it, so step over both
 	}
 	return i, false
 }
@@ -1021,17 +1064,19 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	}
 	buf = buf[:n]
 
-	// Reset slots to nil; a match fills its slot, so a slot left nil records a
-	// missing key. A slot may hold a provisional empty value (non-nil, length
-	// zero) that a later non-empty value for the same key replaces.
-	clear(buf)
-
 	remaining := n
-	// lenMask has bit L set for every key of length L below 64: a field
-	// whose key has some other length can match nothing, and most fields
-	// are settled by that one shift instead of by the compare loop.
+	// One pass does both jobs, because both are per-key and the slice is
+	// short: clearing the slots (a match fills its slot, so a slot left nil
+	// records a missing key, and a slot may hold a provisional empty value
+	// that a later non-empty one replaces) and building lenMask, which has
+	// bit L set for every key of length L below 64 so that a field whose key
+	// has some other length is rejected by one shift instead of by the
+	// compare loop. Spelled as two loops this was a clear() — which for a
+	// slice of slices is a call to the runtime's memclr — plus a second walk
+	// of keys, and both showed up in GetMany's own profile.
 	var lenMask uint64
-	for _, key := range keys {
+	for j, key := range keys {
+		buf[j] = nil
 		if len(key) < 64 {
 			lenMask |= 1 << uint(len(key))
 		}

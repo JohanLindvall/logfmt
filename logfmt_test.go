@@ -652,6 +652,31 @@ func Test_Unit_Quoted_EscapeDense_Scan(t *testing.T) {
 		raw:     `\"` + long + `\"yy`,
 		decoded: `"` + long + `"yy`,
 	}, {
+		// Four escapes inside one 8-byte word. The walk drains a word of every
+		// escape it holds before loading the next, so this is the shape that
+		// exercises the drain rather than the reload that used to follow each
+		// escape.
+		name:    "several escapes in one word",
+		line:    `msg="\"\"\"\"" next=ok`,
+		raw:     `\"\"\"\"`,
+		decoded: `""""`,
+	}, {
+		// A byte one greater than the escape it follows ('#' after '"', ']'
+		// after '\\') is flagged spuriously by hasQuoteOrBackslash's borrow.
+		// Only the drain can ever read such a lane — the outer walk reads only
+		// the lowest bit of each mask, which is always genuine — and reading it
+		// as a closing quote, or stepping two bytes over it as a backslash, is
+		// what the drain's byte re-check prevents.
+		name:    "spurious lane after an escaped quote",
+		line:    `msg="a\"#b\"#c" next=ok`,
+		raw:     `a\"#b\"#c`,
+		decoded: `a"#b"#c`,
+	}, {
+		name:    "spurious lane after an escaped backslash",
+		line:    `msg="a\\]b\\]c" next=ok`,
+		raw:     `a\\]b\\]c`,
+		decoded: `a\]b\]c`,
+	}, {
 		// The first escape sits beyond escGap, so the walk declines on arrival
 		// and the whole value is settled by the IndexByte scan.
 		name:    "first escape too far in: walk declined on arrival",
