@@ -1,5 +1,39 @@
 # CLAUDE.md — logfmt
 
+## Latest follow-up: lookup and decoder work on arm64 (2026-09-09)
+
+See [the local performance report](bench/perf_2026-09-09_arm64.md) for this
+follow-up to the amd64 pass recorded below, including controls, tradeoffs, and
+reproduction commands. The general parser and `time.go` are unchanged.
+
+- `GetMany` returns immediately for zero queries. For 32–256 queries on records
+  at least four bytes per requested key, it uses a lazy, bounded stack index.
+  Its 64 bucket heads and 256 links retain query order; settling a non-empty
+  value removes a slot, while provisional empties remain. Full comparisons
+  verify every match. The small-query and very-short-record paths remain linear.
+  Older blanket linear-matching/crossover descriptions below predate this work.
+- Keep the key-length rejection before index construction: eager construction
+  regressed all-absent workloads. `keyBucket` accepts strings and byte slices
+  directly through a generic helper; converting parsed keys to strings here
+  copies them and allocates for long keys. Equality conversions remain free.
+- `AppendUnescape` performs its first search and prefix copy before the loop,
+  bypasses scanning/copying between adjacent escapes, and reserves raw length
+  once for destinations with zero capacity. This last change can retain more
+  capacity than the decoded result needs; existing buffers still avoid allocating
+  if they fit the decoded output, even when they do not fit the raw input.
+  `hex4` is inline on the common Unicode path; `decodeSurrogateEscape` receives
+  the parsed first code unit instead of re-reading it. `unescWindow` stays 4,
+  and the `s >= 0` bounds-proof hint remains on the probe loop.
+- `perf_lookup_test.go` adds a duplicate-slot-aware reference and fuzzer. The
+  older three-key fuzzer cannot reach the index, and its reference deliberately
+  skips duplicate queries. Run both lookup fuzzers after state-machine changes.
+  `perf_shapes_test.go` pins exact decoded-capacity reuse and fresh-buffer
+  allocation counts; the new benchmarks cover query order, collisions,
+  missing keys, short records, fresh buffers, surrogates, and malformed escapes.
+- `bench/compare.py` runs alternating, CPU-pinned A/B rounds over prebuilt
+  binaries. Use identical test sources on both sides; run an A/A control first.
+
+
 A fast, allocation-free, dependency-free reader for the logfmt line format.
 Read-only `[]byte` parsing with direct key extraction. This file records the
 performance design and, importantly, what has already been tried so it is not

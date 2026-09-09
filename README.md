@@ -147,11 +147,11 @@ for i, v := range vals {
 }
 ```
 
-Keys are matched linearly against each parsed field, which is fastest for the
-handful of keys these lookups target. Measured on a 24-field line, `GetMany`
-stays ahead up to roughly ten keys; past that, use `Iterate` with a map keyed by
-`string(k)` (20 keys: ~505 ns vs ~385 ns) — the compiler optimizes that
-conversion away in a map index.
+Small key sets use linear matching. For 32–256 requested keys on records at
+least four bytes per requested key, `GetMany` uses a bounded stack index and
+removes settled keys from its candidate chains. Very short records and larger
+key sets keep the linear path. Both paths remain allocation-free when `buf`
+has enough capacity. An empty key list returns without parsing the record.
 
 ### Unescape a raw value
 

@@ -727,105 +727,90 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 // decoding, guard with NeedsUnescape; that pattern is also faster than decoding
 // unconditionally, since most values contain no escapes at all.
 func AppendUnescape(dst []byte, raw []byte) []byte {
-	i, n := 0, len(raw)
-	// dense is set once an escape has been decoded: the next one is then
-	// probably close (every '"' of embedded JSON is one), and a few inlined
-	// SWAR steps find it for less than a fresh bytes.IndexByte call costs. Past
-	// unescWindow quiet words IndexByte takes over — the same hand-back
-	// scanQuotedEscapeDense makes in the parser, for the same reason.
-	dense := false
-	for i < n {
-		j := -1 // index of the next backslash, once found
-		s := i  // scan position; raw[i:s] is known to hold none
-		if dense {
-			// The "s >= 0" is redundant to a reader and load-bearing to the
-			// compiler: it is what removes the bounds check on the Uint64 load
-			// below. iterate gets the same fact from its "uint(i) < uint(n)"
-			// loop head, but that trick does not reach here, because s is not
-			// this loop's induction variable (quiet is) and so the prove pass
-			// never learns s is non-negative. Without the test the load pays a
-			// LEA and two compare-and-branch pairs into panicBounds per probed
-			// word: 28 instructions in this region against 23 with it, worth
-			// 14% at 8-byte escape gaps and 13% on Benchmark_UnescapeJSONMsg.
-			// It costs 3% at 128-byte gaps, where all unescWindow words are
-			// wasted anyway and the extra compare has nothing to amortise
-			// against. Three other spellings were tried — a uint outer head, an
-			// unsigned "uint(s) <= uint(n-8)" with the n>=8 guard hoisted, and a
-			// precomputed limit with s as the induction variable — and none of
-			// them eliminates the check. Verify with -d=ssa/check_bce/debug=1
-			// before changing this line.
-			for quiet := 0; quiet < unescWindow && s >= 0 && s <= n-8; quiet++ {
-				w := binary.LittleEndian.Uint64(raw[s : s+8])
-				if m := hasBackslash(w); m != 0 {
-					j = s + bits.TrailingZeros64(m)>>3
-					break
+	j := bytes.IndexByte(raw, '\\')
+	if j < 0 {
+		return append(dst, raw...)
+	}
+	// Decoding never grows the input. A fresh destination needs at most one
+	// allocation; existing buffers keep append's usual reuse behavior, even
+	// when they fit the decoded value but not the larger raw representation.
+	if cap(dst) == 0 {
+		dst = make([]byte, 0, len(raw))
+	}
+	dst = append(dst, raw[:j]...)
+	i, n := j+1, len(raw)
+	for {
+		if i >= n {
+			return append(dst, '\\')
+		}
+		next := raw[i]
+		i++
+		switch next {
+		case 'n':
+			dst = append(dst, '\n')
+		case 'r':
+			dst = append(dst, '\r')
+		case 't':
+			dst = append(dst, '\t')
+		case 'u':
+			if r := hex4(raw[i:]); r >= 0 {
+				adv := 4
+				if utf16.IsSurrogate(r) {
+					r, adv = decodeSurrogateEscape(raw[i:], r)
 				}
-				s += 8
+				dst = utf8.AppendRune(dst, r)
+				i += adv
+			} else {
+				dst = append(dst, '\\', 'u')
 			}
+		default:
+			dst = append(dst, next)
+		}
+		if i >= n {
+			return dst
+		}
+		// Adjacent escapes need neither a scan nor an empty literal copy.
+		if raw[i] == '\\' {
+			i++
+			continue
+		}
+		// After an escape, probe nearby words before restarting IndexByte.
+		// s >= 0 supplies the bounds proof for the fixed-width load; keep it
+		// even though it follows from the algorithm.
+		j = -1
+		s := i
+		for quiet := 0; quiet < unescWindow && s >= 0 && s <= n-8; quiet++ {
+			w := binary.LittleEndian.Uint64(raw[s : s+8])
+			if m := hasBackslash(w); m != 0 {
+				j = s + bits.TrailingZeros64(m)>>3
+				break
+			}
+			s += 8
 		}
 		if j < 0 {
 			q := bytes.IndexByte(raw[s:], '\\')
 			if q < 0 {
-				// no more escapes
 				return append(dst, raw[i:]...)
 			}
 			j = s + q
 		}
 		dst = append(dst, raw[i:j]...)
 		i = j + 1
-		dense = true
-		if i < n {
-			next := raw[i]
-			i++
-			switch next {
-			case 'n':
-				dst = append(dst, '\n')
-			case 'r':
-				dst = append(dst, '\r')
-			case 't':
-				dst = append(dst, '\t')
-			case 'u':
-				if r, adv, ok := decodeUnicodeEscape(raw[i:]); ok {
-					dst = utf8.AppendRune(dst, r)
-					i += adv
-				} else {
-					dst = append(dst, '\\', 'u') // malformed: keep verbatim
-				}
-			default:
-				dst = append(dst, next)
-			}
-		} else {
-			dst = append(dst, '\\')
-			break
-		}
 	}
-	return dst
 }
 
-// decodeUnicodeEscape decodes the hex payload of a \uXXXX escape at the start
-// of b (the caller has consumed the "\u"). It returns the rune, the number of
-// payload bytes consumed (4, or 10 when a low-surrogate escape follows and the
-// two combine), and whether the payload was well-formed. Surrogate handling
-// matches encoding/json: a valid high+low pair combines; a lone half yields
-// U+FFFD.
-func decodeUnicodeEscape(b []byte) (rune, int, bool) {
-	r1 := hex4(b)
-	if r1 < 0 {
-		return 0, 0, false
-	}
-	if !utf16.IsSurrogate(r1) {
-		return r1, 4, true
-	}
-	// A high surrogate may combine with an immediately following \uXXXX low
-	// surrogate. Anything else (lone half, invalid pair) becomes U+FFFD.
+// decodeSurrogateEscape combines the already parsed surrogate r1 with a
+// following low-surrogate escape, if present. b starts at r1's four hex digits.
+// A lone half yields U+FFFD; only a valid pair consumes the second escape.
+func decodeSurrogateEscape(b []byte, r1 rune) (rune, int) {
 	if len(b) >= 10 && b[4] == '\\' && b[5] == 'u' {
 		if r2 := hex4(b[6:]); r2 >= 0 {
 			if r := utf16.DecodeRune(r1, r2); r != utf8.RuneError {
-				return r, 10, true
+				return r, 10
 			}
 		}
 	}
-	return utf8.RuneError, 4, true
+	return utf8.RuneError, 4
 }
 
 // hex4 parses exactly four hex digits from the start of b, returning -1 if b is
@@ -1053,16 +1038,24 @@ func GetQuoted(data []byte, key string) (val []byte, quoted, found bool) {
 // tail past the settled keys is never reached. Call Validate when you need the
 // record checked.
 //
-// Each parsed field is matched against keys linearly, which is the fastest
-// arrangement for the handful of keys these lookups are meant for. Measured on
-// a 24-field line, GetMany stays ahead up to roughly ten keys; past that,
-// Iterate with a map keyed by string(k) wins (20 keys: ~505 ns versus ~385 ns).
+// Small query sets use a linear match loop. Sets of 32..256 keys on records
+// at least four bytes per requested key use a bounded stack index; very short
+// records and larger sets keep the linear path. Reusing buf avoids allocations
+// on either path. An empty key list returns immediately without parsing data.
 func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 	n := len(keys)
 	if cap(buf) < n {
 		buf = make([][]byte, n)
 	}
 	buf = buf[:n]
+	if n == 0 {
+		return buf
+	}
+	// Index setup amortizes over larger records and query sets. Keep the
+	// common handful-of-keys case and very short records on the small path.
+	if n >= 32 && n <= 256 && len(data) >= n*4 {
+		return getManyIndexed(data, keys, buf)
+	}
 
 	remaining := n
 	// One pass does both jobs, because both are per-key and the slice is
@@ -1173,4 +1166,73 @@ func SplitRecord(data []byte) (record, rest []byte) {
 		record = record[:n-1]
 	}
 	return record[:len(record):len(record)], rest
+}
+
+// getManyIndexed uses a bounded stack index for 32..256 query slots. Chains
+// retain query order, and settling a non-empty value removes its slot. Empty
+// values stay in the chain so later occurrences can replace them. Only the
+// full key comparison establishes a match; fingerprint collisions are harmless.
+func getManyIndexed(data []byte, keys []string, buf [][]byte) [][]byte {
+	var lenMask uint64
+	for j, key := range keys {
+		buf[j] = nil
+		if len(key) < 64 {
+			lenMask |= uint64(1) << uint(len(key))
+		}
+	}
+	var heads [64]uint16
+	var next [256]uint16
+	ready := false
+	remaining := len(keys)
+	var quoted bool
+	_ = iterate(data, &quoted, func(k, v []byte) bool {
+		if uint(len(k)) < 64 && lenMask>>uint(len(k))&1 == 0 {
+			return true
+		}
+		// Key lengths can reject fields without needing an index. Build
+		// the chains only when a field survives that inexpensive filter.
+		if !ready {
+			// Links store slot+1 so zero terminates a chain. Reverse insertion keeps
+			// candidates in query order, as required for duplicate query keys.
+			for j := len(keys) - 1; j >= 0; j-- {
+				h := keyBucket(keys[j])
+				next[j] = heads[h]
+				heads[h] = uint16(j + 1)
+			}
+
+			ready = true
+		}
+		link := &heads[keyBucket(k)]
+		for *link != 0 {
+			j := int(*link) - 1
+			if string(k) != keys[j] {
+				link = &next[j]
+				continue
+			}
+			if len(v) > 0 {
+				buf[j] = v[:len(v):len(v)]
+				*link = next[j]
+				remaining--
+			} else if buf[j] == nil {
+				buf[j] = v[:len(v):len(v)]
+			}
+			break
+		}
+		return remaining != 0
+	})
+	return buf
+}
+
+// A few sampled bytes provide a cheap bucket, not a full hash. Accept both
+// input types directly: converting a parsed []byte key to string here copies
+// it (and allocates for long keys), unlike conversion in an equality test.
+func keyBucket[T ~string | ~[]byte](key T) uint {
+	h := uint(len(key))
+	if len(key) > 0 {
+		h ^= uint(key[len(key)-1]) ^ uint(key[len(key)/2])<<1
+		if len(key) > 1 {
+			h ^= uint(key[len(key)-2]) << 3
+		}
+	}
+	return h & 63
 }
