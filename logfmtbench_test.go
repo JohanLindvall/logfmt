@@ -301,3 +301,44 @@ func Benchmark_AppendValueUnicode(b *testing.B) {
 		}
 	}
 }
+
+// Benchmark_Get prices one-key lookups on the 1.4 KB sample by how deep the key
+// sits — a lookup walks every field before its match — and for an absent key,
+// which costs a full parse. The package had no single-key lookup benchmark
+// until 2026-09-22; earlier lookup changes were measured on temporary ones.
+func Benchmark_Get(b *testing.B) {
+	for _, key := range []string{"level", "session_attr_client_locale", "trace_id"} {
+		b.Run(key, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sinkBytes, sinkBool = Get(sample2, key)
+			}
+		})
+	}
+}
+
+// Benchmark_IterateFieldShape isolates the parser's per-field paths: each row
+// repeats one shape of field — short unquoted values that settle inside the
+// key's own word, values that settle in the view's second word, short quoted
+// values, bare keys. Fields this short are bound by the chain from one field's
+// value stop to the next field's first load, so these are the rows that show
+// a change to that chain at full size: on 2026-09-22 a BSF waiting on an
+// unrelated load cost the unquoted row 37%, DecodeKeyval 12% and the sample
+// line only 3%.
+func Benchmark_IterateFieldShape(b *testing.B) {
+	for _, shape := range []struct{ name, row string }{
+		{"unquoted", "a=1 b=2 c=3 d=4 e=5 f=6 g=7 h=8 "},
+		{"second-word", "ab=0123456789 cd=0123456789 ef=0123456789 gh=0123456789 "},
+		{"quoted", `a="1" b="2" c="3" d="4" e="5" f="6" g="7" h="8" `},
+		{"bare", "aa bb cc dd ee ff gg hh "},
+	} {
+		data := bytes.Repeat([]byte(shape.row), 1000)
+		b.Run(shape.name, func(b *testing.B) {
+			b.SetBytes(int64(len(data)))
+			for i := 0; i < b.N; i++ {
+				if err := Iterate(data, func(k, v []byte) bool { return true }); err != nil {
+					b.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}

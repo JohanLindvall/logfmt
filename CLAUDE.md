@@ -1,6 +1,44 @@
 # CLAUDE.md — logfmt
 
-## Latest follow-up: lookup and decoder work on arm64 (2026-09-09)
+## Latest pass: hardware counters and IBS on amd64 (2026-09-22)
+
+Driven by `perf stat` counters and AMD IBS per-op sampling rather than by the
+stopwatch; the numbers, the mechanisms and the rejected list are in "2026-09-22
+pass" below. Ryzen 8840HS, Go 1.27.1, decided on cycles/op, which clock and
+power-state drift cannot move.
+
+- **A BSF waits for its destination register — check every BSF after touching
+  `Iterate`.** At GOAMD64=v1 `bits.TrailingZeros64` is `BSF`, which leaves the
+  destination unchanged for a zero source, so the core treats the old value as
+  an input (measured: dependent BSF steps 2 cycles each, 0.6 with the
+  destination zeroed first). The register allocator hands a BSF the lowest
+  free register, and that is often the one a byte load has just released,
+  which chains the load onto the per-field critical path. Removing the
+  `quoted` out-parameter produced an instruction stream IDENTICAL to HEAD bar
+  register names that ran short unquoted fields +37% and DecodeKeyval +12%;
+  loading the three scan constants in another order fixed it. Run
+  `bench/bsfdep.py` on a test binary after any change to `Iterate` and treat a
+  SUSPECT line as a regression until measured. This mechanism is a candidate
+  explanation for much of what earlier passes filed as layout noise.
+- `Iterate` is the parser now: the unexported `iterate` and its `quoted *bool`
+  protocol are gone, and `GetQuoted` reads the bit from the byte past the value
+  (`wasQuoted`), which relies on `Iterate` never capping what it delivers.
+- The escape walk drains a pair with `m &= (m | -m) << 9` — four dependent ops
+  where `m &^= low | low<<8` took six — and takes the lane from
+  `TrailingZeros64(m)`, which the loop condition proves non-zero (no CMOV):
+  esc=500 −22%, embedded JSON −9%, prose-then-JSON −13%, Iterate −1%.
+- `AppendUnescape` decodes every escape but `\u` through a 256-byte table. The
+  dense decode loop is FRONTEND-bound (55% of dispatch slots empty), and the
+  `switch` was a scattered binary search costing 3–4 taken branches per escape:
+  esc=500 −32%, esc=128 −9%, JSON msg −4%.
+- One-key lookups −4…−7% and LevelTS −8% (the quoted-flag load/store per field
+  is gone); `GetMany`'s two paths share `resetSlots`/`lenSet`/`settle`.
+- New benchmarks: `Benchmark_Get` (one-key lookups by depth, and absent) and
+  `Benchmark_IterateFieldShape`, whose rows show a change to the per-field
+  chain at full size. New tools: `bench/counters.py` (per-op cycles,
+  macro-ops, branches) and `bench/bsfdep.py`.
+
+## Follow-up: lookup and decoder work on arm64 (2026-09-09)
 
 See [the local performance report](bench/perf_2026-09-09_arm64.md) for this
 follow-up to the amd64 pass recorded below, including controls, tradeoffs, and
@@ -59,7 +97,8 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
 - `logfmt.go` — the core parser and key-lookup API (the "general parsing").
 - `time.go` — `ParseTime` (see warning above).
 - `logfmt_swar_test.go` — `FuzzIterateAgainstRef`: differential fuzz of the
-  SWAR `iterate` against a byte-by-byte reference. **Run this after any change
+  SWAR parser (`Iterate`; the unexported `iterate` of earlier notes is gone)
+  against a byte-by-byte reference. **Run this after any change
   to the parser.** It compares FOUR facts per pair, not two: key, value,
   `IsBareKey(v)` and `quoted`. The last two were added 2026-08-08 because
   comparing `string(k)`/`string(v)` alone left it blind to properties the package
@@ -73,13 +112,16 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   escape-dense seeds (JSON in `msg=`, backslash runs of both parities before a
   quote, an escaping backslash as the last byte of an 8-byte word and as the
   last byte of the input) for the SWAR follow-up scan in the quoted branch, and
-  drives the parser through `iterateQ`, the test-side adapter that reads and
-  resets the `*bool` out-parameter (see "The quoted-bit protocol").
+  drives the parser through `iterateQ`, the test-side adapter that adds the
+  quoted bit — since 2026-09-22 derived by `wasQuoted`, exactly as `GetQuoted`
+  derives it, so the comparison against the reference's own state machine is
+  what checks that derivation on every pair (see "The quoted-bit protocol").
   Also `Test_Unit_SWARMasks` (exhaustive: every byte value in every lane, for
   all four masks — `hasKeyStop`, `hasCtrlOrSpace`, `hasQuoteOrBackslash`,
-  `hasBackslash` — plus "the lower of two stops wins", and since 2026-09-01
-  the register-fed `*R` variants iterate actually runs pinned bit-for-bit to
-  the constant ones) and `Test_Unit_IsSpace`.
+  `hasBackslash` — plus "the lower of two stops wins"; since 2026-09-22 the
+  argument-free forms are one-line calls of the register-fed `*R` forms with
+  `swarRegs`' values, so the exhaustive check covers what `Iterate` runs and
+  each formula is written once) and `Test_Unit_IsSpace`.
   `isSpace` needs its own test precisely *because* the reference above shares
   it — a bug there cancels out and the fuzzer sees nothing.
 - `getmany_fuzz_test.go` — `FuzzGetManyAgainstRef`: differential fuzz of
@@ -156,6 +198,22 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   differentially verified against the old vendored copy (pairs/err/msg/pos
   identical on the samples + a malformed battery) and A/B'd clean (control
   clean; big line −3% from the dead resync code going away).
+- `bench/counters.py` (2026-09-22) — per-op hardware counters for prebuilt
+  test binaries: cycles, macro-ops, instructions and branches per op by the
+  difference method (two iteration counts, subtracted), pinned, interleaved,
+  best of `--reps`. Cycles are immune to the clock drift that moves this
+  machine's ns/op by up to 30%, and the op counts are exact, so it screens a
+  change in seconds and stays readable when the machine is too busy for a
+  timing series. `--portable` counts generic events only.
+  `bench/bsfdep.py` (2026-09-22) — lists every possible previous writer of each
+  BSF's destination register in a function (see the 2026-09-22 pass for why
+  that matters); run it on `Iterate` after every change there.
+- `logfmtbench_test.go` also holds, since 2026-09-22, `Benchmark_Get` (one-key
+  lookups: a shallow key, a deep one, an absent one — the package had none) and
+  `Benchmark_IterateFieldShape` (records of one repeated field shape: short
+  unquoted, second-word, short quoted, bare). The shape rows isolate the
+  per-field chain and are where a change to it shows at full size: the BSF
+  dependency of 2026-09-22 cost the unquoted row 37% and the sample line 3%.
 - `testdata/sample_big.txt` — the shared ~1.4 KB benchmark line, read by both
   root (`sample2`) and bench (`sampleBig`). Keep it a single file: the
   cross-suite ratios rely on the two suites parsing identical bytes, which is
@@ -179,9 +237,9 @@ requirement lands on the consumer's module, not this one. `bench/go.mod` is
 Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — see
 "API design rules" below before changing any of it.
 
-- `Iterate(data, func(k, v) bool) error` — exported adapter over the unexported
-  `iterate`, whose callback takes a third `quoted bool` (see "The `iterate` /
-  `Iterate` split" below). Calls back per pair,
+- `Iterate(data, func(k, v) bool) error` — the parser itself since 2026-09-22
+  (it used to be an adapter over an unexported `iterate` that also reported the
+  quoted bit; see "The quoted-bit protocol"). Calls back per pair,
   `k`/`v` alias `data` (bare key → shared `trueSlice`; all results read-only).
   Quoted values have quotes stripped but escapes left intact (raw). `false` from
   the callback stops. **The only function that reports errors alongside data.**
@@ -424,6 +482,12 @@ linked (README said EPYC 7763 / 444 ns; the table said EPYC 9V74 / 386 ns), and
 claimed "regenerated by CI" although nothing in `bench.yml` ever writes README.
 Don't reintroduce that pattern; if the numbers must appear in two places, have
 the renderers splice into marker-delimited blocks so the claim is true.
+
+Table currency, as of 2026-09-22: `git log -- bench/` shows the tables
+regenerated after every pass through `3e58443` (`bb04b30`, `cf5b672`,
+`89e9b0a`), so the paragraph below was already out of date when this one was
+written — which is the paragraph's own warning, a fourth time. They are stale
+for the 2026-09-22 pass until `bench.yml` is dispatched.
 
 Table currency, as of 2026-09-09: the committed tables are **stale for the
 2026-09-01 and 2026-09-09 passes** (nothing dispatched since 2026-08-22), and
@@ -1021,6 +1085,209 @@ losing on the stopwatch:
   so it runs the loop twice per escape: `esc=128` −15.2% against the landed
   −27.8%, `IterateJSONMsg` −20.1% against −25.7%, and every gap row worse.
 
+### 2026-09-22 pass — hardware counters and IBS (Ryzen 8840HS, amd64, Go 1.27.1)
+
+Run on counters rather than on the stopwatch, because the machine was too busy
+for timings to decide anything small: the same binary ran ~20% slower in wall
+time than at the session's start (a browser and a local Kubernetes cluster
+shared it), and the A/A timing control's per-row spread was ±5–12%. Core
+cycles do not move with the clock and per-op counts are exact, so decisions
+were made on `bench/counters.py` — cycles, macro-ops, instructions and
+branches per op by the difference method, pinned to core 10, best of three
+interleaved repetitions, reproducible to about 1% — with AMD IBS for
+per-instruction latency and a timed `compare.py` series as the secondary
+check. HEAD `89e9b0a` → this pass, cycles per op (`FieldShape/quoted`
+re-measured alone; see the harness lessons):
+
+| Benchmark | before | after | Δ |
+|---|---:|---:|---:|
+| `IterateOur` | 863.2 | 852.0 | −1.3% |
+| `GetMany_TimestampLevel` | 208.3 | 205.5 | −1.3% |
+| `LevelTS_LogFmt` | 173.7 | 160.0 | −7.9% |
+| `DecodeKeyval_Custom` | 1548431.0 | 1508914.3 | −2.6% |
+| `IterateJSONMsg` | 345.6 | 314.9 | −8.9% |
+| `Unescape` | 74.5 | 72.6 | −2.6% |
+| `UnescapeJSONMsg` | 590.3 | 567.5 | −3.9% |
+| `UnescapeUnicode` | 253.6 | 253.6 | ±0.0% |
+| `AppendValueUnicode` | 344.8 | 344.2 | −0.2% |
+| `Get/level` | 185.5 | 171.7 | −7.4% |
+| `Get/session_attr_client_locale` | 464.9 | 441.1 | −5.1% |
+| `Get/trace_id` | 977.5 | 938.4 | −4.0% |
+| `IterateFieldShape/unquoted` | 125103.1 | 121719.7 | −2.7% |
+| `IterateFieldShape/second-word` | 63925.3 | 62996.8 | −1.5% |
+| `IterateFieldShape/quoted` | 313793.8 | 317757.6 | +1.3% |
+| `IterateFieldShape/bare` | 108748.3 | 107881.9 | −0.8% |
+| `IterateEscaped/esc=0` | 86.3 | 82.4 | −4.5% |
+| `IterateEscaped/esc=8` | 235.8 | 232.0 | −1.6% |
+| `IterateEscaped/esc=32` | 716.9 | 678.5 | −5.4% |
+| `IterateEscaped/esc=128` | 1111.2 | 963.1 | −13.3% |
+| `IterateEscaped/esc=500` | 3086.1 | 2399.3 | −22.3% |
+| `UnescapeEscaped/esc=0` | 91.1 | 90.9 | −0.2% |
+| `UnescapeEscaped/esc=8` | 396.7 | 401.0 | +1.1% |
+| `UnescapeEscaped/esc=32` | 930.7 | 898.0 | −3.5% |
+| `UnescapeEscaped/esc=128` | 2642.3 | 2416.5 | −8.5% |
+| `UnescapeEscaped/esc=500` | 4404.1 | 3004.9 | −31.8% |
+| `IterateEscapedGap/gap=016` | 883.9 | 811.3 | −8.2% |
+| `IterateEscapedGap/gap=032` | 720.7 | 682.3 | −5.3% |
+| `IterateEscapedGap/gap=040` | 675.9 | 648.3 | −4.1% |
+| `IterateEscapedGap/gap=048` | 538.9 | 520.2 | −3.5% |
+| `IterateEscapedGap/gap=064` | 392.3 | 392.6 | +0.1% |
+| `IterateEscapedGap/gap=128` | 233.3 | 237.4 | +1.8% |
+| `IterateEscapedGap/gap=256` | 162.6 | 160.5 | −1.3% |
+| `IteratePrefixJSON/prefix=008` | 192.9 | 165.6 | −14.2% |
+| `IteratePrefixJSON/prefix=032` | 193.3 | 168.5 | −12.8% |
+| `IteratePrefixJSON/prefix=064` | 413.2 | 411.4 | −0.4% |
+| `IteratePrefixJSON/prefix=160` | 423.9 | 422.6 | −0.3% |
+
+No row regressed beyond the ±2% these repetitions reproduce to. All four
+differential fuzzers clean (30 s each), `-race` clean, golangci-lint v2.13.1
+clean on both modules (v2.12.2 cannot typecheck go1.27's stdlib; CI pins
+v2.13.1 for that reason). The timed series (`compare.py`, n=6 × 1 s, pinned,
+alternating; its A/A control was `~` everywhere at ±5–12% per row, and rows
+spread up to ±77% during the series itself) resolved only the large rows, all
+the same way round: parse `esc=500` −28%, decode `esc=500` −36% and `esc=128`
+−13%, JSON msg −11.5%, prose-then-JSON −16%, 16-byte gaps −13%, `Get/level`
+−12%, geomean −8.8%, nothing significantly worse.
+
+**Where the time goes, measured rather than modelled.** Microbenchmarks of
+this core's ports: a fused compare-and-branch issues at **2 per cycle**, as do
+`SHR imm` and a three-component `LEA`; plain ALU ops and `BSF` (1-cycle
+latency) issue at 4. `Iterate` on the sample retires ~4150 macro-ops and 969
+branches per parse in ~850 cycles, so the two branch-capable ALUs need ~485 of
+those cycles for branches alone, and the schedulers that feed them (IBS and
+`de_dis_dispatch_token_stalls2`: sch3 ≫ sch0 > sch1, sch2) are the ones that
+fill. A seeded short field costs ~21 branch ops (7 of them bounds checks, 3
+taken `JMP`s) and ~27 other ALU ops around a ~12-cycle chain (load 5 → mask 3
+→ BSF 1 → SHR 1 → two LEAs 2): 15.2 cycles per field on
+`FieldShape/unquoted`. A short QUOTED field costs ~40: IBS puts the reload of
+`bytes.IndexByte`'s result ~49 cycles after its dispatch, because the ABI0
+call passes arguments and result through the stack, and the result is on the
+per-field chain. The dense decode loop is the opposite case — frontend-bound,
+55% of dispatch slots empty, all taken branches.
+
+**1. The BSF output dependency (the finding of this pass).** `BSF` leaves its
+destination unchanged for a zero source, so the core treats the destination's
+old value as an input; a microbenchmark shows dependent `BSF`+`LEA` steps at
+2 cycles each, and 0.6 with the destination zeroed first. At GOAMD64=v1 every
+`bits.TrailingZeros64` is a `BSF` (v3's `TZCNT` has no such input; Go even
+zeroes its destination), and Go's register allocator gives the result the
+lowest free register not reserved for something else. In `Iterate` that is
+often the register a byte load has just released: removing the `quoted`
+parameter (item 2) moved the '"' test's byte load into `R11`, the value scan's
+`BSF` then took `R11`, and the load — which waits on the key's `BSF`, `SHR`
+and `LEA` — landed on the value chain. The instruction stream was IDENTICAL to
+HEAD's but for register names, and it ran `FieldShape/unquoted` +37%,
+DecodeKeyval +12%, the sample +3%; IBS showed the `BSF` completing ~8.6 cycles
+after its operand where HEAD's completes ~0.6 after. Loading the scan
+constants `sub, hi, xor` instead of `xor, sub, hi` made every `BSF` inherit a
+register written by one of those loads, long complete — and the pass's gains
+then showed. Moving `Iterate` 704 bytes changed nothing (not aliasing); four
+source respellings of the seeded dispatch changed nothing (the allocation is
+stable against local edits); the load order did. `bench/bsfdep.py` walks the
+control-flow graph back from each `BSF` and lists its destination's possible
+previous writers; a writer that is a load from data is flagged SUSPECT.
+Nothing in the language pins a register, so **run it after any change to
+`Iterate`**, and suspect this mechanism first when a change's cycles move
+without its op counts moving — earlier passes filed several such swings as
+layout noise.
+
+**2. The quoted bit, derived instead of reported.** See the protocol section:
+`Iterate` lost its `quoted *bool` parameter and becomes the parser; `GetQuoted`
+keeps the uncapped winning value and calls `wasQuoted` once. Worth −1.4…−3%
+of macro-ops on the lookups, and it removed four throwaway `var quoted bool`s.
+
+**3. The drain's pair step.** The escape walk used to clear an escape pair
+with `m &^= low | low<<8` after `low := m & -m` — six dependent operations per
+escape, and at the densities the walk exists for, that chain IS the walk. Now
+`m &= (m | -m) << 9`: `m | -m` sets every bit from m's lowest, bit 7 of lane
+t, upward, and shifting by nine starts it at bit 0 of lane t+2 (and clears it
+when there is no such lane, since lane 7 leaves the word first). Four
+operations. The lane comes from `TrailingZeros64(m)`, which the loop condition
+proves non-zero, where `TrailingZeros64(m & -m)` compiled to `BSF` plus a
+`CMOV` for a zero input that cannot occur; with `low` gone from the live set,
+the per-escape spill of the hi constant went too. −22% at 2-byte gaps, −9% on
+embedded JSON, −13% on prose-then-JSON, every escape row ahead or level.
+
+**4. The decode table.** `AppendUnescape`'s `switch` on the escaped byte was a
+binary search whose blocks sat far apart: 4.4 taken branches per escape in a
+loop whose frontend delivered ops to only 45% of dispatch slots. A 256-byte
+table (`unescapeByte`: n, r, t mapped, every other byte itself) for all but
+`\u` leaves 3.4 per escape: −32% at 500 escapes per KB, −9% at 128, −4% on
+the JSON message, Unicode and sparse rows level despite ~4% more macro-ops. The
+three taken branches left are `append`'s grow block laid out inline (Go's
+layout honours the "unlikely" hint by scheduling the split critical edge,
+then places the grow block before the shared store) and the merge after the
+`\u` branch; see the rejected list for the attempts on both.
+
+**5. DRY, at zero codegen cost.** `GetMany`'s small and indexed paths share
+`resetSlots`, `lenSet.excludes` and `settle` (the first-non-empty rule, once);
+the argument-free SWAR predicates call the `*R` forms, so each formula exists
+once; the two unterminated-value errors share `errUnterminated`. The machine
+code of `Iterate`, the escape walk and `AppendUnescape` hashed identical before
+and after. The indexed `GetMany` path moved −1…+5% on counters from alignment
+NOPs alone; it is not a path the realistic suite runs.
+
+**Measured and rejected** (each correctness-checked before losing):
+- *The 16-byte view for the seeded path's verify loads*, removing three bounds
+  checks per field (−73 branch ops per parse): Go CSEs the view's pointer with
+  the key word's address and materialises its `LEA` in the per-word key loop,
+  which spends what the checks saved (the 2026-09-01 result, confirmed), and
+  no constant-load order kept its value `BSF` off the '"' byte's register.
+  Second-word row −3%, unquoted row +34%.
+- *`base + 1` precomputed* so the seeded next-field index is one add: the
+  compiler folds the constant back out into the same two `LEA`s.
+- *The quoted scan started with the SWAR walk*, no `IndexByte` first: short
+  quoted fields −30%, DecodeKeyval −10%, JSON −13%, but LevelTS +11%, GetMany
+  +6%, `esc=0` +25% — 30–60-byte values (timestamps, messages) walk five words
+  and then call `IndexByte` anyway.
+- *An inline two-word probe for the closing quote*: short quoted −30%, but the
+  probe's word is spilled and reloaded twice inside `Iterate`, LevelTS +29%.
+  In a register-ABI helper (`closingQuote`, which also merged the two error
+  sites): LevelTS +11.5%, GetMany +10%; without the probe that helper is a
+  wash. The quoted path's cost is the `IndexByte` call's ABI0 boundary, and
+  every way around it so far charges the realistic 30–60-byte values more
+  than it saves the short ones.
+- *`AppendValue` handing quoted values straight to `AppendUnescape`* (one
+  backslash search, not two): escaped values −3…−5%, clean quoted values +1.8%
+  for the call into `AppendUnescape`'s large frame — a loss on the common
+  case. Splitting the decode loop out to avoid that made `AppendValue` best
+  everywhere but moved a NOP and a rematerialised `LEA` into the frontend-bound
+  dense loop: `esc=500` +20%.
+- *`\u` as an out-of-line fix-up after an unconditional table append*, to let
+  the common path fall through: dense −5%, JSON −4%, Unicode +8%, 48-byte gaps
+  +9% (the probe loop's constants rematerialised by the new allocation).
+- *`escClean` 6/7 and `escGap` 56/64*, re-swept after the faster drain: 5/48
+  still win (6 costs 48-byte gaps +25%, 64 costs 64-byte gaps +7%). The drain
+  cut the per-escape cost, not the clean-run crossover those constants encode.
+- *Dropping the deliver block's `vStart > n-1` guard*, now that branch ops are
+  known to be the scarcer port: −29 branch ops per parse, but the cap-zero mask
+  it folds comes back as more ALU work — Iterate +4.3%, DecodeKeyval +1.7%.
+  The 2026-09-01 trade stands.
+- *Recognising the '=' stop from the masks* (`m&-m&mv == 0`: '=' is the one key
+  stop the value mask lacks) instead of loading the byte: −35 branch ops per
+  parse and short unquoted fields −3.9%, but Iterate +3.6%, second-word +5.4%,
+  bare keys +5.9%. The 2026-09-01 attempt spilled `m`; this one did not, and
+  still lost.
+
+**`GOAMD64=v3` on this tree** (TZCNT has no destination input, so v3 builds
+are immune to the BSF lottery): `Iterate` −4.9%, deep `Get` −3.9%, short
+unquoted fields −3.2%, GetMany −2.6%, LevelTS −1.2%, DecodeKeyval `~` — but
+`IterateJSONMsg` +5.3% and `esc=128` +16% at identical op counts, so the
+escape walk's v3 code is slower than its v1 code (the README now says so).
+Against HEAD built at v3, this tree is still ahead on those rows (JSON −11%,
+`esc=128` −9.5%): the old drain was already four operations there, since v3
+spells `m & -m` as one `BLSI`.
+
+**Harness lessons.** `-test.bench` splits its pattern on `/` and matches each
+part unanchored, so `IterateFieldShape/quoted$` also ran `unquoted` and one
+counter row summed both; `counters.py` anchors every part. IBS works only
+system-wide, so it needs root: run the benchmark pinned to core 10 as the
+user, and `sudo perf record -C 10 -e ibs_op/cnt_ctl=1/ -R -c 20000 -- sleep 2`
+beside it; `perf report -D` decodes each sample, and `TagToRetCtr −
+CompToRetCtr` is the op's dispatch-to-completion latency, which is how the
+late `BSF` was found. Where `cycles:u` sampling attributes stalls to the
+instruction after the culprit, IBS attributes them to the op.
+
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
 **Not re-measured after the 2026-07-27 pass**, which attacked the fixed
@@ -1061,7 +1328,10 @@ drains each word of every escape before loading the next, which took the
 densest case from ~2.5 ns to **~1.3 ns per escape** (`esc=500`: 1272 → 654 ns
 for 500 escapes in 1 KB) and left the sparse end of the same sweep 6–12%
 slower, where the drain's bookkeeping has no second escape to amortise
-against. Embedded JSON in a `msg=` field — every JSON quote becomes `\"`, one
+against. Since 2026-09-22 the drain's pair step is four dependent operations
+instead of six: **~4.8 cycles (about 1 ns) per escape** at that density, and
+the fixed-width sweep's ratio is ~29× (2399 against 82 cycles per op), not
+the 59× below. Embedded JSON in a `msg=` field — every JSON quote becomes `\"`, one
 escape per ~2–8 bytes — is the realistic shape this serves:
 `Benchmark_IterateJSONMsg` −44%, `Benchmark_UnescapeJSONMsg` −40%. At a
 **fixed** 1 KB value the parse sweep now runs 35.6 ns (0 escapes) → 2.11 µs
@@ -1086,7 +1356,22 @@ paying off above ~32 B — which is why the memchr2/SIMD experiments below lost.
 
 ## The quoted-bit protocol (2026-08-08 split, measured and reshaped 2026-08-17)
 
-`iterate` reports whether a value was double-quoted — the only position where a
+**Superseded 2026-09-22: there is no protocol any more.** `Iterate` delivers
+values uncapped, so the byte just past a quoted value is its closing quote,
+while an unquoted value ends only at whitespace or at the end of the record
+(the value scan stops on nothing else, so it can never stop in front of a
+`"`). `wasQuoted(v)` reads that byte, `GetQuoted` calls it once for the value
+that won, and the parser lost a parameter, a store on every quoted field and
+the flag's load and store in `GetQuoted`'s callback on every field: one-key
+lookups −4…−7%, LevelTS −8%, Iterate −1% (cycles, 2026-09-22 pass). This is
+the "Not taken" alternative at the end of this section, and its objection —
+that it couples `GetQuoted` to the uncapped-value property — is accepted as
+the price: capping inside `Iterate` was rejected at −4.5% anyway, and the
+fuzzer's `iterateQ` now derives the bit the same way, so any capping change
+fails `FuzzIterateAgainstRef` against the reference's own quoted flag at once.
+The history below explains why the bit exists and what the protocol cost.
+
+`iterate` reported whether a value was double-quoted — the only position where a
 backslash escape means anything. That bit exists because of a **correctness**
 fix, not an optimization: `AppendValue` used to run `AppendUnescape` over every
 value it found, including unquoted ones, so `path=C:\Users\bob\new` came back
@@ -1229,6 +1514,19 @@ happening implicitly and bought nothing.
   `n-16` did it) makes the allocator spill the word itself inside the loop.
   `Test_Unit_SWARMasks` pins the register-fed helpers bit-for-bit equal to the
   constant ones for every byte value in every lane.
+- **The three scan constants are loaded `sub, hi, xor`, and the order is
+  load-bearing** (2026-09-22): it decides which registers the allocator has
+  free when `Iterate`'s `BSF`s are placed, and a `BSF` waits for its
+  destination's previous value. `xor, sub, hi` put the value scan's `BSF` on
+  the register the '"' test loads a byte into: +37% on short fields. See the
+  2026-09-22 pass; check with `bench/bsfdep.py`.
+- **The escape walk steps over a pair with `m &= (m | -m) << 9`** (2026-09-22):
+  four dependent operations per escape where `m &^= low | low<<8` took six,
+  and the lane comes from `TrailingZeros64(m)` (proven non-zero by the loop
+  condition, so no `CMOV`). The step relies on the lowest set bit of `m` being
+  the backslash's lane t, so shifting "everything from bit 7 of lane t up" by
+  nine keeps exactly the lanes from t+2 — lane 7 never gets here, it leaves
+  the word first.
 - **The mask tail is `& (hi &^ w)`, not `&^ w & hi`** (2026-09-01): with `hi`
   a variable the compiler keeps the association, `hi &^ w` is computed beside
   the subtractions instead of after the OR, and the chain to the `TEST` is a
@@ -1764,6 +2062,19 @@ noisy). Each was **neutral or worse**:
     unsigned form is actively worse (26 instructions vs 23). Only the explicit
     `s >= 0` works — see that loop's comment.
 
+- **2026-09-22 pass (counters and IBS) — measured and rejected**, each written
+  up with its numbers in that pass's section: the 16-byte view for the seeded
+  verify loads (the view pointer's `LEA` lands in the key loop; unlucky `BSF`
+  in every constant order), `base + 1` precomputed (refolded by the compiler),
+  the quoted scan started with the SWAR walk, an inline or out-of-line
+  two-word closing-quote probe, `AppendValue` handing quoted values straight to
+  `AppendUnescape` (with and without splitting the decode loop out), `\u` as an
+  out-of-line fix-up, and `escClean` 6/7 / `escGap` 56/64. The quoted-path
+  items share one lesson: a short quoted field's cost is `IndexByte`'s ABI0
+  boundary (~25 cycles of latency on the per-field chain), and every way
+  around the call so far charges the realistic 30–60-byte values more than it
+  saves the short ones.
+
 The parser is **memory-latency / per-field-overhead bound**, not scan-throughput
 bound (confirmed on arm64 with counters, see the 2026-08-17 benchmarks
 section: IPC 4.4, no mispredictions, instruction count barely moves cycles).
@@ -1792,8 +2103,38 @@ dependency chain: load (5) → mask (3–4) → `BSF` (3) → `SHR` → `LEA` �
 field's load. That chain is why moving work off the per-word path and onto the
 per-field path keeps losing, and why the two wins this pass found are both in
 code that had a chain to shorten rather than instructions to shed.
+**Refined 2026-09-22 with port measurements:** not every ALU op is equal. A
+fused compare-and-branch, a shift and a three-component `LEA` issue at 2 per
+cycle on this core, plain ALU ops and `BSF` at 4, so branch ops are the
+scarcer currency — ~21 of a seeded field's ~48 ALU ops are branches, 7 of them
+bounds checks — and a `BSF`'s destination is a hidden input (the 2026-09-22
+pass). The chain above is ~12 cycles for a short field whose value settles in
+the view, measured at 15.2 cycles per field all told.
 
 ## Methodology (use this for any future perf work)
+
+- **Counters before the stopwatch (2026-09-22).** `bench/counters.py` gives
+  cycles, macro-ops, instructions and branches per op for any list of
+  benchmarks across prebuilt binaries in seconds. Cycles ignore clock drift,
+  so it reads a change on a machine too busy for a timing series, and the op
+  counts say whether a cycle delta came from work or from latency: cycles
+  moving while ops stand still is a dependency or a layout effect, and the
+  first thing to check then is `bench/bsfdep.py`. It does not replace the
+  interleaved timing series for a final claim; it decides what is worth one.
+- **Check every BSF after touching `Iterate` (2026-09-22).**
+  `python3 bench/bsfdep.py <test binary> 'logfmt\.Iterate$'`; a SUSPECT line
+  means a `BSF` may wait on a data load it has nothing to do with.
+- **IBS for "which instruction is late" (2026-09-22).** Needs root: run the
+  benchmark pinned to core 10, and beside it
+  `sudo perf record -C 10 -e ibs_op/cnt_ctl=1/ -R -c 20000 -o ibs.data -- sleep 2`;
+  `perf report -i ibs.data -D` prints each sampled op's `IbsOpRip`,
+  `TagToRetCtr` and `CompToRetCtr`, whose difference is its dispatch-to-
+  completion latency. An op whose latency jumps between two builds with the
+  same instructions is the bug. (Aggregate per address and join with
+  `go tool objdump` — a 60-line script.)
+- **Anchor every part of a sub-benchmark pattern.** `-test.bench` splits on
+  `/` and matches each part on its own, unanchored: `Shape/quoted$` also runs
+  `Shape/unquoted`. `^Shape$/^quoted$` runs one.
 
 - **Differential fuzz** every parser change: `go test -run='^$'
   -fuzz=FuzzIterateAgainstRef -fuzztime=20s` (compares against a byte-by-byte
@@ -1908,4 +2249,7 @@ go test -run='^$' -fuzz=FuzzGetManyAgainstRef -fuzztime=20s  # lookup state mach
 go test -run='^$' -fuzz=FuzzAppendUnescapeAgainstRef -fuzztime=20s # decoder
 go test -run='^$' -bench=. -benchmem -count=3             # benchmarks
 go vet ./... && gofmt -l .                                # lint/format
+make bsfdep                                               # BSF dependency screen of Iterate (amd64)
+python3 bench/counters.py 'Benchmark_IterateOur,Benchmark_Get/level' \
+    /tmp/before.test /tmp/after.test --cpu 10             # per-op cycles/ops/branches
 ```

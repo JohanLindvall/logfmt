@@ -1,4 +1,4 @@
-.PHONY: all check test test-bench lint bench bench-md fix update-tools
+.PHONY: all check test test-bench lint bench bench-md bsfdep fix update-tools
 
 GOPATH := $(shell go env GOPATH)
 GOBIN := $(GOPATH)/bin
@@ -33,6 +33,13 @@ bench:
 bench-md:
 	BENCHTIME=2s bash pkg_bench.sh
 	BENCHTIME=2s bash bench/run_bench.sh
+
+# List every BSF in Iterate with its destination register's possible previous
+# writers (amd64). A BSF waits for that value, so one flagged SUSPECT can put
+# an unrelated load on the per-field chain; see CLAUDE.md, 2026-09-22.
+bsfdep:
+	go test -c -o logfmt.test .
+	python3 bench/bsfdep.py logfmt.test 'logfmt\.Iterate$$'
 
 fix:
 	gofmt -w .

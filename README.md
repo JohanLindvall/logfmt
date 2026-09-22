@@ -309,17 +309,18 @@ quotes cost extra, but boundedly: the first `\"` in a value restarts
 together to be worth it — the parser walks a word at a time looking for the next
 `"` or `\`, consuming each escape as it goes, and falls back to `bytes.IndexByte`
 as soon as they thin out again. So a value dense with escapes — embedded JSON,
-where every quote is one — costs a few nanoseconds per escape rather than a
+where every quote is one — costs about a nanosecond per escape rather than a
 fresh `IndexByte` call each, while a value with two escapes 200 bytes apart
 never leaves the fast path it was already on. A 1 KB value with 500 escapes
-parses roughly 59× slower than a clean 1 KB; `Benchmark_IterateEscaped` sweeps
+parses roughly 30× slower than a clean 1 KB; `Benchmark_IterateEscaped` sweeps
 that axis, and `Benchmark_UnescapeEscaped` sweeps it for `AppendUnescape`, which
 uses the same trick while decoding and is the slower half at high density.
 
 On amd64, building with `GOAMD64=v3` (Haswell+, 2013 onwards) makes the parser
-2–5% faster (BMI's `TZCNT` and `ANDN` in the word-at-a-time scanning; measured
-−4.6% on the 1.4 KB line and −3.5% on a typical one, 2026-09-01). It is a
-consumer build flag, not something the module can set.
+2–5% faster on typical lines (BMI's `TZCNT` and `ANDN` in the word-at-a-time
+scanning; measured −4.9% on the 1.4 KB line and −3% on short fields,
+2026-09-22), though values dense with escapes can come out a few percent
+slower. It is a consumer build flag, not something the module can set.
 
 ### vs other Go logfmt parsers
 

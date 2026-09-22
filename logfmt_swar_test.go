@@ -10,8 +10,8 @@ import (
 )
 
 // iterateRef is a straightforward byte-by-byte reference implementation used
-// to validate the SWAR-accelerated iterate. It must stay behaviourally
-// identical to the scalar version iterate was derived from, including the
+// to validate the SWAR-accelerated Iterate. It must stay behaviourally
+// identical to the scalar version Iterate was derived from, including the
 // quoted flag.
 func iterateRef(buf []byte, fn func(key, val []byte, quoted bool) bool) error {
 	for i, n := 0, len(buf); i < n; {
@@ -102,16 +102,11 @@ func iterateRef(buf []byte, fn func(key, val []byte, quoted bool) bool) error {
 }
 
 // iterateQ adapts the parser to the three-argument shape iterateRef has, so
-// collectPairs can drive both. iterate sets the flag it is handed before
-// delivering a quoted value and never clears it, so this reads and resets it
-// per pair, exactly as GetQuoted does.
+// collectPairs can drive both. The quoted bit comes from wasQuoted, exactly as
+// GetQuoted derives it, so comparing against iterateRef's own state machine is
+// what checks that derivation on every pair the fuzzer produces.
 func iterateQ(buf []byte, fn func(k, v []byte, quoted bool) bool) error {
-	var quoted bool
-	return iterate(buf, &quoted, func(k, v []byte) bool {
-		q := quoted
-		quoted = false
-		return fn(k, v, q)
-	})
+	return Iterate(buf, func(k, v []byte) bool { return fn(k, v, wasQuoted(v)) })
 }
 
 // collectPairs records four facts per pair, not two. The key and value are the
@@ -273,6 +268,9 @@ func firstStop(m uint64) int {
 	return bits.TrailingZeros64(m) >> 3
 }
 
+// Test_Unit_SWARMasks checks every mask exhaustively: every byte value in
+// every lane. The argument-free forms call the register-fed *R forms Iterate
+// runs, with swarRegs' values, so this is a check of those as well.
 func Test_Unit_SWARMasks(t *testing.T) {
 	// 'a' (0x61) satisfies neither predicate, so it is a safe filler.
 	for pos := 0; pos < 8; pos++ {
@@ -313,20 +311,6 @@ func Test_Unit_SWARMasks(t *testing.T) {
 				t.Fatalf("hasBackslash: byte %#02x at %d: stop %d, want %d", v, pos, got, want)
 			}
 
-			// The register-fed variants iterate actually runs must be the
-			// constant ones bit for bit, spurious high bits included: they
-			// are spelled separately, and their tail is associated
-			// differently on purpose.
-			r := swarRegs
-			if a, b := hasKeyStopR(w, r.xor, r.sub, r.hi), hasKeyStop(w); a != b {
-				t.Fatalf("hasKeyStopR: byte %#02x at %d: %#x, want %#x", v, pos, a, b)
-			}
-			if a, b := hasCtrlOrSpaceR(w, r.sub, r.hi), hasCtrlOrSpace(w); a != b {
-				t.Fatalf("hasCtrlOrSpaceR: byte %#02x at %d: %#x, want %#x", v, pos, a, b)
-			}
-			if a, b := hasQuoteOrBackslashR(w, r.quote, r.bslash, r.lo, r.hi), hasQuoteOrBackslash(w); a != b {
-				t.Fatalf("hasQuoteOrBackslashR: byte %#02x at %d: %#x, want %#x", v, pos, a, b)
-			}
 		}
 	}
 

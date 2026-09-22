@@ -36,6 +36,12 @@ func (e *SyntaxError) Error() string {
 // Is makes every SyntaxError match ErrBadFormat under errors.Is.
 func (e *SyntaxError) Is(target error) bool { return target == ErrBadFormat }
 
+// errUnterminated reports a quoted value whose opening quote is at data[open]
+// and which is never closed.
+func errUnterminated(open int) error {
+	return &SyntaxError{Offset: open, Reason: "unterminated quoted value"}
+}
+
 var trueSlice = []byte("true")
 
 var spaceTable = [256]bool{
@@ -67,7 +73,7 @@ const (
 // bytes 0x00..0x08 and 0x0E..0x1F, which the caller rules out by re-checking
 // the located byte. UTF-8 continuation/lead bytes (>= 0x80) are never flagged.
 func hasCtrlOrSpace(w uint64) uint64 {
-	return (w - swarLo*0x21) &^ w & swarHi
+	return hasCtrlOrSpaceR(w, swarRegs.sub, swarRegs.hi)
 }
 
 // swarRegs holds the broadcast constants the scans use, as a package VARIABLE
@@ -77,8 +83,16 @@ func hasCtrlOrSpace(w uint64) uint64 {
 // scanned, and each of those is an integer-ALU op on amd64, which is the unit
 // the scan loop is bound by (four of them; see CLAUDE.md, 2026-09-01). The
 // reloads after each callback go through the otherwise idle load ports. It is
-// never written; the *R helpers below are the constant ones with the values
-// passed in, and Test_Unit_SWARMasks pins them equal for every byte value.
+// never written. The *R helpers below take the values as arguments, and each
+// predicate is written only there: the argument-free forms, which carry the
+// explanations, call them with these values.
+//
+// swarRegs is also the place to look when a value from it moves register:
+// at GOAMD64=v1 bits.TrailingZeros64 is a BSF, which leaves its destination
+// unchanged for a zero input and so WAITS for the destination's previous
+// value. Which register a BSF writes is the register allocator's choice, and
+// the order these values are loaded in is one of its inputs — see the note at
+// Iterate's field head.
 var swarRegs = struct{ xor, sub, hi, quote, bslash, lo uint64 }{
 	swarLo * 0x1d, swarLo * 0x21, swarHi, swarLo * '"', swarLo * '\\', swarLo,
 }
@@ -124,9 +138,7 @@ func hasBackslash(w uint64) uint64 {
 // '"', or a ']' above a '\\') is flagged spuriously, but only ever ABOVE a real
 // one, so the lowest set bit of either half — and of their union — is genuine.
 func hasQuoteOrBackslash(w uint64) uint64 {
-	q := w ^ (swarLo * '"')
-	b := w ^ (swarLo * '\\')
-	return ((q - swarLo) | (b - swarLo)) &^ w & swarHi
+	return hasQuoteOrBackslashR(w, swarRegs.quote, swarRegs.bslash, swarRegs.lo, swarRegs.hi)
 }
 
 // Thresholds for the two scans a quoted value with escapes is split between.
@@ -215,8 +227,7 @@ const unescWindow = 4
 // caveat above harmless: every spurious bit sits above a true match, so the
 // lowest set bit of the union is still a genuine stop.
 func hasKeyStop(w uint64) uint64 {
-	x := w ^ (swarLo * 0x1d)
-	return ((w - swarLo*0x21) | (x - swarLo*0x21)) &^ w & swarHi
+	return hasKeyStopR(w, swarRegs.xor, swarRegs.sub, swarRegs.hi)
 }
 
 // scanQuotedEscapeDense walks a quoted value from just past an escaped quote,
@@ -283,8 +294,10 @@ func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
 		word := data[i : i+8]
 		i += 8 // the whole word is consumed unless a lane-7 pair says otherwise
 		for m != 0 {
-			low := m & -m
-			t := bits.TrailingZeros64(low) >> 3 & 7
+			// The lane comes from m itself, not from m & -m: the loop condition
+			// proves m non-zero, where TrailingZeros64 of the isolated bit
+			// compiled to a BSF plus a CMOV for a zero input that cannot occur.
+			t := bits.TrailingZeros64(m) >> 3 & 7
 			c := word[t]
 			if c == '"' {
 				return base + t, true
@@ -297,7 +310,14 @@ func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
 				i = base + 9 // the escaped byte is the next word's first
 				break
 			}
-			m &^= low | low<<8 // step over the backslash AND what it escapes
+			// Step over the backslash AND what it escapes by keeping only the
+			// lanes from t+2 up: m | -m sets every bit from m's lowest one,
+			// bit 7 of lane t, upward, and shifting that left by 9 starts it
+			// at bit 0 of lane t+2 (or clears it when there is no such lane).
+			// Four dependent operations per escape, where clearing the pair
+			// with m &^= low | low<<8 took six — and this chain is the walk's
+			// whole cost once a word holds several escapes.
+			m &= (m | -m) << 9
 		}
 	}
 	if clean >= escClean {
@@ -371,27 +391,8 @@ func scanQuotedSparse(data []byte, i int) int {
 // on well-formed input; a returned SyntaxError is the only allocation it can
 // make.
 func Iterate(data []byte, fn func(key, val []byte) bool) error {
-	var quoted bool // set by iterate; this callback signature has no room for it
-	return iterate(data, &quoted, fn)
-}
-
-// iterate is the parser; every exported entry point funnels through it. It
-// reports one fact Iterate's callback signature has no room for: whether the
-// value came from a double-quoted token, which is the only position where a
-// backslash escape means anything. The lookups take that bit straight from
-// here rather than guessing at it afterwards, which is what stops AppendValue
-// from "decoding" a Windows path.
-//
-// The reporting protocol is deliberately lopsided: iterate sets *quoted to true
-// just before delivering a quoted value and never clears it, so a caller that
-// wants the bit reads and resets it inside its callback (GetQuoted does; so
-// does the fuzz reference), and everyone else hands in a throwaway. That keeps
-// the common unquoted path free of any store. The alternatives both measured
-// worse on Neoverse N2: storing the bit before every callback cost GetMany
-// +1.8%, and the earlier design — a three-argument callback with a closure
-// adapting Iterate's two-argument one — cost an extra indirect call per field
-// (+2.3% Iterate, +4.4% LevelTS).
-func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
+	// This is the parser itself; every other entry point funnels through it.
+	//
 	// cap == len stops a callback's append reaching past the end of the record
 	// — a tightening of the read-only contract, never a loosening — for one
 	// instruction once per call. (Its original bounds-check role is now played
@@ -437,7 +438,21 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// has to survive a call is spilled at entry and reloaded through the
 		// store buffer, which put a store-forwarding stall on the first
 		// field of every call (worth 5% on a one-field record).
-		kxor, ksub, khi := swarRegs.xor, swarRegs.sub, swarRegs.hi
+		//
+		// The ORDER of these three loads is load-bearing, though nothing in
+		// the language says so. At GOAMD64=v1 bits.TrailingZeros64 is a BSF,
+		// and a BSF waits for its destination register's previous value (the
+		// instruction leaves it unchanged for a zero source). The register
+		// allocator gives each BSF the lowest free register, so which value
+		// last lived there is an accident of everything before it — and with
+		// xor loaded first, the seeded value scan's BSF landed on the register
+		// the '"' test had just loaded a byte into, chaining that load onto
+		// every field: +37% on short unquoted fields, +12% on DecodeKeyval,
+		// for an instruction stream otherwise identical to this one. Loaded
+		// in this order, every BSF here inherits a register written by one of
+		// these loads, long since complete. bench/bsfdep.py reports each BSF's
+		// possible previous writers; run it after any change to this function.
+		ksub, khi, kxor := swarRegs.sub, swarRegs.hi, swarRegs.xor
 
 		// The key scan runs two SWAR loops. The wide one holds a sixteen-byte
 		// view so that an '=' hit can settle a short unquoted value from bytes
@@ -600,7 +615,6 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		}
 	quotedVal:
 		{
-			*quoted = true
 			i++
 			vStart = i
 			// One IndexByte call settles a value with no escaped quote, which
@@ -610,7 +624,7 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 			if q < 0 {
 				// vStart is just past the opening quote, which is the
 				// position worth reporting.
-				return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
+				return errUnterminated(vStart - 1)
 			}
 			i += q
 
@@ -635,7 +649,7 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 				pos, done := scanQuotedEscapeDense(data, i+1, vStart)
 				if !done {
 					if pos = scanQuotedSparse(data, pos); pos < 0 {
-						return &SyntaxError{Offset: vStart - 1, Reason: "unterminated quoted value"}
+						return errUnterminated(vStart - 1)
 					}
 				}
 				i = pos
@@ -697,6 +711,10 @@ func iterate(data []byte, quoted *bool, fn func(key, val []byte) bool) error {
 		// pass follows). It is kept deliberately: it is what lets that pass
 		// fold the cap-zero mask on the value slice, four ALU ops, into this
 		// one fused compare-and-branch.
+		//
+		// The value is NOT capped to its own length, and GetQuoted relies on
+		// that: wasQuoted tells a quoted value from an unquoted one by the
+		// byte just past it.
 		if vStart > n-1 || !fn(data[kStart:kEnd], data[vStart:vEnd]) {
 			return nil
 		}
@@ -745,26 +763,17 @@ func AppendUnescape(dst []byte, raw []byte) []byte {
 		}
 		next := raw[i]
 		i++
-		switch next {
-		case 'n':
-			dst = append(dst, '\n')
-		case 'r':
-			dst = append(dst, '\r')
-		case 't':
-			dst = append(dst, '\t')
-		case 'u':
-			if r := hex4(raw[i:]); r >= 0 {
-				adv := 4
-				if utf16.IsSurrogate(r) {
-					r, adv = decodeSurrogateEscape(raw[i:], r)
-				}
-				dst = utf8.AppendRune(dst, r)
-				i += adv
-			} else {
-				dst = append(dst, '\\', 'u')
+		if next != 'u' {
+			dst = append(dst, unescapeByte[next])
+		} else if r := hex4(raw[i:]); r >= 0 {
+			adv := 4
+			if utf16.IsSurrogate(r) {
+				r, adv = decodeSurrogateEscape(raw[i:], r)
 			}
-		default:
-			dst = append(dst, next)
+			dst = utf8.AppendRune(dst, r)
+			i += adv
+		} else {
+			dst = append(dst, '\\', 'u')
 		}
 		if i >= n {
 			return dst
@@ -798,6 +807,17 @@ func AppendUnescape(dst []byte, raw []byte) []byte {
 		i = j + 1
 	}
 }
+
+// unescapeByte maps the byte after a backslash to the byte the escape decodes
+// to, for every escape but \u: \n, \r and \t become control characters and
+// anything else (\" and \\ above all) stands for itself.
+var unescapeByte = func() (t [256]byte) {
+	for i := range t {
+		t[i] = byte(i)
+	}
+	t['n'], t['r'], t['t'] = '\n', '\r', '\t'
+	return t
+}()
 
 // decodeSurrogateEscape combines the already parsed surrogate r1 with a
 // following low-surrogate escape, if present. b starts at r1's four hex digits.
@@ -979,29 +999,37 @@ func Get(data []byte, key string) ([]byte, bool) {
 // Everything else — aliasing, capping, duplicate resolution, the absence of
 // syntax errors — is exactly as described on Get.
 func GetQuoted(data []byte, key string) (val []byte, quoted, found bool) {
-	// iterate sets q before delivering a quoted value and never clears it, so
-	// the callback consumes the flag: read it, then reset it for the next pair.
-	var q bool
-	_ = iterate(data, &q, func(k, v []byte) bool {
-		wasQuoted := q
-		q = false
+	// raw holds the winning value as Iterate delivered it, uncapped, because
+	// wasQuoted reads the byte past it; it is capped only on the way out.
+	var raw []byte
+	_ = Iterate(data, func(k, v []byte) bool {
 		if string(k) != key {
 			return true
 		}
-		// cap == len, so a caller's append cannot reach into data.
-		if len(v) > 0 {
-			val, quoted, found = v[:len(v):len(v)], wasQuoted, true
-			return false // settled: first non-empty occurrence wins
+		// The first non-empty occurrence settles the key; an empty one is
+		// kept only until a non-empty one turns up. Iterate never delivers a
+		// nil value, even an empty one, so raw == nil means "not seen yet"
+		// and a present but empty value stays distinct from an absent key.
+		if len(v) > 0 || raw == nil {
+			raw = v
 		}
-		if !found {
-			// Provisional empty; keep looking for a non-empty one. Slicing a
-			// non-nil slice keeps it non-nil even at zero length, so a
-			// present-but-empty value stays distinct from an absent key.
-			val, quoted, found = v[:len(v):len(v)], wasQuoted, true
-		}
-		return true
+		return len(v) == 0
 	})
-	return val, quoted, found
+	if raw == nil {
+		return nil, false, false
+	}
+	// cap == len, so a caller's append cannot reach into data.
+	return raw[:len(raw):len(raw)], wasQuoted(raw), true
+}
+
+// wasQuoted reports whether v, a value Iterate delivered, was written as a
+// double-quoted token. Iterate hands values out uncapped, so the byte just past
+// a quoted value is its closing quote, while an unquoted value always ends at
+// whitespace or at the end of the record — the value scan stops on nothing
+// else, so it can never stop in front of a '"'. The bare-key sentinel has no
+// byte past it at all.
+func wasQuoted(v []byte) bool {
+	return cap(v) > len(v) && v[:len(v)+1][len(v)] == '"'
 }
 
 // GetMany looks up several keys in a single pass over data. It returns a slice
@@ -1057,26 +1085,10 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 		return getManyIndexed(data, keys, buf)
 	}
 
+	lens := resetSlots(keys, buf)
 	remaining := n
-	// One pass does both jobs, because both are per-key and the slice is
-	// short: clearing the slots (a match fills its slot, so a slot left nil
-	// records a missing key, and a slot may hold a provisional empty value
-	// that a later non-empty one replaces) and building lenMask, which has
-	// bit L set for every key of length L below 64 so that a field whose key
-	// has some other length is rejected by one shift instead of by the
-	// compare loop. Spelled as two loops this was a clear() — which for a
-	// slice of slices is a call to the runtime's memclr — plus a second walk
-	// of keys, and both showed up in GetMany's own profile.
-	var lenMask uint64
-	for j, key := range keys {
-		buf[j] = nil
-		if len(key) < 64 {
-			lenMask |= 1 << uint(len(key))
-		}
-	}
-	var quoted bool // throwaway: GetMany hands out raw values without the bit
-	_ = iterate(data, &quoted, func(k, v []byte) bool {
-		if uint(len(k)) < 64 && lenMask>>uint(len(k))&1 == 0 {
+	_ = Iterate(data, func(k, v []byte) bool {
+		if lens.excludes(k) {
 			return true
 		}
 		for j := range keys {
@@ -1087,14 +1099,8 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 			if len(buf[j]) > 0 || string(k) != keys[j] {
 				continue
 			}
-			if len(v) > 0 {
-				buf[j] = v[:len(v):len(v)] // cap == len, so a caller's append cannot reach into data
-				remaining--                // settled: a non-empty value won't be overridden
-			} else if buf[j] == nil {
-				// Record the empty value, but keep looking. Slicing a non-nil
-				// slice keeps it non-nil even at zero length, so a present-empty
-				// value stays distinguishable from an absent key's nil.
-				buf[j] = v[:len(v):len(v)]
+			if settle(&buf[j], v) {
+				remaining--
 			}
 			break
 		}
@@ -1109,8 +1115,7 @@ func GetMany(data []byte, keys []string, buf [][]byte) [][]byte {
 // Validate when a record's validity matters, and errors.Is(err, ErrBadFormat)
 // or a *SyntaxError type assertion to inspect the result.
 func Validate(data []byte) error {
-	var quoted bool // throwaway
-	return iterate(data, &quoted, func(key, val []byte) bool { return true })
+	return Iterate(data, func(key, val []byte) bool { return true })
 }
 
 // All returns an iterator over data's key/value pairs, for use with range:
@@ -1132,8 +1137,7 @@ func Validate(data []byte) error {
 // to know; use Iterate to get the error and the pairs in one pass.
 func All(data []byte) func(yield func(key, val []byte) bool) {
 	return func(yield func(key, val []byte) bool) {
-		var quoted bool // throwaway; a range loop has no room for the bit either
-		_ = iterate(data, &quoted, yield)
+		_ = Iterate(data, yield)
 	}
 }
 
@@ -1173,20 +1177,13 @@ func SplitRecord(data []byte) (record, rest []byte) {
 // values stay in the chain so later occurrences can replace them. Only the
 // full key comparison establishes a match; fingerprint collisions are harmless.
 func getManyIndexed(data []byte, keys []string, buf [][]byte) [][]byte {
-	var lenMask uint64
-	for j, key := range keys {
-		buf[j] = nil
-		if len(key) < 64 {
-			lenMask |= uint64(1) << uint(len(key))
-		}
-	}
+	lens := resetSlots(keys, buf)
 	var heads [64]uint16
 	var next [256]uint16
 	ready := false
 	remaining := len(keys)
-	var quoted bool
-	_ = iterate(data, &quoted, func(k, v []byte) bool {
-		if uint(len(k)) < 64 && lenMask>>uint(len(k))&1 == 0 {
+	_ = Iterate(data, func(k, v []byte) bool {
+		if lens.excludes(k) {
 			return true
 		}
 		// Key lengths can reject fields without needing an index. Build
@@ -1199,7 +1196,6 @@ func getManyIndexed(data []byte, keys []string, buf [][]byte) [][]byte {
 				next[j] = heads[h]
 				heads[h] = uint16(j + 1)
 			}
-
 			ready = true
 		}
 		link := &heads[keyBucket(k)]
@@ -1209,18 +1205,58 @@ func getManyIndexed(data []byte, keys []string, buf [][]byte) [][]byte {
 				link = &next[j]
 				continue
 			}
-			if len(v) > 0 {
-				buf[j] = v[:len(v):len(v)]
-				*link = next[j]
+			if settle(&buf[j], v) {
+				*link = next[j] // a settled slot leaves its chain
 				remaining--
-			} else if buf[j] == nil {
-				buf[j] = v[:len(v):len(v)]
 			}
 			break
 		}
 		return remaining != 0
 	})
 	return buf
+}
+
+// lenSet has bit L set for every requested key of length L below 64, so a
+// field whose key has some other length is turned away by one shift, before
+// any key is compared. Keys of 64 bytes or more are never turned away by it.
+type lenSet uint64
+
+// excludes reports whether no requested key can have k's length.
+func (s lenSet) excludes(k []byte) bool {
+	return uint(len(k)) < 64 && s>>uint(len(k))&1 == 0
+}
+
+// resetSlots nils every slot of buf — a match fills its slot, so a slot left
+// nil records a missing key — and returns the set of the keys' lengths. One
+// pass does both jobs because both are per key and the list is short: spelled
+// as two, clear() on a slice of slices was a call to the runtime's memclr plus
+// a second walk of keys, and both showed up in GetMany's own profile.
+func resetSlots(keys []string, buf [][]byte) lenSet {
+	var s lenSet
+	for j, key := range keys {
+		buf[j] = nil
+		if len(key) < 64 {
+			s |= 1 << uint(len(key))
+		}
+	}
+	return s
+}
+
+// settle records v in *slot under the rule every lookup shares for duplicate
+// keys — the first non-empty value wins, an empty one is held only until a
+// non-empty one turns up — and reports whether the slot is now settled. The
+// value is capped (cap == len), so a caller's append copies instead of
+// reaching into data, and slicing keeps a present-but-empty value non-nil,
+// distinct from an absent key's nil.
+func settle(slot *[]byte, v []byte) bool {
+	if len(v) > 0 {
+		*slot = v[:len(v):len(v)]
+		return true
+	}
+	if *slot == nil {
+		*slot = v[:len(v):len(v)]
+	}
+	return false
 }
 
 // A few sampled bytes provide a cheap bucket, not a full hash. Accept both
