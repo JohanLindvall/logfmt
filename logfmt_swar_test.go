@@ -6,6 +6,7 @@ import (
 	"math/bits"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -219,6 +220,17 @@ func FuzzIterateAgainstRef(f *testing.F) {
 		`msg="a\"#b\"#c" d=1`,
 		`msg="a\\]b\\]c" d=1`,
 		`msg="\"###\"###" d=1`,
+		// A value that starts sparse — its first escaped quote beyond escGap
+		// on every architecture — and turns dense: prose, then JSON. arm64's
+		// sparse scan hands such a value back to the walk, once (escUpgrade);
+		// the second seed makes the walk give up again on a long clean run,
+		// after which the value stays sparse even where it turns dense again;
+		// the third runs off the end of the input just after the hand-back;
+		// the fourth stays sparse for one more escaped quote before it.
+		`msg="` + strings.Repeat("p", 70) + `{\"id\":7,\"ok\":true}" b=1`,
+		`msg="` + strings.Repeat("p", 70) + `\"a\"` + strings.Repeat("q", 90) + `\"b\"c\"" b=1`,
+		`msg="` + strings.Repeat("p", 70) + `\"a\"xyz\`,
+		`msg="` + strings.Repeat("p", 70) + `\"` + strings.Repeat("q", 70) + `\"ab\"cd\"" b=1`,
 	}
 	for _, s := range seeds {
 		f.Add([]byte(s))

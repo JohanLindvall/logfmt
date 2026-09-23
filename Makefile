@@ -36,9 +36,10 @@ bench-md:
 
 # List every BSF in Iterate with its destination register's possible previous
 # writers (amd64). A BSF waits for that value, so one flagged SUSPECT can put
-# an unrelated load on the per-field chain; see CLAUDE.md, 2026-09-22.
+# an unrelated load on the per-field chain; see CLAUDE.md, 2026-09-22. The
+# binary is cross-compiled, so the check means the same thing on an arm64 host.
 bsfdep:
-	go test -c -o logfmt.test .
+	GOARCH=amd64 go test -c -o logfmt.test .
 	python3 bench/bsfdep.py logfmt.test 'logfmt\.Iterate$$'
 
 fix:

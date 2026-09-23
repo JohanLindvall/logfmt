@@ -1,6 +1,46 @@
 # CLAUDE.md — logfmt
 
-## Latest pass: hardware counters and IBS on amd64 (2026-09-22)
+## Latest pass: arm64-native escape paths from hardware counters (2026-09-23)
+
+Neoverse N2 (the Azure arm64 VM), Go 1.27.1, decided on per-op cycles from
+`bench/counters.py` — which now counts the Armv8 PMUv3 events this VM exposes
+(`OP_RETIRED`, `BR_RETIRED`, `STALL_BACKEND`, `STALL_FRONTEND`, … — the old
+note that only generic events count here is wrong) — and confirmed by pinned,
+alternating timing series. Numbers, controls and the rejected list are in
+"2026-09-23 pass" below and in [bench/perf_2026-09-23_arm64.md](bench/perf_2026-09-23_arm64.md).
+**amd64 compiles to the same machine code as before, function for function**
+(`bench/asmdiff.py`), so nothing here is an x86 claim.
+
+- **arm64 has its own escape paths now**, in build-tagged files beside the
+  generic ones: `scan_arm64.go` (the walk, spelled so a clean word costs 16
+  instructions instead of 22 and a lane's byte is re-checked from the register;
+  `escClean` = 8 and `escGap` = 64; and a sparse scan that hands a value back to
+  the walk once) and `scan_other.go` (the amd64-tuned code, moved verbatim out
+  of `logfmt.go`). Escape rows −9…−29%, prose-then-JSON −64%.
+- **The KNOWN GAP is closed on arm64**, and the trap in closing it is written
+  down: letting the sparse scan hand ANY value back after every short gap cost
+  +28–34% on alternating short/long gaps (JSON with long string values); only a
+  value the walk declined on arrival may go back, and only once.
+  `Benchmark_IterateEscapedAlternating` pins that shape.
+- **`AppendUnescape` decodes into spare capacity on arm64** (`unescape_spare.go`,
+  chosen by the constant `runtime.GOARCH == "arm64"`, so amd64 compiles the
+  dispatch away): no `memmove` call per literal run up to 32 bytes, an adaptive
+  8-word probe, surrogate pairs without a call. Decode rows −7…−33%, JSON
+  −17%; `Unescape` (a short value, two escapes) +3.6%.
+- **`Iterate` itself is unchanged**, after a long list of measured attempts
+  (below). Short fields on this core are bound by the callback's round trip and
+  the key-verify chain as a whole; no single removal gives back more than 1%.
+  The +0.7% `IterateOur` shows is placement — `Iterate` moved from offset 32 to
+  16 of a 64-byte block — and a padding control that moves it back matches
+  the baseline to ±0.0%. On this core the same code retires ~40 fewer ops per
+  parse at 32-byte-aligned offsets: compare-and-branch fusion depends on where
+  the pair falls.
+- New tools: `bench/asmdiff.py` (which functions' machine code differs between
+  two builds — run it cross-compiled for every architecture a change is NOT
+  meant for), `counters.py` on arm64 (plus a mispredicts column), and
+  `make bsfdep` now cross-compiles, so it means the same thing on an arm64 host.
+
+## Previous pass: hardware counters and IBS on amd64 (2026-09-22)
 
 Driven by `perf stat` counters and AMD IBS per-op sampling rather than by the
 stopwatch; the numbers, the mechanisms and the rejected list are in "2026-09-22
@@ -95,6 +135,20 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   streaming error semantics, leniency divergences from go-logfmt, and the
   explicit non-goals under "Scope".
 - `logfmt.go` — the core parser and key-lookup API (the "general parsing").
+- `scan_other.go` / `scan_arm64.go` (2026-09-23) — the escape walk
+  (`scanQuotedEscapeDense`), the sparse quoted scan (`scanQuotedSparse`) and
+  their thresholds `escClean`/`escGap`, per architecture. `scan_other.go`
+  (`!arm64`) is the amd64-tuned code moved verbatim out of `logfmt.go`, and
+  builds to the same machine code as before; `scan_arm64.go` is the N2-tuned
+  version (register byte re-check, a quiet limit instead of a counter, 8/64,
+  the one-time hand-back from the sparse scan). `Iterate` calls whichever is
+  built and its own source is shared.
+- `unescape_spare.go` (2026-09-23) — `unescapeInto`, the decoder for a
+  destination with room for all of `raw`, and `unescapeIntoSpare =
+  runtime.GOARCH == "arm64"`, the constant `AppendUnescape` dispatches on after
+  its first `IndexByte`. Portable Go, used on arm64 only because it was measured
+  there only; on amd64 the constant-false branch is removed before code
+  generation (checked with `bench/asmdiff.py`) and the linker drops the rest.
 - `time.go` — `ParseTime` (see warning above).
 - `logfmt_swar_test.go` — `FuzzIterateAgainstRef`: differential fuzz of the
   SWAR parser (`Iterate`; the unexported `iterate` of earlier notes is gone)
@@ -145,7 +199,14 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   because decoding never lengthens, and the one case a read-ahead can break) —
   plus `NeedsUnescape(raw) == false ⇒ raw decodes to itself`. **Run after any
   change to `AppendUnescape`.** Mutation-checked: swapping `\r` for `\n` in the
-  decoder fails on the seeds alone.
+  decoder fails on the seeds alone. Since 2026-09-23 it checks five placements,
+  not three — also a prefix WITH spare capacity and an in-place decode behind a
+  prefix in the same buffer, the two that reach arm64's `unescapeInto` besides
+  `dst = raw[:0]` — and carries seeds whose literal runs sit on every boundary
+  of that decoder's copies (1, 2, 4, 8, 16, 32 bytes, `memmove`) and of its
+  probe window. **The runs are non-periodic on purpose**: with runs of `x`, a
+  copy that read the last word one byte early survived, because it copied the
+  same bytes; four such mutations of the copies now each fail on the seeds.
 - `*_test.go` — unit tests, benchmarks, and a regex-vs-logfmt comparison.
   `Test_Unit_HotPath_Allocs` pins the allocation-free contract across all 14
   entry points that claim one (previously only 2 were asserted, and three
@@ -180,7 +241,10 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   the decisions instead of sampling evenly. The count-parameterised sweep's blind
   spot has now hidden a regression (the 32-byte window, −7% GetMany) *and* a win
   (`escClean` 5, −10% at a 48-byte gap read as `~` on every committed row).
-  `Benchmark_IteratePrefixJSON` pins the `escGap` cliff (see Known limits).
+  `Benchmark_IteratePrefixJSON` pins the `escGap` cliff (see Known limits) —
+  closed on arm64 since 2026-09-23, where `Benchmark_IterateEscapedAlternating`
+  (escapes alternating short and long gaps, i.e. JSON with long string values)
+  pins the shape the closing must not break.
   `Benchmark_UnescapeUnicode` / `Benchmark_AppendValueUnicode` are the first
   benchmarks in this package's history to execute `hex4` or
   `decodeUnicodeEscape` **at all** — every escaped sample here carries `\" \\ \t
@@ -204,10 +268,21 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   best of `--reps`. Cycles are immune to the clock drift that moves this
   machine's ns/op by up to 30%, and the op counts are exact, so it screens a
   change in seconds and stays readable when the machine is too busy for a
-  timing series. `--portable` counts generic events only.
+  timing series. `--portable` counts generic events only. Since 2026-09-23 it
+  picks the event set by host: on arm64 the PMUv3 common events by number
+  (`OP_RETIRED`, `BR_RETIRED`, `STALL_BACKEND`, `STALL_FRONTEND`,
+  `BR_MIS_PRED_RETIRED`), adding the two stall shares (`be%`, `fe%`) as
+  columns; both sets print mispredicts per op.
   `bench/bsfdep.py` (2026-09-22) — lists every possible previous writer of each
   BSF's destination register in a function (see the 2026-09-22 pass for why
-  that matters); run it on `Iterate` after every change there.
+  that matters); run it on `Iterate` after every change there. `make bsfdep`
+  cross-compiles for amd64, so it can run from any host.
+  `bench/asmdiff.py` (2026-09-23) — lists the package functions whose machine
+  code differs between two test binaries, ignoring addresses, line numbers and
+  arm64's page-relative offsets. Build both with the GOARCH a change is NOT
+  meant for and it proves the change left that architecture alone: that is how
+  every arm64-only change of 2026-09-23 was shown to leave amd64 identical.
+  `bench/perf_2026-09-23_arm64.md` — the report of that pass.
 - `logfmtbench_test.go` also holds, since 2026-09-22, `Benchmark_Get` (one-key
   lookups: a shallow key, a deep one, an absent one — the package had none) and
   `Benchmark_IterateFieldShape` (records of one repeated field shape: short
@@ -294,7 +369,14 @@ Reshaped 2026-07-26 in one breaking pass, while the module was still v0.x — se
   **Unlike `escClean`, `unescWindow` = 4 re-measured the same on amd64**
   (2026-08-17): 2 costs the 32-byte-gap row 18.8% and `UnescapeJSONMsg` 4.3%, 8
   costs the 128-byte-gap row 28.5%. Both arches agree, so a change here needs
-  both before it lands.
+  both before it lands. **On arm64 since 2026-09-23 a destination with room for
+  all of `raw` takes `unescapeInto` instead** (`unescape_spare.go`), which keeps
+  `unescWindow` for no one: its probe is `spareWindow` = 8 words, cheaper per
+  word (constants in registers) and skipped after a run of 64+ bytes until a
+  short run turns up — the adaptive part is what made 8 words pay (a fixed 8
+  measured −25% at 48-byte gaps and +16% at 128; adaptive, −25% and −7%). The
+  append-as-you-go loop above still serves arm64 buffers with less room than
+  `raw`, and every other architecture, unchanged.
   **The probe loop carries a redundant-looking `s >= 0` and it is load-bearing**
   (2026-08-17): it is what removes the bounds check on the `Uint64` load. The
   `uint(i) < uint(n)` / `i <= n-8` recipe that clears `iterate`'s two SWAR loads
@@ -412,6 +494,19 @@ Deliberate behaviours that surprise people; all are now in `doc.go`/README.
   48-byte gap.** Raising or deleting `escGap` are the cheap alternatives and both
   measure worse: deleting it fixes the cliff but costs one wasted 40-byte probe
   on *every* sparse value (+6–9% at 64–128 B gaps).
+  **Closed on arm64, 2026-09-23** (`scanQuotedSparse` in `scan_arm64.go`), and
+  the threshold rule above turned out to be necessary but not sufficient. With
+  the upgrade at 48 against a give-up at 64 the prefix shape measured −61%, but
+  a value handed back after EVERY short gap measured **+28–34%** on escapes
+  alternating a short gap and a long one (8/80, 40/80, 40/120, 20/70 bytes) —
+  JSON whose string values are long: each long gap made the walk give up after
+  64 wasted bytes and the next short gap brought it straight back. What landed
+  hands a value back **once, and only if the walk declined it on arrival** (the
+  sparse scan tells the two cases apart by the byte before its start: an escaped
+  quote is left there only by a decline, never by a clean run). Prefix shape
+  −64%, alternating gaps +0.3–0.9%, 128/256-byte gaps ~/+1.5%. Still open on
+  amd64, on the numbers above; if it is ported, port the once-only rule with it
+  and re-measure the alternating rows, which exist for exactly this.
 - **Keys are never quoted**: `"a b"=c` → bare key `"a`, then `b"`=c. Quoting is
   position-dependent (value position only) — the same property that defeats the
   SIMD substring search below.
@@ -482,6 +577,13 @@ linked (README said EPYC 7763 / 444 ns; the table said EPYC 9V74 / 386 ns), and
 claimed "regenerated by CI" although nothing in `bench.yml` ever writes README.
 Don't reintroduce that pattern; if the numbers must appear in two places, have
 the renderers splice into marker-delimited blocks so the claim is true.
+
+Table currency, as of 2026-09-23: the tables were regenerated right after
+the 2026-09-22 pass (`3cb3ae9`, stamped 2026-09-22T20:31Z), so the next
+paragraph's "stale for the 2026-09-22 pass" was out of date within hours — a
+fifth time. They are stale for the 2026-09-23 arm64 changes (the escape and
+decode rows of `pkg_results_arm64.md` above all) until `bench.yml` is
+dispatched; the amd64 tables are not, since amd64's machine code did not change.
 
 Table currency, as of 2026-09-22: `git log -- bench/` shows the tables
 regenerated after every pass through `3e58443` (`bb04b30`, `cf5b672`,
@@ -1288,6 +1390,121 @@ CompToRetCtr` is the op's dispatch-to-completion latency, which is how the
 late `BSF` was found. Where `cycles:u` sampling attributes stalls to the
 instruction after the culprit, IBS attributes them to the op.
 
+### 2026-09-23 pass — arm64-native escape paths (Neoverse N2, Azure, 2 vCPU, Go 1.27.1)
+
+The first pass driven by counters on arm64. Baseline `3cb3ae9`; before and
+after built from identical test sources; decisions on per-op cycles
+(`bench/counters.py`, CPU 1, best of 2–3 interleaved repetitions), claims from
+`bench/compare.py` (n=6 × 0.5 s, pinned, alternating; the A/A control read `~`
+on every row at +0.01% geomean, spread ±0–1%). Full tables, controls and
+reproduction: [bench/perf_2026-09-23_arm64.md](bench/perf_2026-09-23_arm64.md).
+**amd64 machine code is identical to the baseline for every package function**
+(`bench/asmdiff.py` on cross-compiled binaries), so nothing below says anything
+about x86.
+
+**The core, measured** (Go-assembly microbenchmarks, independent chains): ~5
+ops/cycle dispatch; 4 integer ALUs (1-cycle `ADD`/logical/`RBIT`/`CLZ`/`LSRV`/
+`UBFX`/`CSEL`; `ADD` with an `LSR`-shifted operand is 2 cycles on 2 pipes, with
+`LSL` ≤ 4 1 cycle); 2 branch units, and `CMP`/`TST`+`B.cond` fuse into one op;
+3 loads per cycle, L1 load-to-use 4 cycles for immediate and register offsets
+alike; store-to-load forwarding ~5 cycles; register `MOV`s are partly
+eliminated (~0.7 cycles each in a chain) but take an ALU slot; a non-encodable
+64-bit constant is 4 ALU ops. `bytes.IndexByte` costs ~30 cycles flat for a
+match within 24 bytes (~34 to 64, 45 at 200) — mostly the NEON↔GPR round trip
+— against 12 cycles at 1 byte and 22 at 32 for a called SWAR scan: the
+crossover is ~48–56 bytes. `Iterate` on the sample runs at IPC 4.3 (3.9
+ops/cycle), 20% backend-stalled; a short quoted field costs 54 cycles against
+19 for a short unquoted one.
+
+**Where the parser's time goes, by elimination.** Not calling the callback at
+all is −21% on short fields and −11.6% on the sample (~4 cycles a field: `i`
+goes through the stack across the call, ~5 cycles of store-to-load forwarding,
+plus the argument moves). Halving the key loop's stride prices it at 2.9
+cycles per key word, ~26% of the sample; the value loop is ~1%. Everything
+else was tried one piece at a time and none of it moves short fields by more
+than ~1% (rejected list below): not the quote test, not the `vStart > n-1`
+guard, not the `'='` verify, not the `+1` on the chain, not the op count. The
+cycle-sampled profile (arm64's PMU interrupt lands on the oldest unretired
+instruction) puts half the samples on the key-verify chain — mask, `RBIT`/
+`CLZ`, shifted add, byte load, compare — but shortening that chain from the
+register instead of a load made short fields 9–11% SLOWER. `Iterate` is
+therefore unchanged in this pass; its arm64 machine code is the baseline's.
+
+**What landed, all on the escape paths, all arm64-only:**
+1. **The walk, spelled for arm64** (`scan_arm64.go`): a quiet limit on the
+   index instead of a clean-word counter (the counter and the index traded
+   registers every iteration), `n-8` hoisted, the drain re-checking a lane's
+   byte from the register with `byte(w >> (tz & 56))` — one cycle here, where
+   amd64 needs the count in `CL` and has rejected the spelling three times — so
+   the word's address leaves the loop and the drain loses a 4-cycle load. 22
+   instructions per clean word → 16. Escape rows −9…−11%, JSON in `msg=` −4%.
+2. **`escClean` = 8, `escGap` = 64 on arm64** (5 and 48 stay everywhere else):
+   with the walk at ~0.57 cycles a byte and each hand-off to the sparse scan an
+   `IndexByte` call, the crossover is ~64 bytes. 48-byte gaps −29%, 64-byte −12%,
+   every other row flat.
+3. **The sparse scan hands a value back to the walk, once** (see "The escGap
+   entry decision is one-way" under Known limits for the full story, including
+   the +28–34% the unrestricted version cost): prose-then-JSON −64%.
+4. **`unescapeInto`** (`unescape_spare.go`), for destinations with room for all
+   of `raw`: the old loop spent ~92 instructions per escape at 8-byte gaps,
+   most of them a `memmove` call per literal run and the seven registers spilled
+   around it. Runs up to 32 bytes are now copied inline — two to four
+   overlapping loads, then as many stores, which keeps an in-place decode
+   correct; longer runs still call `memmove`, which wins past ~32 bytes (an
+   8-byte copy loop for every run was +66% on 128-byte runs). The next-escape
+   probe keeps its constants in registers (spelled as constants, each word
+   rebuilt `0x5c5c…` with `MOVZ`+3×`MOVK`), is 8 words, and is skipped after a
+   run of 64+ bytes until a short one turns up. `decodeSurrogateEscape` is
+   written out inline (as a call, it made each surrogate pair spill and reload
+   the loop's state twice: +5% on that row, now −3%), and `copy` for long runs
+   is given an exact-length destination. Decode rows −7…−33%, JSON −17%,
+   `esc=128` −19%; `Unescape` +3.6% (one call more per decode — folding the loop
+   into `AppendUnescape` to save it lost 3 points on every dense row), 256-byte
+   gaps +1.4%. Allocation counts and bytes unchanged on every row.
+
+**Measured and rejected** (each fuzz- or test-clean before it lost):
+- *A SWAR probe for short quoted values* before `IndexByte`, 1/2/4/6 words:
+  short quoted fields −38%, `DecodeKeyval` −6%, but `LevelTS`/`GetMany`/
+  `Get/level` +2–10% — the sample's quoted values are 16+ bytes, and each miss
+  costs 2–5 cycles in context (1.5–2 in an isolated sweep). The same trade as
+  the rejected fused value scan: the realistic line decides.
+- *The key loop's test as a fused `TST`+branch* (`orr &^ w & 0x8080… != 0`, the
+  exact mask rebuilt at the hit from the same `ORR` so the key chain keeps its
+  length): 2 fewer ops per key word, `IterateOur` −2.2%, `Get/trace_id` −3.1%,
+  but `GetMany` +0.9%, `DecodeKeyval` +0.9%, second-word fields +3.0%; geomean
+  −0.06%. The simpler form (mask rebuilt after the branch) put a cycle on the
+  key-end chain: bare keys +5.5%.
+- *The view's second word from `base+7`* (so its address shares nothing with
+  the loop and the loop loses its per-word `ADD`): the slice's bounds check
+  comes back, worse than the `ADD`. `data[base+8:base+16]` CSEs with the loop
+  increment and trades the `ADD` for a `MOV`; an eager `pair[8:16]` load gets
+  no `LDP` (the pair pass wants two immediate-offset loads) and two `NOP`s.
+- *Stop bytes verified from the register* (`'='`, `'"'` and the value stop,
+  no byte loads): +9–11% on short fields.
+- *The next field's index from the value mask moved up a lane*
+  (`TrailingZeros64((hb<<1)&(sw<<1))>>3`, which drops the `+1` from the chain at
+  the same op count and compiles exactly as intended — `TST`, `ADD`, `AND` with
+  a shifted operand): short fields −0.3%.
+- *Arithmetic `isSpace`* (no `ADRP`+`ADD` for the table's address, which the
+  allocator rematerialises on many edges): −2.5% ops, cycles flat.
+  *Scan constants hoisted out of the field loop*: +2–4%, spilled across the
+  callback exactly as on amd64 in 2026-07-27.
+- *Decoder*: a fixed 6- or 8-word probe (see above); the loop inside
+  `AppendUnescape` itself; probe constants reloaded per probe instead of held
+  (−3 points on dense rows); `utf8.EncodeRune` into the buffer (+1 point on
+  `\u` rows against `AppendRune`).
+
+**Harness lessons.** (1) A padding control needs a REACHABLE pad: a
+never-called unexported function is removed by the linker and moves nothing —
+reference it from a test file (`var _ = pad(3)`). With one, `Iterate` placed
+at offset 0 or 32 of a 64-byte block measured the baseline to ±0.4% on every
+core row, at 16 or 48 +0.7–0.9%; the same code retires ~40 fewer ops per parse
+at the 32-byte-aligned offsets, so compare-and-branch fusion depends on where
+a pair falls. This is the N2's layout band, and a consumer's binary places
+`Iterate` wherever it lands. (2) A copy-correctness seed must not be periodic:
+a run of `x` let an off-by-one copy through. (3) The VM has two cores; run
+fuzzers and builds between series, never during one.
+
 ### Cost model (measured 2026-07-26, synthetic field-size sweep)
 
 **Not re-measured after the 2026-07-27 pass**, which attacked the fixed
@@ -1635,7 +1852,9 @@ happening implicitly and bought nothing.
   `IndexByte`+parity loop, out of line): **`escGap` = 48**, the first escape sat
   more than 48 bytes into the value, so the escapes are sparse and `IndexByte`'s
   stride wins; and **`escClean` = 5**, five consecutive words went by with
-  neither byte in them. Handing back carries nothing, because the parity rule is
+  neither byte in them. (Those are the amd64 values, in `scan_other.go`. Since
+  2026-09-23 arm64 has its own walk and 64/8 in `scan_arm64.go` — and a sparse
+  scan that can hand a value back, once; see the 2026-09-23 pass.) Handing back carries nothing, because the parity rule is
   context-free. The crossover behind both is `IndexByte` scanning clean bytes
   ~4.5× faster than the walk but costing a call per escape.
   **The 4.5× ratio travels between machines; the crossover does not** — it also
@@ -2075,6 +2294,19 @@ noisy). Each was **neutral or worse**:
   around the call so far charges the realistic 30–60-byte values more than it
   saves the short ones.
 
+- **2026-09-23 pass (arm64, Neoverse N2) — measured and rejected**, each with
+  its numbers in that pass's section: a SWAR probe for short quoted values
+  (−38% on short quoted fields, +2–10% on the realistic line — the same verdict
+  as on amd64, from a different machine), the key loop's test as a fused
+  `TST`+branch (a wash), the view's second word from `base+7` or
+  `data[base+8:base+16]` (a bounds check or a `MOV` for the `ADD` it saves),
+  stop bytes verified from the register (+9–11% on short fields), the value
+  mask moved up a lane to drop the `+1` (−0.3%), arithmetic `isSpace` and
+  hoisted scan constants (no gain / +2–4%), and for the decoder a fixed 6- or
+  8-word probe, the fast loop inside `AppendUnescape` itself, and probe
+  constants reloaded per probe. Also the unrestricted sparse-to-dense hand-back
+  (+28–34% on alternating gaps), which landed restricted instead.
+
 The parser is **memory-latency / per-field-overhead bound**, not scan-throughput
 bound (confirmed on arm64 with counters, see the 2026-08-17 benchmarks
 section: IPC 4.4, no mispredictions, instruction count barely moves cycles).
@@ -2110,6 +2342,16 @@ scarcer currency — ~21 of a seeded field's ~48 ALU ops are branches, 7 of them
 bounds checks — and a `BSF`'s destination is a hidden input (the 2026-09-22
 pass). The chain above is ~12 cycles for a short field whose value settles in
 the view, measured at 15.2 cycles per field all told.
+**The N2, measured 2026-09-23 (the "unmeasured" above):** a short unquoted
+field costs ~19 cycles and ~73 ops, a sample field ~35 cycles and ~135 ops, at
+3.9 ops/cycle against a ~5-wide dispatch with 20% of cycles backend-stalled.
+Of a short field's 19 cycles, ~4 are the callback (−21% without it: `i`'s
+store-to-load round trip is ~5 cycles here); the key loop costs 2.9 cycles per
+word (26% of the sample). Neither regime of the Zen 4 rules holds cleanly:
+cutting 2.5% of the ops (arithmetic `isSpace`) moved nothing, and cutting a
+cycle off the value chain moved short fields 0.3%. What did pay on this core
+was taking calls and their spills off hot paths (`memmove` per decoded run,
+`IndexByte` per escaped quote), which is where every win of that pass is.
 
 ## Methodology (use this for any future perf work)
 
@@ -2121,6 +2363,19 @@ the view, measured at 15.2 cycles per field all told.
   moving while ops stand still is a dependency or a layout effect, and the
   first thing to check then is `bench/bsfdep.py`. It does not replace the
   interleaved timing series for a final claim; it decides what is worth one.
+- **Counters on arm64 (2026-09-23).** The N2 VMs count the PMUv3 common
+  events, and `counters.py` uses them there unasked: ops, branches,
+  mispredicts and the two stall shares per op. The events that read 0 (IMPDEF,
+  `STALL_SLOT*`) are the hypervisor's filter, not a perf syntax problem — raw
+  codes (`r003a`) work for everything it passes. There is no SPE and no IBS: a
+  `cycles:u` sample lands on the oldest unretired instruction, which is useful
+  for finding a stalled chain but says nothing about why.
+- **Change one architecture, prove the others unchanged (2026-09-23).** Put
+  the arch-specific code in `_arm64.go`/`_other.go` files or behind a constant
+  like `runtime.GOARCH == "arm64"` (removed before code generation where it is
+  false), then run `bench/asmdiff.py` on binaries cross-compiled for the other
+  architecture at the baseline and after. Zero package functions different is
+  the claim; anything else needs that architecture's own measurement.
 - **Check every BSF after touching `Iterate` (2026-09-22).**
   `python3 bench/bsfdep.py <test binary> 'logfmt\.Iterate$'`; a SUSPECT line
   means a `BSF` may wait on a data load it has nothing to do with.
@@ -2251,5 +2506,6 @@ go test -run='^$' -bench=. -benchmem -count=3             # benchmarks
 go vet ./... && gofmt -l .                                # lint/format
 make bsfdep                                               # BSF dependency screen of Iterate (amd64)
 python3 bench/counters.py 'Benchmark_IterateOur,Benchmark_Get/level' \
-    /tmp/before.test /tmp/after.test --cpu 10             # per-op cycles/ops/branches
+    /tmp/before.test /tmp/after.test --cpu 10             # per-op cycles/ops/branches (AMD or Arm PMU)
+python3 bench/asmdiff.py /tmp/before.test /tmp/after.test # which functions' machine code changed
 ```

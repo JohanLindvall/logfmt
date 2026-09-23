@@ -242,7 +242,9 @@ func Benchmark_UnescapeEscapedGap(b *testing.B) {
 // handles the whole value, and there is no way back once it is decided. Expect
 // a step of roughly 60% between the prefix=032 and prefix=064 rows, flat on
 // either side — that step IS the cliff, and it is the row to watch if the
-// sparse-to-dense upgrade is ever implemented.
+// sparse-to-dense upgrade is ever implemented. On arm64 it has been (2026-09-23,
+// scan_arm64.go), and the step is gone there: prefix=064 and 160 measure within
+// 20% of prefix=032 instead of 3x it.
 func Benchmark_IteratePrefixJSON(b *testing.B) {
 	tail := []byte(`{\"level\":\"info\",\"caller\":\"server/handler.go:42\",` +
 		`\"msg\":\"request completed\",\"user\":\"bob\",\"status\":200}`)
@@ -250,6 +252,34 @@ func Benchmark_IteratePrefixJSON(b *testing.B) {
 		line := append([]byte(`msg="`), bytes.Repeat([]byte("x"), pre)...)
 		line = append(append(append(line, ' '), tail...), '"')
 		b.Run(fmt.Sprintf("prefix=%03d", pre), func(b *testing.B) {
+			b.SetBytes(int64(len(line)))
+			for i := 0; i < b.N; i++ {
+				if err := Iterate(line, func(k, v []byte) bool { return true }); err != nil {
+					b.Fatalf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Benchmark_IterateEscapedAlternating prices escapes that alternate a short
+// gap with a long one — JSON whose string values are long, where every value
+// ends a run of short gaps with one longer than the walk's give-up distance. It
+// is the shape a sparse-to-dense hand-back gets wrong: handed back to the walk
+// after every short gap, each long gap costs a wasted walk as well as the
+// IndexByte call, which measured +28-34% on arm64 before the hand-back was
+// limited to values the walk declined on arrival (scan_arm64.go). Keep it next
+// to Benchmark_IteratePrefixJSON, which is the shape the hand-back is for.
+func Benchmark_IterateEscapedAlternating(b *testing.B) {
+	for _, g := range [][2]int{{8, 80}, {40, 120}} {
+		line := []byte(`msg="`)
+		for len(line) < 1024 {
+			for _, gap := range g {
+				line = append(append(line, bytes.Repeat([]byte("a"), gap-2)...), '\\', '"')
+			}
+		}
+		line = append(line, '"')
+		b.Run(fmt.Sprintf("gaps=%d-%d", g[0], g[1]), func(b *testing.B) {
 			b.SetBytes(int64(len(line)))
 			for i := 0; i < b.N; i++ {
 				if err := Iterate(line, func(k, v []byte) bool { return true }); err != nil {

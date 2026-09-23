@@ -678,11 +678,32 @@ func Test_Unit_Quoted_EscapeDense_Scan(t *testing.T) {
 		decoded: `a\]b\]c`,
 	}, {
 		// The first escape sits beyond escGap, so the walk declines on arrival
-		// and the whole value is settled by the IndexByte scan.
+		// and the whole value is settled by the IndexByte scan — or, on arm64,
+		// handed back to the walk as soon as two escaped quotes sit escUpgrade
+		// bytes apart or closer (scan_arm64.go).
 		name:    "first escape too far in: walk declined on arrival",
 		line:    `msg="` + long + `\"\"\"" next=ok`,
 		raw:     long + `\"\"\"`,
 		decoded: long + `"""`,
+	}, {
+		// Prose longer than escGap, then embedded JSON: sparse on arrival,
+		// dense from the JSON on.
+		name:    "sparse, then dense",
+		line:    `msg="` + long + ` {\"id\":7,\"ok\":true}" next=ok`,
+		raw:     long + ` {\"id\":7,\"ok\":true}`,
+		decoded: long + ` {"id":7,"ok":true}`,
+	}, {
+		// Sparse on arrival and for one more escape, then dense.
+		name:    "sparse, sparse, then dense",
+		line:    `msg="` + long + `\"` + long + `\"ab\"cd\"" next=ok`,
+		raw:     long + `\"` + long + `\"ab\"cd\"`,
+		decoded: long + `"` + long + `"ab"cd"`,
+	}, {
+		// Dense again after the walk has given up on a long clean run.
+		name:    "sparse, dense, sparse, dense",
+		line:    `msg="` + long + `\"a\"` + long + long + `\"b\"c\"" next=ok`,
+		raw:     long + `\"a\"` + long + long + `\"b\"c\"`,
+		decoded: long + `"a"` + long + long + `"b"c"`,
 	}} {
 		t.Run(tt.name, func(t *testing.T) {
 			line := []byte(tt.line)
@@ -719,6 +740,11 @@ func Test_Unit_Quoted_EscapeDense_Scan(t *testing.T) {
 		// that found it.
 		name: "trailing lone backslash mid-walk",
 		line: `msg="\"` + strings.Repeat("0", escClean*8-8) + `\`,
+	}, {
+		// Sparse on arrival, dense after it, then the input ends inside an
+		// escape.
+		name: "unterminated after the walk is taken back",
+		line: `msg="` + long + `\"a\"xyz\`,
 	}} {
 		t.Run(tt.name, func(t *testing.T) {
 			err := Validate([]byte(tt.line))

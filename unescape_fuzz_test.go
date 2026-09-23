@@ -3,6 +3,7 @@ package logfmt
 import (
 	"bytes"
 	"strconv"
+	"strings"
 	"testing"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -80,13 +81,17 @@ func hex4Ref(b []byte) (rune, bool) {
 	return rune(v), true
 }
 
-// FuzzAppendUnescapeAgainstRef checks AppendUnescape against unescapeRef three
-// ways: appending to nil, appending behind an existing prefix (the result must
-// keep the prefix intact and never alias raw), and decoding IN PLACE over the
-// raw bytes (dst = raw[:0]), which is legal because decoding never lengthens
-// the input — and which the escape-dense SWAR read-ahead must not disturb.
-// It also pins NeedsUnescape's contract: false means the bytes decode to
-// themselves.
+// FuzzAppendUnescapeAgainstRef checks AppendUnescape against unescapeRef five
+// ways: appending to nil, appending behind an existing prefix with no spare
+// capacity and again with room for all of raw (the result must keep the prefix
+// intact and never alias raw), and decoding IN PLACE over the raw bytes —
+// dst = raw[:0], and behind a prefix in the same buffer — which is legal
+// because decoding never lengthens the input, and which neither the
+// escape-dense SWAR read-ahead nor the word copies of the spare-capacity
+// decoder (unescape_spare.go, arm64) may disturb. The prefix with room and the
+// in-place placements are the ones that reach that decoder; the prefix without
+// room keeps AppendUnescape's own loop. It also pins NeedsUnescape's contract:
+// false means the bytes decode to themselves.
 func FuzzAppendUnescapeAgainstRef(f *testing.F) {
 	for _, s := range []string{
 		``, `plain`, `a\nb\tc\rd`, `q\"q\\`, `trailing\`, `éA`,
@@ -96,6 +101,18 @@ func FuzzAppendUnescapeAgainstRef(f *testing.F) {
 		`\ud83d\u`, `\ud83d\uZZZZ`, `\ud83d\ud83d`,
 	} {
 		f.Add([]byte(s))
+	}
+	// Literal runs on every boundary of the spare-capacity decoder's copies
+	// (one byte, two, four, eight, sixteen and thirty-two at a time, then
+	// memmove) and of its probe window, each followed by a short run so a
+	// search that skipped the probe after a long run has to find it again.
+	// No two neighbouring bytes of a run are equal, so a copy that is off by
+	// one byte anywhere changes the output.
+	alnum := strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", 4)
+	for _, run := range []int{1, 2, 3, 4, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 200} {
+		lit := alnum[:run]
+		f.Add([]byte(`\n` + lit + `\t` + lit + `\"ab\\`))
+		f.Add([]byte(lit + `\u00e9` + lit + `\` + "\n" + `c`))
 	}
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		want := unescapeRef(raw)
@@ -109,9 +126,17 @@ func FuzzAppendUnescapeAgainstRef(f *testing.F) {
 		if got := AppendUnescape(prefix, raw); !bytes.Equal(got, append([]byte("prefix:"), want...)) {
 			t.Fatalf("AppendUnescape(prefix, %q) = %q, want prefix:%q", raw, got, want)
 		}
+		roomy := append(make([]byte, 0, len(prefix)+len(raw)), prefix...)
+		if got := AppendUnescape(roomy, raw); !bytes.Equal(got, append([]byte("prefix:"), want...)) {
+			t.Fatalf("AppendUnescape(prefix with room, %q) = %q, want prefix:%q", raw, got, want)
+		}
 		cp := append([]byte(nil), raw...)
 		if got := AppendUnescape(cp[:0], cp); !bytes.Equal(got, want) {
 			t.Fatalf("in-place AppendUnescape(%q) = %q, want %q", raw, got, want)
+		}
+		behind := append([]byte("pre:"), raw...)
+		if got := AppendUnescape(behind[:4], behind[4:]); !bytes.Equal(got, append([]byte("pre:"), want...)) {
+			t.Fatalf("in-place AppendUnescape behind a prefix (%q) = %q, want pre:%q", raw, got, want)
 		}
 	})
 }

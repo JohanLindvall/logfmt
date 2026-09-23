@@ -173,10 +173,13 @@ func hasQuoteOrBackslash(w uint64) uint64 {
 // is 8.6% faster and no other row moves. NOTE this is an amd64 result in a band
 // neither machine's committed sweep samples — the synthetic sweep jumps straight
 // from 32-byte to 128-byte gaps — so it wants a confirming arm64 run.
-const (
-	escClean = 5  // consecutive clean words after which the walk gives up
-	escGap   = 48 // bytes to the first escape at or below which the walk wins
-)
+//
+// That arm64 run came on 2026-09-23, and the crossover had moved with the walk:
+// arm64 now has a walk of its own (scan_arm64.go), which costs about 0.57 cycles
+// a byte on a Neoverse N2 against IndexByte's ~30 cycles a call there, so it
+// wins out to 64-byte gaps. The values therefore live beside the walk they tune
+// — escClean = 8 and escGap = 64 on arm64, 5 and 48 everywhere else
+// (scan_other.go) — and this comment is the history of both.
 
 // KNOWN GAP, priced but not closed: escGap is asked once, at the value's first
 // escaped quote, and nothing asks again. escClean can take a value OFF the walk
@@ -192,6 +195,14 @@ const (
 // attempted, the upgrade threshold must sit STRICTLY BELOW the distance escClean
 // gives up at, or the two scans oscillate handing back to each other — setting
 // it equal to escGap measured +26% at a 48-byte gap.
+//
+// Closed on arm64 (2026-09-23; scanQuotedSparse in scan_arm64.go): a value the
+// walk declined on arrival is handed back to it once, when two of its escaped
+// quotes come 48 bytes apart or closer — below escClean's 64 there. That is
+// -64% on the prefix-then-JSON shape; handing back ANY value after every short
+// gap, the obvious version, cost +28-34% on escapes that alternate a short gap
+// with a long one (Benchmark_IterateEscapedAlternating). Still open everywhere
+// else, on the amd64 numbers above.
 
 // unescWindow is the decoder's equivalent of escClean: how many quiet words
 // AppendUnescape probes for the next backslash before handing back to
@@ -228,141 +239,6 @@ const unescWindow = 4
 // lowest set bit of the union is still a genuine stop.
 func hasKeyStop(w uint64) uint64 {
 	return hasKeyStopR(w, swarRegs.xor, swarRegs.sub, swarRegs.hi)
-}
-
-// scanQuotedEscapeDense walks a quoted value from just past an escaped quote,
-// a word at a time, consuming each backslash together with the byte it escapes
-// — stepping over the pair IS the run-parity rule, so no backslash walk is
-// needed here. It returns the position it stopped at and whether that position
-// is the value's unescaped closing quote.
-//
-// It declines the job in two ways, both handing back to scanQuotedSparse: the
-// first escape sat more than escGap bytes into the value (so the escapes are
-// sparse and IndexByte's wider stride wins), or escClean consecutive words went
-// by with neither byte in them (so they have become sparse part way through).
-// Handing back needs nothing carried across, because the parity rule is
-// context-free — the caller resumes with a plain IndexByte from wherever this
-// stopped.
-//
-// n is derived here rather than passed: the caller's n IS len(data), and
-// spelling it that way inside this function is what lets the prove pass relate
-// i to the slice at all. The loop head is unsigned for the reason iterate's is
-// — it means i < n while also supplying the i >= 0 fact — which matters because
-// the i += 2 step below can leave i at n+1, and that value must reach the head
-// as "stop", not as a negative-looking index that costs every bounds check in
-// the loop.
-func scanQuotedEscapeDense(data []byte, i, vStart int) (int, bool) {
-	if i-1-vStart > escGap {
-		return i, false // already sparse on arrival; never mind the walk
-	}
-	n := len(data)
-	clean := 0
-	kq, kb, klo, khi := swarRegs.quote, swarRegs.bslash, swarRegs.lo, swarRegs.hi
-	// One word is loaded, masked and then DRAINED of every escape it holds
-	// before the next is loaded. The reload was this walk's whole dependency
-	// chain — load, mask, find, verify, step, load again, about fourteen
-	// cycles per escape with nothing else to overlap — and at the densities
-	// this scan exists for (embedded JSON escapes every two to eight bytes)
-	// a word holds several. Draining costs a few bit operations per escape
-	// instead, and the word loads become independent of each other.
-	//
-	// Two things the outer walk got for free have to be paid for here. A
-	// spurious lane — the borrow above a true match described on
-	// hasQuoteOrBackslash — used to be impossible because every mask was
-	// taken from a freshly anchored word, where only the LOWEST bit is read
-	// and that one is genuine; draining reads the ones above it too, so the
-	// byte is checked for '\\' as well as '"' and an impostor is simply
-	// cleared. And a backslash in the last lane escapes a byte the word does
-	// not contain, so that case leaves the word and resumes past the pair.
-	for i >= 0 && i <= n-8 && clean < escClean {
-		w := binary.LittleEndian.Uint64(data[i : i+8])
-		m := hasQuoteOrBackslashR(w, kq, kb, klo, khi)
-		if m == 0 {
-			i += 8
-			clean++
-			continue
-		}
-		clean = 0
-		base := i
-		// The sub-slice and the "& 7" are both load-bearing, and only
-		// together: the byte re-check below runs once per escape rather than
-		// once per word, and spelled data[base+t] it pays a bounds check
-		// every time, because the prove pass will not combine i <= n-8 with
-		// t's range. Against a slice whose length it knows is 8 the masked
-		// index needs no check at all. (-d=ssa/check_bce/debug=1 reports
-		// nothing in this function.)
-		word := data[i : i+8]
-		i += 8 // the whole word is consumed unless a lane-7 pair says otherwise
-		for m != 0 {
-			// The lane comes from m itself, not from m & -m: the loop condition
-			// proves m non-zero, where TrailingZeros64 of the isolated bit
-			// compiled to a BSF plus a CMOV for a zero input that cannot occur.
-			t := bits.TrailingZeros64(m) >> 3 & 7
-			c := word[t]
-			if c == '"' {
-				return base + t, true
-			}
-			if c != '\\' {
-				m &= m - 1 // spurious lane: not a real escape, take the next
-				continue
-			}
-			if t == 7 {
-				i = base + 9 // the escaped byte is the next word's first
-				break
-			}
-			// Step over the backslash AND what it escapes by keeping only the
-			// lanes from t+2 up: m | -m sets every bit from m's lowest one,
-			// bit 7 of lane t, upward, and shifting that left by 9 starts it
-			// at bit 0 of lane t+2 (or clears it when there is no such lane).
-			// Four dependent operations per escape, where clearing the pair
-			// with m &^= low | low<<8 took six — and this chain is the walk's
-			// whole cost once a word holds several escapes.
-			m &= (m | -m) << 9
-		}
-	}
-	if clean >= escClean {
-		return i, false // a long clean run: IndexByte covers it faster
-	}
-	// Fewer than eight bytes left: finish a byte at a time. i can end at n+1
-	// here, one past the end, when a trailing backslash escapes the byte after
-	// the input; the caller's unsigned loop head is what makes that safe.
-	for i < n {
-		switch data[i] {
-		case '"':
-			return i, true
-		case '\\':
-			i += 2
-		default:
-			i++
-		}
-	}
-	return i, false
-}
-
-// scanQuotedSparse finds the unescaped closing quote of a value whose escapes
-// are far enough apart that one bytes.IndexByte call per escape beats walking
-// the bytes between them. It returns the closing quote's index, or -1 if the
-// value is never closed. i may arrive at n+1 from the dense scan's last step;
-// the unsigned head treats that as "nothing left", which is what stops the
-// data[i:] below from panicking rather than merely failing to match.
-func scanQuotedSparse(data []byte, i int) int {
-	n := len(data)
-	for uint(i) < uint(n) {
-		q := bytes.IndexByte(data[i:], '"')
-		if q < 0 {
-			break
-		}
-		i += q
-		bs := 0
-		for j := i - 1; data[j] == '\\'; j-- {
-			bs++
-		}
-		if bs&1 == 0 {
-			return i
-		}
-		i++
-	}
-	return -1
 }
 
 // Iterate parses data as a logfmt record and calls fn once for each key/value
@@ -754,6 +630,12 @@ func AppendUnescape(dst []byte, raw []byte) []byte {
 	// when they fit the decoded value but not the larger raw representation.
 	if cap(dst) == 0 {
 		dst = make([]byte, 0, len(raw))
+	}
+	// On arm64 a destination with room for all of raw is decoded straight
+	// into that room; see unescape_spare.go. The condition is a constant
+	// false everywhere else, so this is compiled away there.
+	if unescapeIntoSpare && cap(dst)-len(dst) >= len(raw) {
+		return unescapeInto(dst, raw, j)
 	}
 	dst = append(dst, raw[:j]...)
 	i, n := j+1, len(raw)

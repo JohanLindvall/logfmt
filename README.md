@@ -322,6 +322,17 @@ scanning; measured −4.9% on the 1.4 KB line and −3% on short fields,
 2026-09-22), though values dense with escapes can come out a few percent
 slower. It is a consumer build flag, not something the module can set.
 
+On arm64 the escape paths are tuned separately, from a Neoverse N2's hardware
+counters: a cheaper escape walk that stays on escapes up to 64 bytes apart, a
+hand-back to it for values that start as prose and turn into embedded JSON
+(which were ~3× slower once the prose ran past 48 bytes, and now cost about
+what they do without the prose), and an `AppendUnescape` that decodes straight
+into a destination with room for the raw value instead of calling `memmove`
+for every run between escapes — 7–33% faster on escape-dense values, 3–4% slower
+on a short value with only a couple of escapes. amd64 compiles to the same
+machine code as before. The details and numbers are in
+[bench/perf_2026-09-23_arm64.md](bench/perf_2026-09-23_arm64.md).
+
 ### vs other Go logfmt parsers
 
 The `bench/` module is a separate module, so the root package stays

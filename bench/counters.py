@@ -14,8 +14,14 @@ binaries are interleaved, the whole measurement is repeated --reps times, and
 the run with the fewest cycles is kept as the least disturbed one.
 
 Needs Linux perf with access to the core PMU (perf_event_paranoid <= 2 counts
-the benchmark's own user-mode events). Build both binaries with the same test
-sources and toolchain; pass benchmark names without the -N CPU suffix:
+the benchmark's own user-mode events). The event set follows the machine: AMD
+Zen's retired macro-ops and branches on x86-64, and on arm64 the Armv8 PMUv3
+common events by number -- OP_RETIRED, BR_RETIRED, STALL_BACKEND and
+STALL_FRONTEND, which the Neoverse N2 VMs expose (the IMPDEF and STALL_SLOT
+events read 0 there). The two stall columns are the share of cycles in which
+nothing was dispatched for want of backend or frontend resources. Build both
+binaries with the same test sources and toolchain; pass benchmark names without
+the -N CPU suffix:
 
     python3 bench/counters.py 'Benchmark_IterateOur,Benchmark_Get/level' \\
         /tmp/before.test /tmp/after.test --cpu 10
@@ -23,11 +29,18 @@ sources and toolchain; pass benchmark names without the -N CPU suffix:
 
 import argparse
 import os
+import platform
 import subprocess
 import sys
 
-EVENTS = ["cycles:u", "ex_ret_ops:u", "instructions:u", "ex_ret_brn:u", "ex_ret_brn_misp:u"]
-PORTABLE = ["cycles:u", "instructions:u", "branches:u", "branch-misses:u"]
+# Each set is cycles, ops, instructions, branches, then extras; one group, so
+# every event is counted over the same interval (7 counters on the N2).
+EVENTS = {
+    "amd": ["cycles:u", "ex_ret_ops:u", "instructions:u", "ex_ret_brn:u", "ex_ret_brn_misp:u"],
+    # OP_RETIRED, BR_RETIRED, STALL_BACKEND, STALL_FRONTEND, BR_MIS_PRED_RETIRED
+    "arm": ["cycles:u", "r003a:u", "instructions:u", "r0021:u", "r0024:u", "r0023:u", "r0022:u"],
+    "portable": ["cycles:u", "instructions:u", "instructions:u", "branches:u", "branch-misses:u"],
+}
 
 
 def measure(binary, bench, n, events, cpu, cwd):
@@ -59,14 +72,18 @@ def main():
     ap.add_argument("--seconds", type=float, default=0.25, help="approximate length of the longer run")
     ap.add_argument("--cwd", default=os.getcwd(), help="module directory holding the benchmark's testdata")
     ap.add_argument("--portable", action="store_true",
-                    help="count generic events only, for CPUs without the AMD Zen ones")
+                    help="count generic events only, for CPUs without the AMD Zen or Arm ones")
     args = ap.parse_args()
-    events = PORTABLE if args.portable else EVENTS
+    pmu = "portable" if args.portable else "arm" if platform.machine() in ("aarch64", "arm64") else "amd"
+    events = list(dict.fromkeys(EVENTS[pmu]))
+    cyc, ops, ins, brn = EVENTS[pmu][:4]
     names = [os.path.basename(b) for b in args.binaries]
-    print("%-44s %-16s %10s %10s %10s %9s" % ("benchmark", "binary", "cycles/op", "ops/op", "instr/op", "brn/op"))
+    stalls = "  %6s %6s" % ("be%", "fe%") if pmu == "arm" else ""
+    stalls += "  %7s" % "misp/op" if pmu != "portable" else ""
+    print("%-44s %-16s %10s %10s %10s %9s%s" % ("benchmark", "binary", "cycles/op", "ops/op", "instr/op", "brn/op", stalls))
     for bench in args.benches.split(","):
         probe = measure(args.binaries[0], bench, 1000, events, args.cpu, args.cwd)
-        per_op = max(probe["cycles:u"] / 1000.0, 1.0)
+        per_op = max(probe[cyc] / 1000.0, 1.0)
         n2 = max(int(args.seconds * 4e9 / per_op), 600)
         n1 = n2 // 6
         best = {}
@@ -76,16 +93,20 @@ def main():
                 c1 = measure(args.binaries[i], bench, n1, events, args.cpu, args.cwd)
                 c2 = measure(args.binaries[i], bench, n2, events, args.cpu, args.cwd)
                 r = {e: (c2[e] - c1[e]) / float(n2 - n1) for e in events}
-                if i not in best or r[events[0]] < best[i][events[0]]:
+                if i not in best or r[cyc] < best[i][cyc]:
                     best[i] = r
         for i, name in enumerate(names):
             r = best[i]
-            delta = ""
+            extra = ""
+            if pmu == "arm":
+                extra = "  %6.1f %6.1f" % (100 * r["r0024:u"] / r[cyc], 100 * r["r0023:u"] / r[cyc])
+            if pmu != "portable":
+                extra += "  %7.2f" % r[EVENTS[pmu][-1]]
             if i:
-                delta = "  cycles %+6.1f%%" % (100 * (r[events[0]] / best[0][events[0]] - 1))
+                extra += "  cycles %+6.1f%%" % (100 * (r[cyc] / best[0][cyc] - 1))
             print("%-44s %-16s %10.1f %10.1f %10.1f %9.1f%s" % (
-                bench if i == 0 else "", name, r[events[0]], r[events[1]] if not args.portable else float("nan"),
-                r["instructions:u"], r[events[3] if not args.portable else "branches:u"], delta))
+                bench if i == 0 else "", name, r[cyc], r[ops] if pmu != "portable" else float("nan"),
+                r[ins], r[brn], extra))
         sys.stdout.flush()
 
 
