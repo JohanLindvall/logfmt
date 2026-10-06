@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 .PHONY: all check test test-bench lint bench bench-md bsfdep fix update-tools
 
 GOPATH := $(shell go env GOPATH)

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package bench compares this logfmt parser against other Go logfmt parsers on
 // representative input. It lives in its own module (see go.mod) so the root
 // package keeps zero dependencies.

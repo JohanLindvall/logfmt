@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Compare per-op hardware counters of prebuilt Go benchmark binaries.
 
 Cycles are core cycles, so unlike ns/op they do not move with the clock:

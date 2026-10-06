@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+type: software
+title: "logfmt: a fast, allocation-free logfmt reader for Go"
+abstract: >-
+  A Go library for reading the logfmt key/value log line format. Keys and
+  values are reported as sub-slices of the input, so parsing a line allocates
+  nothing; lookups of one or several keys stop as soon as those keys are
+  settled; and quoted values decode go-logfmt's escapes, including \uXXXX, for
+  round-trip interoperability.
+authors:
+  - family-names: Lindvall
+    given-names: Johan
+repository-code: "https://github.com/JohanLindvall/logfmt"
+url: "https://pkg.go.dev/github.com/JohanLindvall/logfmt"
+license: MIT
+keywords:
+  - logfmt
+  - Go
+  - parser
+  - logging
+  - structured logging
+  - zero allocation
+  - SWAR

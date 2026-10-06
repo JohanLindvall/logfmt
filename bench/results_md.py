@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Render the cross-library comparison `go test -bench` output (results.txt) into
 a markdown summary: one table per scenario, one row per parser, sorted by ns/op,
 with a Speedup column relative to go-logfmt (the de-facto standard).

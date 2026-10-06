@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Compare prebuilt Go benchmark binaries in alternating, CPU-pinned rounds.
 
 Build both binaries with the same tests and toolchain. Run an A/A control with

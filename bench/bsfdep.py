@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Report what every BSF/BSR in a function waits for besides its source.
 
 AMD and Intel CPUs leave a BSF destination unchanged when the source is zero,

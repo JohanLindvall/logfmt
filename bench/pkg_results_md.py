@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Render `go test -bench` output from the root logfmt module into a markdown
 table (one row per benchmark).
 

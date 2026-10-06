@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
 """Report which functions of package logfmt compile to different machine code
 in two test binaries.
 

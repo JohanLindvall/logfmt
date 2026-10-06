@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # Run the root-module microbenchmarks (parser, lookups, unescape, ParseTime) and
 # render an architecture-specific markdown summary (bench/pkg_results_<goarch>.md),

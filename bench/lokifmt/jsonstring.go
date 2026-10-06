@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT AND BSD-3-Clause
+
 // The decode half of go-logfmt/logfmt v0.6.1's jsonstring.go (MIT — see the
 // LICENSE file in this directory), which is in turn:
 //

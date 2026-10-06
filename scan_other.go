@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 //go:build !arm64
 
 package logfmt

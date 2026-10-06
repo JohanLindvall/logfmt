@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
 #
 # Run the cross-library comparison suite (this package vs go-logfmt, kr/logfmt,
 # and Grafana Loki's vendored decoder) and render an architecture-specific

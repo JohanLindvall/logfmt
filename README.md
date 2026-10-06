@@ -2,20 +2,34 @@
 
 [![CI](https://github.com/JohanLindvall/logfmt/actions/workflows/ci.yml/badge.svg)](https://github.com/JohanLindvall/logfmt/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/JohanLindvall/logfmt.svg)](https://pkg.go.dev/github.com/JohanLindvall/logfmt)
+[![Version](https://img.shields.io/github/v/tag/JohanLindvall/logfmt?sort=semver&label=version)](https://pkg.go.dev/github.com/JohanLindvall/logfmt?tab=versions)
 [![Go Report Card](https://goreportcard.com/badge/github.com/JohanLindvall/logfmt)](https://goreportcard.com/report/github.com/JohanLindvall/logfmt)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-A fast, allocation-free **reader** for the [logfmt](https://brandur.org/logfmt)
-line format in Go:
+A [logfmt](https://brandur.org/logfmt) reader for Go that pulls fields out of
+log lines **without allocating**: keys and values come back as sub-slices of
+your `[]byte`, and a lookup stops reading as soon as it has its keys. On a real
+1.4 KB log line it parses every pair roughly **8× faster than go-logfmt** and
+extracts two keys **15–20× faster**, on amd64 and arm64 alike (CI-generated
+tables: [amd64](bench/results_amd64.md), [arm64](bench/results_arm64.md)).
+Standard library only, Go 1.21+, and differentially fuzzed against a
+byte-by-byte reference parser.
 
-```
-level=info msg="user login" user=john id=42 success=true
+```go
+line := []byte(`level=error msg="disk \"sda\" full" retries=3`)
+
+level, _ := logfmt.Get(line, "level")          // error: a sub-slice of line, no copy
+msg, _ := logfmt.AppendValue(nil, line, "msg") // disk "sda" full: unescaped into your buffer
+
+err := logfmt.Iterate(line, func(key, val []byte) bool {
+    fmt.Printf("%s=%s\n", key, val) // every pair in order, values raw
+    return true                     // false stops early
+})
 ```
 
-The package operates on `[]byte` and reports keys and values as sub-slices of
-the input, so iterating a line performs **zero allocations**. It has no
-dependencies outside the standard library, and parses a ~1.4 KB line at
-~3 GB/s — roughly 6× go-logfmt, with key extraction 12× faster still.
+**[▶ Run it on pkg.go.dev](https://pkg.go.dev/github.com/JohanLindvall/logfmt#example-package)**
+— this example and the per-function ones, runnable in the browser with nothing
+to install.
 
 ## Install
 
@@ -352,11 +366,21 @@ this file, because a copied one goes stale silently and this one did:
   microbenchmarks
 
 For orientation only, on the ~1.4 KB sample line this package parses every pair
-roughly **7× faster than go-logfmt** with zero allocations, and extracts two
-keys roughly **14× faster** by stopping as soon as both are found. Consult the
+roughly **8× faster than go-logfmt** with zero allocations, and extracts two
+keys roughly **15–20× faster** by stopping as soon as both are found. Consult the
 tables for the actual figures on actual hardware; treat any ratio quoted in
 prose as approximate and possibly a release behind.
 
+## Star history
+
+[![Star history of JohanLindvall/logfmt, go-logfmt/logfmt and kr/logfmt](https://api.star-history.com/svg?repos=johanlindvall/logfmt,go-logfmt/logfmt,kr/logfmt&type=Date)](https://www.star-history.com/#johanlindvall/logfmt&go-logfmt/logfmt&kr/logfmt&Date)
+
+## Security
+
+Please report vulnerabilities privately, not in a public issue — see
+[SECURITY.md](SECURITY.md).
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE). Every source file carries an
+`SPDX-License-Identifier` header.

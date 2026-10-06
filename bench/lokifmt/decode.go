@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package lokifmt is a benchmark stand-in for Grafana Loki's in-tree logfmt
 // decoder (pkg/logql/log/logfmt): go-logfmt's scanner operating on a caller
 // supplied []byte line instead of an io.Reader, with Reset for reuse.

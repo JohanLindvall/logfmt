@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: MIT
+
 // Package logfmt provides a fast, allocation-free reader for the logfmt
 // key/value line format:
 //
