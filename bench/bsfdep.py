@@ -6,9 +6,8 @@ AMD and Intel CPUs leave a BSF destination unchanged when the source is zero,
 so they treat the destination's previous value as an input. At GOAMD64=v1 Go
 compiles bits.TrailingZeros64 to BSF and the register allocator chooses the
 destination freely, so a BSF can end up waiting for whatever instruction last
-wrote that register. On a Ryzen 8840HS that cost the parser 37% on short
-unquoted fields for an instruction stream that was otherwise identical (see
-CLAUDE.md, 2026-09-22).
+wrote that register. An unrelated load can therefore lengthen the parser's
+per-field dependency chain even when its instruction count is unchanged.
 
 For each BSF this walks the function's control-flow graph backwards and lists
 every instruction that can have been the destination's previous writer. A

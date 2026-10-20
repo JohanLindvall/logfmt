@@ -118,8 +118,9 @@ request. Measure with identical test sources on both sides; avoid drawing
 conclusions from one timing run.
 
 See [bench/README.md](bench/README.md) for reproduction and comparison commands.
-Read the relevant sections of [CLAUDE.md](CLAUDE.md) before changing hot paths:
-it records measurements and approaches already tried. In particular:
+Read the relevant sections of [AGENTS.md](AGENTS.md) before changing hot paths:
+it describes implementation invariants and measurement requirements. In
+particular:
 
 - After changing `Iterate`, run `make bsfdep` to inspect amd64 BSF dependencies.
 - For changes intended for one architecture, cross-compile both revisions for

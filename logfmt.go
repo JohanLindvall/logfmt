@@ -83,9 +83,9 @@ func hasCtrlOrSpace(w uint64) uint64 {
 // into registers once and keeps them there, where a constant is
 // rematerialised with a 10-byte MOVQ at every use — one per constant per word
 // scanned, and each of those is an integer-ALU op on amd64, which is the unit
-// the scan loop is bound by (four of them; see CLAUDE.md, 2026-09-01). The
-// reloads after each callback go through the otherwise idle load ports. It is
-// never written. The *R helpers below take the values as arguments, and each
+// the scan loop competes for. The reloads after each callback go through the
+// otherwise idle load ports. It is never written. The *R helpers below take
+// the values as arguments, and each
 // predicate is written only there: the argument-free forms, which carry the
 // explanations, call them with these values.
 //
@@ -294,8 +294,7 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 	// i >= 0 fact it otherwise never has, and "i <= n-8" proves i+8 <= n
 	// without an add that could overflow. The pair is what eliminates every
 	// bounds check on the SWAR loads and in the separator-drain loop; neither
-	// half does it alone (the half-applied form measures WORSE — see
-	// CLAUDE.md on the previously rejected bare "lim := n-8" attempt).
+	// half supplies both proofs on its own.
 	//
 	// The second half of the condition is implied by the first and the prove
 	// pass can see that, so it compiles to nothing — but it restates the

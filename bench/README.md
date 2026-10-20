@@ -93,7 +93,7 @@ regressions together.
 
 For hardware-counter work, [counters.py](counters.py) reports per-operation
 cycles, operations, branches, and misses using `perf`. See `--help` and
-[the measurement notes](../CLAUDE.md#methodology-use-this-for-any-future-perf-work)
+[the measurement guidance](../AGENTS.md#performance-work)
 for event support and interpretation.
 
 ## Choose representative workloads
@@ -121,9 +121,8 @@ allocation behavior, documented on `ParseTime`.
 
 The escape scans and spare-capacity decoder are tuned separately for arm64.
 Results on one architecture do not establish a win on another. Read the
-[arm64 lookup report](perf_2026-09-09_arm64.md),
-[arm64 escape report](perf_2026-09-23_arm64.md), and
-[performance history](../CLAUDE.md) before repeating earlier experiments.
+[hot-path invariants](../AGENTS.md#hot-path-invariants) before changing these
+implementations.
 
 On amd64, consumer builds can choose `GOAMD64=v3` for CPUs supporting that
 feature level. Earlier measurements found gains on some typical lines and
