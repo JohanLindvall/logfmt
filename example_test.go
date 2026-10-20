@@ -3,15 +3,16 @@
 package logfmt_test
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/JohanLindvall/logfmt"
 )
 
-// The README's first code block, runnable: keep the two in step. pkg.go.dev
-// shows these examples with a Run button, which is what the README's "try it"
-// link points at.
+// The README's quick start: keep its main function and this example in step.
+// pkg.go.dev shows this example with a Run button.
 func Example() {
 	line := []byte(`level=error msg="disk \"sda\" full" retries=3`)
 
@@ -124,6 +125,33 @@ func ExampleGetMany() {
 	// trace_id: absent
 }
 
+func ExampleGetMany_reuseBuffer() {
+	lines := [][]byte{
+		[]byte(`level=info status=200`),
+		[]byte(`level=error msg="request failed"`),
+	}
+	keys := []string{"level", "status"}
+	buf := make([][]byte, len(keys))
+
+	for _, line := range lines {
+		// Keep the returned slice so the next call can reuse its storage.
+		buf = logfmt.GetMany(line, keys, buf)
+		for i, v := range buf {
+			if v == nil {
+				fmt.Printf("%s: absent\n", keys[i])
+				continue
+			}
+			fmt.Printf("%s: %s\n", keys[i], v)
+		}
+	}
+
+	// Output:
+	// level: info
+	// status: 200
+	// level: error
+	// status: absent
+}
+
 func ExampleAppendValue() {
 	line := []byte(`msg="first\nsecond" path=C:\Users\bob\new`)
 
@@ -139,6 +167,48 @@ func ExampleAppendValue() {
 	// first
 	// second
 	// C:\Users\bob\new
+}
+
+func ExampleAppendValue_reuseBuffer() {
+	lines := [][]byte{
+		[]byte(`msg="first\nsecond"`),
+		[]byte(`msg=done`),
+	}
+	buf := make([]byte, 0, 64)
+
+	for _, line := range lines {
+		var ok bool
+		// Reset the length, then keep the returned slice for the next call.
+		buf, ok = logfmt.AppendValue(buf[:0], line, "msg")
+		if ok {
+			fmt.Printf("%q\n", buf)
+		}
+	}
+
+	// Output:
+	// "first\nsecond"
+	// "done"
+}
+
+func Example_readStream() {
+	input := strings.NewReader("level=info msg=started\nlevel=error msg=failed\n")
+	scanner := bufio.NewScanner(input)
+	// Choose a maximum record size for your application; Scanner's default
+	// is 64 KiB. Allow up to 1 MiB here, including the line ending.
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+
+	for scanner.Scan() {
+		level, _ := logfmt.Get(scanner.Bytes(), "level")
+		// Use the value before Scan reuses its buffer; copy it to retain it.
+		fmt.Printf("%s\n", level)
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Println("read logs:", err)
+	}
+
+	// Output:
+	// info
+	// error
 }
 
 func ExampleSplitRecord() {

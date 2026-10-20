@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT
+
+name: Feature or documentation request
+description: Suggest a capability, example, or explanation that would help you.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us about your use case. Documentation and example requests are welcome too.
+        logfmt is a small, read-only parser; its [scope](https://pkg.go.dev/github.com/JohanLindvall/logfmt#hdr-Scope)
+        describes the intended boundaries.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the task and what makes it difficult with the current API or documentation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Suggested improvement
+      description: An example of the behavior, API, or documentation you would like is helpful.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or workarounds
+      description: Share anything you have tried, if applicable.

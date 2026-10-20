@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: MIT
+
+name: Bug report
+description: Report an incorrect result or other unexpected behavior.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A small reproducer helps us investigate. Replace private log data with a sanitized sample.
+        For a suspected vulnerability, including a panic or hang on malformed input, please use
+        [private security reporting](https://github.com/JohanLindvall/logfmt/security/advisories/new).
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Small reproducer
+      description: Include the exact input and function call, a Go test, or a runnable example.
+      placeholder: |
+        line := []byte(`level=info msg="example"`)
+        value, found := logfmt.Get(line, "msg")
+        fmt.Printf("%q %v\n", value, found)
+      render: go
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Versions and platform
+      description: |
+        Paste the output of `go version`, `go env GOOS GOARCH`, and
+        `go list -m github.com/JohanLindvall/logfmt` from your module.
+        For a local checkout, include its commit instead of the module version.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: For performance issues, include the CPU, benchmark command, buffer sizes, and before/after results.

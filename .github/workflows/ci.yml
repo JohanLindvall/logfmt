@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+
 name: CI
 
 on:
@@ -35,6 +37,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
+      - name: Check formatting
+        if: matrix.arch == 'amd64' && matrix.go == 'stable'
+        run: make fmt-check
       - name: Vet (root module)
         run: go vet ./...
       - name: Test (root module)

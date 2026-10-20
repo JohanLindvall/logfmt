@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT
+
+name: Usage question
+description: Get help choosing an API or using the library.
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        See the [usage guide](https://github.com/JohanLindvall/logfmt/blob/main/docs/usage.md)
+        and [runnable examples](https://pkg.go.dev/github.com/JohanLindvall/logfmt#pkg-examples).
+        If they do not answer your question, ask here.
+  - type: textarea
+    id: question
+    attributes:
+      label: How can we help?
+      description: Describe what you want to do and where you are stuck.
+    validations:
+      required: true
+  - type: textarea
+    id: example
+    attributes:
+      label: Example and environment
+      description: If relevant, include a small log sample, your code, and the Go and module versions. Remove private data.

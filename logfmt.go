@@ -610,18 +610,19 @@ func Iterate(data []byte, fn func(key, val []byte) bool) error {
 // lone backslash are kept verbatim rather than rejected.
 //
 // Pass it ONLY a value that was quoted in the input. Escapes are meaningful
-// only inside quotes: an emitter writes path=C:\Users\bob unquoted and means
-// every byte literally, so decoding that yields C:Usersbob with an embedded
-// newline. Iterate, All, Get and GetMany all hand out quoted and unquoted
+// only inside quotes: an emitter writes path=C:\Users\bob\new unquoted and means
+// every byte literally, so decoding that yields C:Usersbob followed by a
+// newline and ew. Iterate, All, Get and GetMany all hand out quoted and unquoted
 // values alike without distinguishing them; GetQuoted reports which it was, and
 // AppendValue applies this function only when it should. Feeding raw values
 // through here unconditionally is the one way to corrupt data with this package.
 //
-// It always appends — the result never aliases raw — so it composes like the
-// other Append functions in the standard library. Pass dst[:0] to reuse a
-// buffer without allocating. To skip the copy entirely for values that need no
-// decoding, guard with NeedsUnescape; that pattern is also faster than decoding
-// unconditionally, since most values contain no escapes at all.
+// It always appends to dst, like other Append functions in the standard library.
+// A separate destination keeps the result independent of raw. Decoding in place
+// with AppendUnescape(raw[:0], raw) is also supported and overwrites raw.
+// Pass dst[:0] to reuse a buffer without allocating. To skip the copy for values
+// that need no decoding, guard with NeedsUnescape; that pattern is also faster
+// than decoding unconditionally, since most values contain no escapes at all.
 func AppendUnescape(dst []byte, raw []byte) []byte {
 	j := bytes.IndexByte(raw, '\\')
 	if j < 0 {
@@ -769,13 +770,15 @@ var hexTable = func() [256]int8 {
 // quoted, so an unquoted one is copied through byte for byte — path=C:\Users\bob
 // comes back intact rather than "decoded" into nonsense.
 //
-// It always appends, so the result never aliases data and is safe to keep.
+// It always appends to dst. With a separate destination, the result is
+// independent of data and remains valid until the destination is reused.
 // Callers who would rather not copy values that need no decoding should use
 // GetQuoted with NeedsUnescape instead:
 //
 //	if v, quoted, ok := logfmt.GetQuoted(line, "msg"); ok {
 //		if quoted && logfmt.NeedsUnescape(v) {
-//			v = logfmt.AppendUnescape(buf[:0], v)
+//			buf = logfmt.AppendUnescape(buf[:0], v)
+//			v = buf
 //		}
 //		// v now aliases line (no copy) or buf (decoded)
 //	}
@@ -790,8 +793,8 @@ func AppendValue(dst, data []byte, key string) ([]byte, bool) {
 		return dst, false
 	}
 	// Only a quoted value carries escapes. Decoding an unquoted one would eat
-	// the backslashes an emitter meant literally — path=C:\Users\bob becomes
-	// C:Usersbob with an embedded newline — so it is copied through verbatim.
+	// the backslashes an emitter meant literally — path=C:\Users\bob\new becomes
+	// C:Usersbob followed by a newline and ew — so it is copied through verbatim.
 	if !quoted || !NeedsUnescape(raw) {
 		return append(dst, raw...), true
 	}

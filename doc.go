@@ -44,11 +44,11 @@
 // # Escapes belong to quoted values only
 //
 // A backslash means something only inside quotes. msg="a\nb" holds an escape;
-// path=C:\Users\bob holds three literal backslashes, and go-logfmt's encoder
+// path=C:\Users\bob\new holds three literal backslashes, and go-logfmt's encoder
 // writes it exactly that way, because a backslash is not one of the bytes that
 // force quoting. Unescaping without knowing which of the two you have turns
-// C:\Users\bob into C:Usersbob with an embedded newline — silently, since every
-// byte of it is valid logfmt.
+// C:\Users\bob\new into C:Usersbob followed by a newline and ew — silently,
+// since every byte of it is valid logfmt.
 //
 // Iterate, All, Get and GetMany hand out quoted and unquoted values alike and do
 // not distinguish them, so the raw value alone cannot tell you which it was. Two entry points
@@ -99,10 +99,11 @@
 // GetQuoted and GetMany return values capped to their length, so appending to one copies
 // rather than overwriting the bytes that follow it in the input; they cap once
 // per lookup, which costs nothing measurable. AppendValue and AppendUnescape
-// always copy into the caller's buffer, so their results never alias the input
-// at all. Iterate and All do not cap what they hand the callback to the value's
+// always copy into the caller's buffer. With a separate destination, the result
+// is independent of the input; AppendUnescape also supports decoding in place
+// with AppendUnescape(raw[:0], raw). Iterate and All do not cap values to their
 // own length, because that lands once per field and measures ~4.5% on
-// field-dense input; they do bound it at the end of the record, so an append
+// field-dense input; they do bound values at the end of the record, so an append
 // cannot run past the data you handed in, but it can still overwrite later
 // fields of the same record. Inside a callback, copy first
 // (append(dst[:0], v...), string(v)) or re-slice to v[:len(v):len(v)] before
@@ -123,9 +124,12 @@
 // callback's output as a valid prefix, not as something to discard.
 //
 // That *SyntaxError is the one allocation this package makes on its own behalf.
-// Every entry point is allocation-free on a well-formed record; a malformed one
-// costs a single 24-byte error value, and the lookups pay it only when they have
-// to walk past the fault to settle their keys (they discard it, since they
+// Parsing a well-formed record allocates nothing. GetMany may grow its outer
+// result slice, and the append functions may grow their destination; reuse
+// buffers with enough capacity to avoid those allocations. ParseTime has
+// separate allocation behavior described in its documentation. A malformed
+// record costs a single 24-byte error value, and the lookups pay it only when
+// they have to walk past the fault to settle their keys (they discard it, since they
 // report no errors). "Allocation-free" throughout this documentation means
 // exactly that.
 //

@@ -298,11 +298,21 @@ parsing.** The `Benchmark_ParseTime_*` benchmarks may stay as measurement.
   above a blank line, so it never joins the package doc comment and stays
   ahead of any `//go:build` line. `bench/lokifmt/jsonstring.go` is
   `MIT AND BSD-3-Clause` (go-logfmt's code around Go's `encoding/json`).
-- `example_test.go` (2026-10-06) — runnable examples, shown with a Run button
-  on pkg.go.dev; that page is the README's "Run it" link. The package-level
-  `Example` is the README's first code block in runnable form, so change the
-  two together. There is no `ExampleAll`: ranging over `All` needs Go 1.23 and
-  the root module declares 1.21.
+- `README.md` — the quick start and API chooser. Detailed recipes live in
+  `docs/usage.md`; benchmark interpretation and reproduction in `bench/README.md`.
+  Keep benchmark claims explicit about raw parsing versus decoding.
+- `CONTRIBUTING.md` — contributor setup, compatibility floors, and checks.
+  Plain `make` shows help; `make check` checks formatting, vets, and tests both
+  modules without rewriting source. `make lint` is separate and its installer
+  pins CI's version. `make fuzz` runs all four differential fuzzers.
+  `.github/ISSUE_TEMPLATE/`, `.github/SUPPORT.md`, the pull request template,
+  and `CODE_OF_CONDUCT.md` provide the community entry points.
+- `example_test.go` (2026-10-06; expanded 2026-10-20) — runnable examples,
+  shown with a Run button on pkg.go.dev. Keep the package-level `Example` and
+  the README quick start's `main` function in step. Buffer-reuse and stream
+  recipes in `docs/usage.md` also have executable examples here.
+  There is no `ExampleAll`: ranging over `All` needs Go 1.23 and the root
+  module declares 1.21.
 - `SECURITY.md` (2026-10-06) — sends reporters to GitHub private vulnerability
   reporting, which has to be enabled in the repository settings for its link
   to work. `CITATION.cff` has no `version` or `date-released` on purpose: CI

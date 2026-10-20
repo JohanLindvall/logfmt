@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: MIT
+
+blank_issues_enabled: true
+contact_links:
+  - name: API reference and runnable examples
+    url: https://pkg.go.dev/github.com/JohanLindvall/logfmt
+    about: Explore the functions and try examples in your browser.
+  - name: Report a security vulnerability privately
+    url: https://github.com/JohanLindvall/logfmt/security/advisories/new
+    about: Use private reporting for suspected vulnerabilities, including crashes or hangs on malformed input.
